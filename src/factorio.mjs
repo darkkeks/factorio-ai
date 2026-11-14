@@ -652,6 +652,67 @@ const BODY = {
     end
     return {start=P(head.position), belts=n, total_items=total, sections=sections, branches=branches, ends=ends}`,
 
+  // Сводка «что встало»: состояния машин, как значки над ними в игре. Игрок видит их на экране и на карте там, где
+  // карта показывается вживую (рядом с собой, под радаром), поэтому дальше 60 клеток смотрим только в таких чанках.
+  alerts: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    local MAJOR = {no_fuel=true, no_power=true, low_power=true, not_plugged_in_electric_network=true, no_minable_resources=true,
+      missing_science_packs=true, no_ammo=true, no_input_fluid=true, missing_required_fluid=true, fuel_running_out=true}
+    local MINOR = {no_ingredients=true, item_ingredient_shortage=true, fluid_ingredient_shortage=true, full_output=true,
+      waiting_for_space_in_destination=true, no_recipe=true, no_research_in_progress=true, low_input_fluid=true, full_burnt_result_output=true}
+    local TYPES = {'mining-drill', 'furnace', 'assembling-machine', 'lab', 'boiler', 'generator', 'burner-generator', 'reactor',
+      'offshore-pump', 'pump', 'inserter', 'rocket-silo', 'ammo-turret', 'electric-turret', 'radar', 'beacon'}
+    local vis = {}
+    local function visible(p)
+      if dist(p, e.position) <= 60 then return true end
+      local cx, cy = math.floor(p.x/32), math.floor(p.y/32)
+      local k = cx..','..cy
+      if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {cx, cy}) end
+      return vis[k]
+    end
+    local groups, major, minor, checked, hidden, low = {}, {}, {}, 0, 0, 0
+    for _, c in pairs(s.find_entities_filtered{position=e.position, radius=A.radius, force=f, type=TYPES}) do
+      if not visible(c.position) then hidden = hidden + 1
+      else
+        checked = checked + 1
+        local st = status_of(c)
+        if st == 'low_power' then low = low + 1 end
+        if not MAJOR[st] and not MINOR[st] then
+          -- Топливо ещё горит, но в топке больше ничего не лежит: скоро встанет.
+          pcall(function() if c.burner and c.burner.remaining_burning_fuel > 0 and c.burner.inventory.is_empty() then st = 'fuel_running_out' end end)
+        end
+        if MAJOR[st] or MINOR[st] then
+          local k = st..'|'..c.name
+          local g = groups[k]
+          if not g then
+            g = {status=st, name=c.name, count=0, all={}}
+            groups[k] = g
+            local list = MAJOR[st] and major or minor
+            list[#list+1] = g
+          end
+          g.count = g.count + 1
+          g.all[#g.all+1] = {pos=P(c.position), dist=r1(dist(c.position, e.position))}
+        end
+      end
+    end
+    local function finish(list)
+      for _, g in pairs(list) do
+        table.sort(g.all, function(a, b) return a.dist < b.dist end)
+        g.nearest = {}
+        for i = 1, math.min(#g.all, 6) do g.nearest[i] = g.all[i] end
+        g.all = nil
+      end
+      table.sort(list, function(a, b) return a.count > b.count end)
+      local out = {}
+      for i = 1, math.min(#list, 25) do out[i] = list[i] end
+      return out
+    end
+    local r = {me=P(e.position), radius=A.radius, machines_checked=checked, problems=finish(major), shortage=low > 0}
+    if A.idle then r.idle = finish(minor) end
+    if hidden > 0 then r.not_visible = hidden end
+    return r`,
+
   recipe: `
     local f = bot().force
     local function info(rc)
@@ -1017,7 +1078,16 @@ export function createFactorioServer(botName, hooks) {
       { ...coords, section: z.number().int().min(1).max(100).default(20).describe('наибольшая длина одного участка в отчёте') },
       (a) => run('belt', a)),
 
-    def('recipe_info', 'Рецепт по имени рецепта или предмета: ингредиенты, результат, время, открыт ли.', { name: z.string() }, (a) => run('recipe', a)),
+    def('alerts', 'Что на базе встало — одним вызовом, как значки над машинами в игре. problems — серьёзное: нет топлива (no_fuel), топливо догорает и в топке больше ничего нет (fuel_running_out), нет питания или его не хватает (no_power, low_power, not_plugged_in_electric_network), руда под буром кончилась (no_minable_resources), лаборатории не хватает колб (missing_science_packs), нет воды или патронов. idle — простой, который часто нормален: нет ингредиентов, выход полон (full_output, waiting_for_space_in_destination), нет рецепта, лаборатория без исследования. Сгруппировано по состоянию и виду машины: сколько таких и координаты ближайших. shortage — электричества не хватает. Дальше 60 клеток от персонажа видно только там, где карта показывается вживую (радар, игроки); сколько машин осталось вне видимости — not_visible.',
+      { radius: z.number().min(1).max(500).default(200).describe('радиус от персонажа в клетках'),
+        idle: z.boolean().default(true).describe('показывать ли простой (idle); false — только серьёзные проблемы') },
+      async (a) => {
+        const r = await run('alerts', a);
+        if (r.not_visible) r.note = 'часть машин в радиусе не видна (нет радара): подойди ближе или поставь радар';
+        return r;
+      }),
+
+    def('recipe_info','Рецепт по имени рецепта или предмета: ингредиенты, результат, время, открыт ли.', { name: z.string() }, (a) => run('recipe', a)),
 
     def('give', 'Отдать предметы из инвентаря игроку-человеку. Сам подходит к нему.',
       { player: z.string(), item: z.string(), count: z.number().int().min(1).default(1) },
@@ -1045,7 +1115,51 @@ export function createFactorioServer(botName, hooks) {
       }),
   ];
 
-  tools.push(def('feedback', 'Оставить разработчикам заявку на улучшение этих инструментов: чего не хватает, что работает неудобно или неверно. Одна заявка — одна тема, с примером из практики. Заявки разбираются в фоне; читерских возможностей не добавляют. Что с заявкой стало и что ответил разработчик — feedback_status; загляни туда перед новой заявкой, чтобы не повторять уже разобранное.',
+  // План: те же инструменты подряд одним вызовом. Каждый шаг — обычный вызов со всеми его проверками и скоростью;
+  // выигрыш только в том, что между шагами нет круга «ответ → следующий вызов».
+  const NOT_IN_PLAN = new Set(['plan', 'feedback', 'feedback_status', 'read_chat']);
+  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом: steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана пришло сообщение в чат; остальные шаги не выполняются (not_done). В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
+    { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы') })).min(1).max(20) },
+    async (a) => {
+      const prepared = a.steps.map((s, i) => {
+        const t = NOT_IN_PLAN.has(s.tool) ? null : tools.find((x) => x.name === s.tool);
+        if (!t) throw new Error(`шаг ${i + 1}: инструмент ${s.tool} в плане использовать нельзя или его нет`);
+        const parsed = z.object(t.inputSchema).safeParse(s.args);
+        if (!parsed.success) throw new Error(`шаг ${i + 1} (${s.tool}): неверные аргументы — ${parsed.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ')}`);
+        return { t, args: parsed.data };
+      });
+      // Сообщения чата, пришедшие ещё до плана, план не останавливают (как и любое долгое действие): отдаём их отдельно.
+      const before = memo ? await takeChat().catch(() => []) : [];
+      const start = Date.now();
+      const done = [];
+      let stopped_at, why;
+      for (let i = 0; i < prepared.length; i++) {
+        if (i > 0) {
+          if (hooks.aborted()) why = 'прервано новой репликой';
+          else if (Date.now() - start > 240_000) why = 'вышло время на один план (около четырёх минут)';
+          if (why) { stopped_at = i + 1; break; }
+        }
+        const { t, args } = prepared[i];
+        const res = await t.handler(args);
+        const text = res.content[0].text;
+        let result = text;
+        if (!res.isError) { try { result = JSON.parse(text); } catch { /* оставляем текстом */ } }
+        const step = { step: i + 1, tool: t.name, ok: !res.isError, result };
+        done.push(step);
+        if (res.isError) why = 'ошибка';
+        else if (result && typeof result === 'object') {
+          if (result.not_reached) why = 'не дошёл';
+          else if (result.stopped || result.interrupted) why = `действие свернулось: ${result.stopped || result.interrupted}`;
+          else if (result.chat && i < prepared.length - 1) why = 'новое сообщение в чате (оно в поле chat этого шага)';
+        }
+        if (why) { step.ok = false; stopped_at = i + 1; break; }
+      }
+      const not_done = a.steps.slice(done.length).map((s, k) => ({ step: done.length + k + 1, tool: s.tool }));
+      return { completed: !why, steps_ok: done.filter((s) => s.ok).length, steps_total: a.steps.length, stopped_at, why, steps: done, not_done: not_done.length ? not_done : undefined,
+        chat_before: before.length ? before : undefined };
+    }));
+
+  tools.push(def('feedback','Оставить разработчикам заявку на улучшение этих инструментов: чего не хватает, что работает неудобно или неверно. Одна заявка — одна тема, с примером из практики. Заявки разбираются в фоне; читерских возможностей не добавляют. Что с заявкой стало и что ответил разработчик — feedback_status; загляни туда перед новой заявкой, чтобы не повторять уже разобранное.',
     { text: z.string().min(10).max(4000) },
     (a) => ({ ...submitFeedback(botName, a.text), status: 'что с заявкой дальше, покажет feedback_status' })));
 
