@@ -30,7 +30,7 @@ const systemPrompt = (human, bot) => `
 инструмента, ты их не слышишь, а пачка твоих вызовов может оборваться. Поэтому:
 - Сам вызывай инструменты factorio только для быстрых справок: status, look_around, inspect, find, recipe_info,
   power, belt, research — один-три вызова, чтобы ответить на вопрос или составить задание.
-- Любую работу руками (идти, добывать, крафтить, строить, носить, ждать) поручай саб-агенту: инструмент Task
+- Любую работу руками (идти, добывать, крафтить, строить, носить, ждать) поручай саб-агенту: инструмент Agent
   с subagent_type «general-purpose» и run_in_background=true. Саб-агент ничего не знает о разговоре, поэтому
   в задании напиши всё: что он управляет персонажем «${bot}» в Factorio инструментами mcp__factorio__*, цель,
   известные координаты и факты, что считать готовым, и правила: играть честно, имена предметов — внутренние
@@ -58,11 +58,17 @@ const systemPrompt = (human, bot) => `
   если тебя прямо по имени просят о помощи и это не мешает делу, которое поручил хозяин.
 - Сам пиши в say редко и коротко: когда нужно поделить работу или попросить ресурсы. Отчёты о прогрессе туда не шли —
   они заставляют остальных помощников отвлекаться.
-- В конце напиши одну короткую строку итога для лога: что сделал или почему не получилось.
 `.trim();
 
 // Саб-агенты: главная сессия остаётся на связи, а работу руками ведёт фоновый саб-агент с теми же инструментами factorio.
 const SUBAGENT_TOOLS = ['Task', 'SendMessage', 'TaskList', 'TaskStop'];
+
+// Сессии живут долго и привыкают работать по-старому, поэтому о смене правил возобновлённой сессии сообщаем отдельно.
+const RULES_VERSION = 2;
+const RULES_NOTICE = `[система]: правила работы изменились, перечитай их в системных инструкциях. Главное: у тебя появился
+инструмент Agent. Теперь ты диспетчер: работу руками (идти, добывать, крафтить, строить, носить, ждать) поручай фоновому
+саб-агенту (run_in_background=true) с полным заданием, а сам сразу отвечай хозяину и оставайся на связи. Сам вызывай
+инструменты factorio только для быстрых справок. На это сообщение отвечать не нужно — ответь точкой.`;
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
@@ -70,6 +76,7 @@ function loadState() {
 function saveSession(key, sessionId) {
   const s = loadState();
   s[key] = sessionId;
+  s[`${key}:rules`] = RULES_VERSION;
   fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
 }
 
@@ -84,7 +91,9 @@ export class Agent extends EventEmitter {
   constructor(key, human, bot, mcp) {
     super();
     Object.assign(this, { key, human, bot, mcp, busy: false, stopped: false });
-    this.#run(loadState()[key]);
+    const state = loadState();
+    this.#run(state[key]);
+    if (state[key] && state[`${key}:rules`] !== RULES_VERSION) this.send(RULES_NOTICE);
   }
 
   /** Передать сессии реплику; если ход уже идёт, она подмешивается в него. */
