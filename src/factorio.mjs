@@ -3,7 +3,7 @@
 import { z } from 'zod';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { lua } from './rcon.mjs';
-import { submitFeedback } from './feedback.mjs';
+import { submitFeedback, readItems } from './feedback.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1045,9 +1045,38 @@ export function createFactorioServer(botName, hooks) {
       }),
   ];
 
-  tools.push(def('feedback', 'Оставить разработчикам заявку на улучшение этих инструментов: чего не хватает, что работает неудобно или неверно. Одна заявка — одна тема, с примером из практики. Заявки разбираются в фоне; читерских возможностей не добавляют.',
+  tools.push(def('feedback', 'Оставить разработчикам заявку на улучшение этих инструментов: чего не хватает, что работает неудобно или неверно. Одна заявка — одна тема, с примером из практики. Заявки разбираются в фоне; читерских возможностей не добавляют. Что с заявкой стало и что ответил разработчик — feedback_status; загляни туда перед новой заявкой, чтобы не повторять уже разобранное.',
     { text: z.string().min(10).max(4000) },
-    (a) => submitFeedback(botName, a.text)));
+    (a) => ({ ...submitFeedback(botName, a.text), status: 'что с заявкой дальше, покажет feedback_status' })));
+
+  // Обратная связь по заявкам: статус и ответ разработчика. Очередь общая для всех ботов, поэтому перед новой заявкой
+  // можно посмотреть и чужие (all=true), чтобы не дублировать.
+  const FB_STATUS = { new: 'в очереди', in_progress: 'в работе', done: 'сделано', rejected: 'отклонено', discussion: 'на обсуждении у людей' };
+  tools.push(def('feedback_status', 'Что стало с заявками на улучшение (feedback): статус (в очереди / в работе / сделано / отклонено / на обсуждении у людей) и ответ разработчика. По умолчанию — твои заявки, новые сверху, тексты сокращены; с id — одна заявка целиком; с all=true — заявки всех ботов (загляни перед новой заявкой, чтобы не дублировать). В «сделано» ответ говорит, что именно сделано и как называется инструмент.',
+    { id: z.string().optional().describe('номер заявки, например fb-016: показать её целиком'),
+      all: z.boolean().default(false).describe('показать заявки всех ботов, а не только твои'),
+      open_only: z.boolean().default(false).describe('только ещё не разобранные (в очереди и в работе)') },
+    (a) => {
+      const cut = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : t; };
+      const view = (i, full) => ({ id: i.id, from: a.all || i.from !== botName ? i.from : undefined, at: i.at, status: FB_STATUS[i.status] || i.status,
+        priority: i.priority ? 'приоритет от людей' : undefined, text: full ? i.text : cut(i.text, 160),
+        answer: i.note ? (full ? i.note : cut(i.note, 400)) : undefined, answered_at: i.note ? i.updated : undefined });
+      const items = readItems();
+      if (a.id) {
+        const id = a.id.trim().toLowerCase();
+        const it = items.find((i) => i.id === id || i.id === `fb-${id.replace(/\D/g, '').padStart(3, '0')}`);
+        if (!it) throw new Error(`нет заявки ${a.id}`);
+        return view(it, true);
+      }
+      const mine = items.filter((i) => a.all || i.from === botName);
+      const counts = {};
+      for (const i of mine) { const s = FB_STATUS[i.status] || i.status; counts[s] = (counts[s] || 0) + 1; }
+      const open = (i) => i.status === 'new' || i.status === 'in_progress';
+      const list = mine.filter((i) => !a.open_only || open(i)).reverse();
+      return { whose: a.all ? 'заявки всех ботов' : `заявки ${botName}`, total: mine.length, counts,
+        items: list.slice(0, 30).map((i) => view(i, false)), not_shown: Math.max(0, list.length - 30) || undefined,
+        note: list.some((i) => (i.note || '').length > 400 || (i.text || '').length > 160) ? 'тексты сокращены; целиком — feedback_status с id' : undefined };
+    }));
 
   if (hooks.chatTool) {
     tools.push(def('read_chat', 'Новые сообщения других ботов из игрового чата. Обычно вызывать не нужно: новые сообщения сами приходят в поле chat ответа любого инструмента, а mine, wait, craft и групповые действия сворачиваются, как только в чате появилось новое.', {},
