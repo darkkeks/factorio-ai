@@ -58,3 +58,21 @@
 Долгие действия по HTTP сворачиваются через 40 секунд (таймауты nginx), клиент просто вызывает инструмент ещё раз.
 
     tmux new-window -d -t 0: -n factorio-mcp ~/claude/discord-voice/run-mcp.sh     # запуск, лог в mcp.log
+
+## Заявки на улучшение (feedback)
+
+У ботов есть инструмент `feedback`: заявка дописывается в `feedback/queue.jsonl`. Фоновый обработчик
+(`src/feedback-worker.mjs`, окно tmux `feedback-worker`, лог `feedback/worker.log`) раз в 30 секунд берёт одну новую
+заявку и запускает на неё отдельную сессию Claude Code (Fable 5.2, на хосте) с правилами из `feedback/WORKER_PROMPT.md`:
+действия MCP должны быть как у обычного игрока, без читерства; любое сомнение — отказ или обсуждение.
+Сессии разрешено только читать проект, править `src/factorio.mjs` и `README.md` и запускать `node --check`
+и `src/tool-test.mjs`. После неё обработчик сам проверяет результат, коммитит в git (история правок — `git log`)
+и перезапускает запущенные процессы ботов; при любой неполадке откатывает правки.
+
+Статусы: `new` → `in_progress` → `done` | `rejected` | `discussion`. Очередь разбирается руками так:
+
+    node src/feedback.mjs list [статус]             # список с вердиктами
+    node src/feedback.mjs show <id>                 # заявка целиком
+    node src/feedback.mjs set <id> <статус> [текст] # сменить статус (new — отправить на повторную обработку)
+
+    tmux new-window -d -t 0: -n feedback-worker 'cd ~/claude/discord-voice && node src/feedback-worker.mjs 2>&1 | tee -a feedback/worker.log'
