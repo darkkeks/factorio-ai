@@ -291,9 +291,33 @@ const BODY = {
     if not s.can_place_entity{name=pr.name, position={A.x, A.y}, direction=dir, force=e.force, build_check_type=defines.build_check_type.manual} then
       fail('сюда поставить нельзя (занято, не та поверхность или нет руды под буром)')
     end
-    local n = s.create_entity{name=pr.name, position={A.x, A.y}, direction=dir, force=e.force, raise_built=true}
+    local kind
+    -- Ближайший такой же подземный конвейер, смотрящий туда же: sign=-1 — позади по ходу, sign=1 — впереди.
+    local function ug_near(p, sign)
+      local v = dir == defines.direction.north and {0,-1} or dir == defines.direction.east and {1,0} or dir == defines.direction.south and {0,1} or {-1,0}
+      for k = 1, pr.max_underground_distance do
+        local o = s.find_entities_filtered{name=pr.name, position={p.x+v[1]*k*sign, p.y+v[2]*k*sign}}[1]
+        if o and o.direction == dir then return o end
+      end
+    end
+    if pr.type == 'underground-belt' then
+      -- Как в игре: подземный конвейер ставится входом, а если позади него по ходу в пределах дальности
+      -- стоит такой же вход, смотрящий туда же, — выходом. Явный A.underground важнее.
+      kind = A.underground
+      if not kind then
+        local o = ug_near(A, -1)
+        kind = (o and o.belt_to_ground_type == 'input') and 'output' or 'input'
+      end
+    end
+    local n = s.create_entity{name=pr.name, position={A.x, A.y}, direction=dir, force=e.force, raise_built=true, type=kind}
     e.remove_item{name=A.item, count=1}
     local r = {placed=n.name, pos=P(n.position), direction=A.direction, left=e.get_item_count(A.item)}
+    if n.type == 'underground-belt' then
+      r.underground = n.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
+      local o = ug_near(n.position, n.belt_to_ground_type == 'input' and 1 or -1)
+      if o and o.belt_to_ground_type ~= n.belt_to_ground_type then r.paired_with = P(o.position)
+      else r.paired_with = n.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход' or 'пары нет: позади по ходу в пределах дальности нужен вход' end
+    end
     if n.type == 'inserter' then r.takes_from, r.puts_to = arm(n) end
     return r`,
 
@@ -777,27 +801,46 @@ export function createFactorioServer(botName, hooks) {
         return { ...r, note: 'крафт ещё идёт' };
       }),
 
-    def('place', 'Поставить постройку из инвентаря в точку. Сам подходит. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to).',
-      { item: z.string().describe('внутреннее имя предмета'), ...coords, direction: z.enum(DIRECTIONS).default('north').describe('куда смотрит постройка: конвейер везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную') },
+    def('place', 'Поставить постройку из инвентаря в точку. Сам подходит. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to). Подземный конвейер: direction у входа и у выхода одинаковый — куда едут предметы; вход это или выход, задаёт underground, а в ответе видно, чем он встал (underground) и с каким концом соединился (paired_with).',
+      { item: z.string().describe('внутреннее имя предмета'), ...coords, direction: z.enum(DIRECTIONS).default('north').describe('куда смотрит постройка: конвейер (и подземный тоже) везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
+        underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера: input — вход под землю, output — выход из-под земли. По умолчанию как в игре: выход, если позади по ходу в пределах дальности стоит вход без пары, иначе вход') },
       async (a) => { await approach(a.x, a.y, 8); return run('place', a); }),
 
-    def('place_line', 'Поставить ряд одинаковых построек из инвентаря от точки (x, y) до точки (x2, y2): лента, столбы, трубы, стены. Идёт вдоль ряда и ставит по одной, как игрок с зажатой кнопкой. Занятые клетки пропускает, останавливается, когда предметы кончились.',
+    def('place_line', 'Поставить ряд одинаковых построек из инвентаря от точки (x, y) до точки (x2, y2): лента, столбы, трубы, стены. Идёт вдоль ряда и ставит по одной, как игрок с зажатой кнопкой. Занятые клетки пропускает, останавливается, когда предметы кончились. С параметром turn ряд идёт с одним поворотом под прямым углом: лента на углу сразу смотрит вдоль второго отрезка. Если действие прервалось, повтори тот же вызов: уже поставленное пропустится.',
       { item: z.string().describe('внутреннее имя предмета'), ...coords, x2: z.number().describe('x конца ряда'), y2: z.number().describe('y конца ряда'),
         step: z.number().min(1).max(64).default(1).describe('шаг между постройками в клетках: 1 для ленты, для столбов — их дальность провода'),
-        direction: z.enum(DIRECTIONS).optional().describe('куда смотрят постройки; по умолчанию — вдоль ряда, от начала к концу (лента повезёт к концу ряда)') },
+        direction: z.enum(DIRECTIONS).optional().describe('куда смотрят постройки; по умолчанию — вдоль ряда, от начала к концу (лента повезёт к концу ряда)'),
+        turn: z.enum(['x_first', 'y_first']).optional().describe('ряд с одним поворотом: x_first — сначала по горизонтали до x2, потом по вертикали до y2; y_first — наоборот. Без него ряд идёт по прямой от начала к концу') },
       async (a) => {
-        const dx = a.x2 - a.x, dy = a.y2 - a.y;
-        const len = Math.hypot(dx, dy);
-        const n = Math.floor(len / a.step + 1e-6) + 1;
+        const along = (dx, dy) => (Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 'east' : 'west') : (dy >= 0 ? 'south' : 'north'));
+        // Отрезок ряда: точки от (x1, y1) к (x2, y2) с шагом step; конец включается, только если withEnd.
+        const leg = (x1, y1, x2, y2, withEnd) => {
+          const dx = x2 - x1, dy = y2 - y1;
+          const len = Math.hypot(dx, dy);
+          const dir = a.direction || along(dx, dy);
+          const out = [];
+          for (let i = 0; a.step * i <= len + 1e-6; i++) {
+            const d = a.step * i;
+            if (!withEnd && d > len - 1e-6) break;
+            out.push({ x: len ? x1 + dx / len * d : x1, y: len ? y1 + dy / len * d : y1, direction: dir });
+          }
+          return out;
+        };
+        let points, turn_at;
+        if (a.turn && a.x !== a.x2 && a.y !== a.y2) {
+          turn_at = a.turn === 'x_first' ? { x: a.x2, y: a.y } : { x: a.x, y: a.y2 };
+          points = [...leg(a.x, a.y, turn_at.x, turn_at.y, false), ...leg(turn_at.x, turn_at.y, a.x2, a.y2, true)];
+        } else points = leg(a.x, a.y, a.x2, a.y2, true);
+        const n = points.length;
         if (n > 100) throw new Error(`в ряду получается ${n} построек, за один вызов можно не больше 100`);
-        const direction = a.direction || (Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 'east' : 'west') : (dy >= 0 ? 'south' : 'north'));
+        const direction = points[0].direction;
         let placed = 0, left, stopped, last;
         const skipped = [];
         for (let i = 0; i < n; i++) {
-          const x = len ? a.x + dx / len * a.step * i : a.x, y = len ? a.y + dy / len * a.step * i : a.y;
+          const { x, y } = points[i];
           try {
             await approach(x, y, 8);
-            const r = await run('place', { item: a.item, x, y, direction });
+            const r = await run('place', { item: a.item, x, y, direction: points[i].direction });
             placed++; left = r.left; last = r.pos;
           } catch (e) {
             if (/в инвентаре нет|нет предмета|нельзя поставить на землю/.test(e.message)) { stopped = e.message.replace(/^Lua: /, ''); break; }
@@ -808,7 +851,7 @@ export function createFactorioServer(botName, hooks) {
           if (stopped) break;
           await sleep(150);
         }
-        return { placed, asked: n, direction, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
+        return { placed, asked: n, direction, turn_at, then_direction: turn_at ? points[n - 1].direction : undefined, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
       }),
 
     def('insert_all', 'Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
