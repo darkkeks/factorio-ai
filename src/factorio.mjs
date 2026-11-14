@@ -830,9 +830,17 @@ export function createFactorioServer(botName, hooks) {
     const r = await run('chat', { since: chatBase ?? 1e15 }).catch(() => null);
     if (!r) return false;
     if (chatBase === null) chatBase = r.seq;
-    else chatNew = Array.isArray(r.messages) && r.messages.length > 0;
+    else chatNew = Array.isArray(r.messages) && r.messages.some(chatStops);
     return chatNew;
   }
+  // Какие сообщения чата сворачивают долгое действие. Обычно любые; внутри plan — по его параметру stop_on_chat:
+  // чат шумный (боты пишут статусы), и длинный план иначе не доживает до конца.
+  let chatMode = 'any';
+  const myNames = [botName, botName.replace(/-бот$/i, '')].map((s) => s.toLowerCase()).filter((s) => s.length >= 3);
+  const STOP_WORD = /(^|[^\p{L}])(стоп|стой|стойте|остановись|остановитесь|stop)([^\p{L}]|$)/iu;
+  /** Сообщение обращено к этому боту (в тексте есть его имя) или просит остановиться. */
+  const chatAddressed = (m) => { const t = String(m.text ?? '').toLowerCase(); return STOP_WORD.test(t) || myNames.some((n) => t.includes(n)); };
+  const chatStops = (m) => chatMode === 'any' || (chatMode === 'addressed' && chatAddressed(m));
   async function takeChat() {
     const r = await run('chat', { since: memo.seq });
     memo.seq = r.seq;
@@ -1171,8 +1179,9 @@ export function createFactorioServer(botName, hooks) {
   // План: те же инструменты подряд одним вызовом. Каждый шаг — обычный вызов со всеми его проверками и скоростью;
   // выигрыш только в том, что между шагами нет круга «ответ → следующий вызов».
   const NOT_IN_PLAN = new Set(['plan', 'feedback', 'feedback_status', 'read_chat']);
-  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом: steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана пришло сообщение в чат; остальные шаги не выполняются (not_done). В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
-    { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы') })).min(1).max(20) },
+  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом: steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана в чат пришло сообщение, обращённое к тебе (в нём твоё имя) либо со словом «стоп»; остальные шаги не выполняются (not_done). Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
+    { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы') })).min(1).max(20),
+      stop_on_chat: z.enum(['addressed', 'any', 'never']).default('addressed').describe('какие сообщения игрового чата останавливают план: addressed — только с твоим именем или словом «стоп»; any — любое новое; never — никакие') },
     async (a) => {
       const prepared = a.steps.map((s, i) => {
         const t = NOT_IN_PLAN.has(s.tool) ? null : tools.find((x) => x.name === s.tool);
@@ -1186,6 +1195,7 @@ export function createFactorioServer(botName, hooks) {
       const start = Date.now();
       const done = [];
       let stopped_at, why;
+      try {
       for (let i = 0; i < prepared.length; i++) {
         if (i > 0) {
           if (hooks.aborted()) why = 'прервано новой репликой';
@@ -1193,7 +1203,9 @@ export function createFactorioServer(botName, hooks) {
           if (why) { stopped_at = i + 1; break; }
         }
         const { t, args } = prepared[i];
+        chatMode = a.stop_on_chat; // на время шага: его долгое действие сворачивают только такие сообщения
         const res = await t.handler(args);
+        chatMode = 'any';
         const text = res.content[0].text;
         let result = text;
         if (!res.isError) { try { result = JSON.parse(text); } catch { /* оставляем текстом */ } }
@@ -1203,10 +1215,14 @@ export function createFactorioServer(botName, hooks) {
         else if (result && typeof result === 'object') {
           if (result.not_reached) why = 'не дошёл';
           else if (result.stopped || result.interrupted) why = `действие свернулось: ${result.stopped || result.interrupted}`;
-          else if (result.chat && i < prepared.length - 1) why = 'новое сообщение в чате (оно в поле chat этого шага)';
+          else if (Array.isArray(result.chat) && i < prepared.length - 1) {
+            if (a.stop_on_chat === 'any') why = 'новое сообщение в чате (оно в поле chat этого шага)';
+            else if (a.stop_on_chat === 'addressed' && result.chat.some(chatAddressed)) why = 'в чате сообщение для тебя или просьба остановиться (оно в поле chat этого шага)';
+          }
         }
         if (why) { step.ok = false; stopped_at = i + 1; break; }
       }
+      } finally { chatMode = 'any'; }
       const not_done = a.steps.slice(done.length).map((s, k) => ({ step: done.length + k + 1, tool: s.tool }));
       return { completed: !why, steps_ok: done.filter((s) => s.ok).length, steps_total: a.steps.length, stopped_at, why, steps: done, not_done: not_done.length ? not_done : undefined,
         chat_before: before.length ? before : undefined };
