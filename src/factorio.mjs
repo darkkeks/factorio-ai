@@ -55,9 +55,19 @@ end
 local function arm(t)
   return {pos=tile(t.pickup_position), what=thing(t.surface, t.pickup_position)}, {pos=tile(t.drop_position), what=thing(t.surface, t.drop_position)}
 end
+local BELT = {['transport-belt']=true, ['underground-belt']=true, splitter=true}
+-- Полосы конвейера: у всех видов нечётные линии — левая полоса по ходу движения, чётные — правая.
+local function belt_lanes(t)
+  local l = {left={}, right={}}
+  for i = 1, t.get_max_transport_line_index() do
+    local side = i % 2 == 1 and l.left or l.right
+    for k, v in pairs(contents(t.get_transport_line(i))) do side[k] = (side[k] or 0) + v end
+  end
+  return l
+end
 local function belt_items(t)
   local r = {}
-  for i = 1, t.get_max_transport_line_index() do for k, v in pairs(contents(t.get_transport_line(i))) do r[k] = (r[k] or 0) + v end end
+  for _, side in pairs(belt_lanes(t)) do for k, v in pairs(side) do r[k] = (r[k] or 0) + v end end
   return r
 end
 `;
@@ -211,13 +221,13 @@ const BODY = {
       r.takes_from, r.puts_to = arm(t)
       pcall(function() if t.held_stack.valid_for_read then r.holding = t.held_stack.name end end)
     end
-    if t.type == 'transport-belt' or t.type == 'underground-belt' or t.type == 'splitter' then r.on_belt = belt_items(t) end
+    if BELT[t.type] then r.on_belt = belt_items(t) r.lanes = belt_lanes(t) end
     if t.type == 'underground-belt' then r.underground = t.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли' end
     pcall(function() r.crafting_progress = r1(t.crafting_progress) end)
     pcall(function() if t.mining_target then r.mining_target = t.mining_target.name end end)
     local inv = {}
     pcall(function() for i = 1, t.get_max_inventory_index() do local c = contents(t.get_inventory(i)) if next(c) then for k, v in pairs(c) do inv[k] = (inv[k] or 0) + v end end end end)
-    r.items = inv
+    r.items = BELT[t.type] and r.on_belt or inv
     pcall(function() if t.burner then r.fuel_left = t.burner.remaining_burning_fuel > 0 or next(contents(t.burner.inventory)) ~= nil end end)
     return r`,
 
@@ -309,7 +319,14 @@ const BODY = {
     reach(e, t, 10)
     local have = e.get_item_count(A.item)
     if have < 1 then fail('в инвентаре нет '..A.item) end
-    local n = t.insert{name=A.item, count=math.min(have, A.count)}
+    local n = 0
+    if t.type == 'transport-belt' then
+      -- На ленту предметы кладутся по одному в начало каждой полосы, если там свободно.
+      for i = 1, 2 do
+        local line = t.get_transport_line(i)
+        if n < math.min(have, A.count) and line.can_insert_at_back() and line.insert_at_back({name=A.item, count=1}) then n = n + 1 end
+      end
+    else n = t.insert{name=A.item, count=math.min(have, A.count)} end
     if n < 1 then fail(t.name..' не принимает '..A.item..' (не подходит или нет места)') end
     e.remove_item{name=A.item, count=n}
     return {inserted=n, item=A.item, into=t.name}`,
@@ -322,6 +339,20 @@ const BODY = {
     if A.item then for i = 1, t.get_max_inventory_index() do local v = t.get_inventory(i) if v then invs[#invs+1] = v end end
     else local v = t.get_output_inventory() if v then invs[1] = v end end
     local taken, left = {}, A.count
+    if BELT[t.type] then
+      for i = 1, t.get_max_transport_line_index() do
+        local line = t.get_transport_line(i)
+        for _, s in pairs(line.get_contents()) do
+          if left > 0 and (not A.item or s.name == A.item) then
+            local n = math.min(s.count, left)
+            if e.can_insert{name=s.name, count=n, quality=s.quality} then
+              n = line.remove_item{name=s.name, count=n, quality=s.quality}
+              if n > 0 then e.insert{name=s.name, count=n, quality=s.quality} taken[s.name] = (taken[s.name] or 0) + n left = left - n end
+            end
+          end
+        end
+      end
+    end
     for _, v in pairs(invs) do
       for _, s in pairs(v.get_contents()) do
         if left > 0 and (not A.item or s.name == A.item) then
@@ -455,7 +486,6 @@ const BODY = {
   belt: `
     local e = bot()
     local t = at(e, A.x, A.y)
-    local BELT = {['transport-belt']=true, ['underground-belt']=true, splitter=true}
     if not BELT[t.type] then fail('в этой точке не конвейер, а '..t.name) end
     if dist(t.position, e.position) > 60 then fail('слишком далеко: конвейер видно в радиусе 60') end
     local function vec(d) return d == defines.direction.north and {0,-1} or d == defines.direction.east and {1,0} or d == defines.direction.south and {0,1} or {-1,0} end
@@ -701,7 +731,7 @@ export function createFactorioServer(botName, hooks) {
       { name: z.string(), radius: z.number().min(1).max(1000).default(300) },
       (a) => run('find', a)),
 
-    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит.', coords, (a) => run('inspect', a)),
+    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground).', coords, (a) => run('inspect', a)),
 
     def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, препятствия обходит; если дойти не удалось, в ответе not_reached и место, где остановился.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio') },
@@ -815,11 +845,11 @@ export function createFactorioServer(botName, hooks) {
     def('pick_up', 'Снять постройку в точке обратно в инвентарь. Сам подходит.', coords,
       async (a) => { await approach(a.x, a.y, 8); return run('pick_up', a); }),
 
-    def('insert_items', 'Положить предметы из инвентаря в объект в точке (топливо, руду, ингредиенты). Сам подходит.',
+    def('insert_items', 'Положить предметы из инвентаря в объект в точке (топливо, руду, ингредиенты). На клетку ленты за раз ложится не больше двух предметов — по одному в начало каждой полосы. Сам подходит.',
       { ...coords, item: z.string(), count: z.number().int().min(1).default(5) },
       async (a) => { await approach(a.x, a.y, 8); return run('insert', a); }),
 
-    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. Сам подходит.',
+    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Сам подходит.',
       { ...coords, item: z.string().optional(), count: z.number().int().min(1).default(1000) },
       async (a) => { await approach(a.x, a.y, 8); return run('take', a); }),
 
