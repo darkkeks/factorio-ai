@@ -486,7 +486,9 @@ const BODY = {
     if A.technology then
       local t = f.technologies[A.technology]
       if not t then fail('нет технологии '..A.technology) end
-      if t.researched then res.added = false res.reason = 'уже исследована'
+      if A.remove and A.position then fail('remove и position вместе не задаются') end
+      if A.remove or (A.position and queued(t)) then
+      elseif t.researched then res.added = false res.reason = 'уже исследована'
       elseif queued(t) then res.added = false res.reason = 'уже в очереди'
       elseif not t.enabled then res.added = false res.reason = 'технология недоступна'
       elseif t.prototype.research_trigger then res.added = false res.reason = 'открывается не колбами, а действием в игре'
@@ -496,6 +498,51 @@ const BODY = {
         f.add_research(t)
         res.added = queued(t)
         if not res.added then res.reason = #miss > 0 and ('сначала нужны: '..table.concat(miss, ', ')) or 'игра не приняла (очередь заполнена?)' end
+      end
+    end
+    -- Перестановка и удаление в очереди, как перетаскивание и крестик в окне исследований. Очередь всегда идёт
+    -- в порядке зависимостей, поэтому вместе с технологией двигаются её соседи по очереди, без которых порядок сломался бы.
+    if A.technology and (A.remove or A.position) then
+      local t = f.technologies[A.technology]
+      local names = {}
+      for _, q in pairs(f.research_queue) do names[#names+1] = q.name end
+      if not queued(t) then
+        if A.remove then res.removed = false res.reason = 'нет в очереди' end
+      elseif A.remove then
+        -- Убираем и то, что стоит в очереди и зависит от убранного.
+        local gone, keep, also = {[t.name]=true}, {}, {}
+        for _, n in ipairs(names) do
+          if not gone[n] then for _, p in pairs(f.technologies[n].prerequisites) do if gone[p.name] then gone[n] = true end end end
+          if gone[n] then if n ~= t.name then also[#also+1] = n end else keep[#keep+1] = n end
+        end
+        f.research_queue = keep
+        res.removed = not queued(t)
+        if not res.removed then res.reason = 'игра не приняла' elseif #also > 0 then res.also_removed = also end
+      else
+        local group = {[t.name]=true}
+        if A.position == 'first' then
+          -- В начало: вместе с ещё не исследованными предшественниками из очереди.
+          local function mark(x) for _, p in pairs(x.prerequisites) do if not p.researched and not group[p.name] then group[p.name] = true mark(p) end end end
+          mark(t)
+        else
+          -- В конец: вместе с теми, кто от неё зависит.
+          for _, n in ipairs(names) do
+            if not group[n] then for _, p in pairs(f.technologies[n].prerequisites) do if group[p.name] then group[n] = true end end end
+          end
+        end
+        local g, rest, also = {}, {}, {}
+        for _, n in ipairs(names) do
+          if group[n] then g[#g+1] = n if n ~= t.name then also[#also+1] = n end else rest[#rest+1] = n end
+        end
+        local list = {}
+        if A.position == 'first' then for _, n in ipairs(g) do list[#list+1] = n end for _, n in ipairs(rest) do list[#list+1] = n end
+        else for _, n in ipairs(rest) do list[#list+1] = n end for _, n in ipairs(g) do list[#list+1] = n end end
+        f.research_queue = list
+        local now = {}
+        for i, q in pairs(f.research_queue) do now[i] = q.name if q.name == t.name then res.position = i end end
+        res.moved = #now == #list
+        for i, n in ipairs(list) do if now[i] ~= n then res.moved = false end end
+        if not res.moved then res.reason = 'игра не приняла новый порядок' elseif #also > 0 then res.also_moved = also end
       end
     end
     local cur = f.current_research
@@ -1066,8 +1113,14 @@ export function createFactorioServer(botName, hooks) {
     def('rotate', 'Повернуть постройку в точке. Манипулятор берёт со стороны direction и кладёт на противоположную; в ответе видно, откуда и куда.', { ...coords, direction: z.enum(DIRECTIONS) },
       async (a) => { await approach(a.x, a.y, 8); return run('rotate', a); }),
 
-    def('research', 'Исследования: текущее, вся очередь (по каждой технологии — какие колбы и сколько на единицу, сколько единиц всего и осталось, секунд на единицу в одной лаборатории) и список доступных. С параметром technology — поставить в очередь: added=true, только если технология действительно появилась в очереди, иначе в reason причина.',
-      { technology: z.string().optional() }, (a) => run('research', a)),
+    def('research', 'Исследования: текущее, вся очередь (по каждой технологии — какие колбы и сколько на единицу, сколько единиц всего и осталось, секунд на единицу в одной лаборатории) и список доступных. С параметром technology — поставить в очередь: added=true, только если технология действительно появилась в очереди, иначе в reason причина. position — переставить технологию в очереди (и ту, что уже стоит, и только что добавленную): first — в начало, она станет текущей, вместе с ней поднимаются её ещё не исследованные предшественники (also_moved); last — в конец, вместе с теми, кто от неё зависит. remove=true — убрать технологию из очереди; зависящие от неё уходят тоже (also_removed). Накопленный прогресс технологий не пропадает.',
+      { technology: z.string().optional(),
+        position: z.enum(['first', 'last']).optional().describe('куда переставить technology в очереди'),
+        remove: z.boolean().optional().describe('убрать technology из очереди') },
+      (a) => {
+        if ((a.position || a.remove) && !a.technology) throw new Error('для position и remove укажи technology');
+        return run('research', a);
+      }),
 
     def('power', 'Электросеть, как в окне столба: выработка и потребление в кВт по видам машин (среднее за 5 секунд), состояние генераторов и котлов рядом, заряд аккумуляторов и список машин без питания (no_power, low_power, не подключён к сети). Без координат берётся ближайший столб.',
       { x: z.number().optional().describe('координата x столба'), y: z.number().optional().describe('координата y столба'),
