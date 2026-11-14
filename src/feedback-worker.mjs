@@ -1,5 +1,5 @@
-// Фоновый обработчик заявок: берёт новые заявки из feedback/queue.jsonl по одной и на каждую запускает отдельную
-// сессию Claude Code (на хосте, в этой папке), которая дорабатывает src/factorio.mjs по правилам из
+// Фоновый обработчик заявок: пока в feedback/queue.jsonl есть новые заявки, запускает заходы — на каждый отдельную
+// сессию Claude Code, которая видит всю очередь и сама выбирает заявку или пачку связанных. Сессия (на хосте, в этой папке), которая дорабатывает src/factorio.mjs по правилам из
 // feedback/WORKER_PROMPT.md. Сессии разрешено только читать, править два файла и запускать проверки.
 // После сессии обработчик сам проверяет результат, коммитит его в git и перезапускает работающие процессы ботов;
 // при любой неполадке откатывает правки и ставит заявке статус discussion.
@@ -36,39 +36,41 @@ function runClaude(prompt) {
   });
 }
 
-function revert() {
-  git('checkout', '--', '.');
-}
-
-async function handle(item) {
-  log(`${item.id} от ${item.from}: беру в работу`);
-  setStatus(item.id, 'in_progress');
+// Один заход: сессия видит всю очередь, сама выбирает заявку или пачку связанных и даёт вердикт по каждой разобранной.
+async function handle(queue) {
+  const all = readItems();
+  log(`в очереди ${queue.length}: ${queue.map((i) => i.id + (i.priority ? '!' : '')).join(' ')}`);
   if (git('status', '--porcelain', '--untracked-files=no').trim()) {
-    setStatus(item.id, 'discussion', 'обработчик не запускался: в рабочей папке есть незакоммиченные правки, их нужно разобрать руками');
-    return log(`${item.id}: в репозитории незакоммиченные правки, пропускаю`);
+    return log('в рабочей папке незакоммиченные правки — жду, пока их закоммитят');
   }
 
   const rules = fs.readFileSync(path.join(ROOT, 'feedback', 'WORKER_PROMPT.md'), 'utf8');
-  const { code, out } = await runClaude(`${rules}\n\n## Заявка ${item.id} от бота «${item.from}»\n\n<feedback>\n${item.text}\n</feedback>`);
+  const resolved = all.filter((i) => ['done', 'rejected', 'discussion'].includes(i.status)).slice(-25)
+    .map((i) => `- ${i.id} (${i.from}) ${i.status}: ${i.text.replace(/\s+/g, ' ').slice(0, 120)} → ${(i.note ?? '').replace(/\s+/g, ' ').slice(0, 220)}`).join('\n');
+  const open = queue.map((i) => `### ${i.id} от «${i.from}»${i.priority ? ' — ПРИОРИТЕТ ОТ ЛЮДЕЙ' : ''}\n<feedback>\n${i.text.slice(0, 2500)}\n</feedback>`).join('\n\n');
+  const { code, out } = await runClaude(`${rules}\n\n## Уже разобранные заявки (для справки)\n\n${resolved || 'пока нет'}\n\n## Очередь\n\n${open}`);
   let summary = '';
-  try { summary = JSON.parse(out).result ?? ''; } catch { summary = out.slice(-2000); }
-  fs.writeFileSync(path.join(ROOT, 'feedback', `session-${item.id}.txt`), summary);
+  try { summary = JSON.parse(out).result ?? ''; } catch { summary = out.slice(-4000); }
+  fs.writeFileSync(path.join(ROOT, 'feedback', `session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`), summary);
 
-  // Вердикт — последний JSON-объект с полем status в итоговом сообщении сессии.
-  let verdict = { status: 'discussion', note: `сессия обработчика не оставила вердикт (код завершения ${code})` };
-  for (const m of [...summary.matchAll(/\{[^{}]*"status"[^{}]*\}/g)].reverse()) {
-    try {
-      const v = JSON.parse(m[0]);
-      if (['done', 'rejected', 'discussion'].includes(v.status)) { verdict = { status: v.status, note: String(v.note ?? '').slice(0, 4000) }; break; }
-    } catch { /* не JSON — смотрим предыдущий */ }
+  // Вердикты — JSON-массив после последней пометки VERDICTS: в итоговом сообщении.
+  let verdicts = [];
+  const at = summary.lastIndexOf('VERDICTS:');
+  if (at >= 0) {
+    const tail = summary.slice(at + 9);
+    try { verdicts = JSON.parse(tail.slice(tail.indexOf('['), tail.lastIndexOf(']') + 1)); } catch { /* разбор ниже сочтёт, что вердиктов нет */ }
   }
+  const ids = new Set(queue.map((i) => i.id));
+  verdicts = (Array.isArray(verdicts) ? verdicts : []).filter((v) => v && ids.has(v.id) && ['done', 'rejected', 'discussion'].includes(v.status))
+    .map((v) => ({ id: v.id, status: v.status, note: String(v.note ?? '').slice(0, 4000) }));
 
   const changed = git('status', '--porcelain', '--untracked-files=no').split('\n').filter(Boolean).map((l) => l.slice(3));
+  let problem = null;
+  if (!verdicts.length) problem = `сессия не оставила вердиктов (код завершения ${code})`;
   if (changed.length) {
-    let problem = null;
     const foreign = changed.filter((f) => !ALLOWED_CHANGES.includes(f));
-    if (foreign.length) problem = `изменены посторонние файлы: ${foreign.join(', ')}`;
-    if (!problem && verdict.status !== 'done') problem = `код изменён, но вердикт «${verdict.status}»`;
+    if (!problem && foreign.length) problem = `изменены посторонние файлы: ${foreign.join(', ')}`;
+    if (!problem && !verdicts.some((v) => v.status === 'done')) problem = 'код изменён, но ни одна заявка не отмечена выполненной';
     if (!problem) {
       try {
         execFileSync('node', ['--check', 'src/factorio.mjs'], { cwd: ROOT, stdio: 'pipe' });
@@ -81,19 +83,38 @@ async function handle(item) {
     }
     if (problem) {
       // Отменённую работу не выбрасываем: её можно посмотреть и применить руками (git apply).
-      fs.writeFileSync(path.join(ROOT, 'feedback', `rejected-${item.id}.diff`), git('diff'));
-      revert();
-      verdict = { status: 'discussion', note: `правки отменены и сохранены в feedback/rejected-${item.id}.diff: ${problem}. Вердикт сессии был «${verdict.status}»: ${verdict.note}` };
+      const saved = `feedback/rejected-${Date.now()}.diff`;
+      fs.writeFileSync(path.join(ROOT, saved), git('diff'));
+      git('checkout', '--', '.');
+      problem += `; правки отменены и сохранены в ${saved}`;
     } else {
+      const done = verdicts.filter((v) => v.status === 'done');
       git('add', ...changed);
-      git('commit', '-q', '-m', `feedback ${item.id}: ${verdict.note.split('\n')[0].slice(0, 100)}\n\nЗаявка от ${item.from}. Обработано автоматически (src/feedback-worker.mjs).\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`);
-      // Отправка на GitHub — по возможности: недоступная сеть не должна останавливать разбор заявок.
-      try { git('push', '-q', 'origin', 'HEAD'); } catch (e) { log(`${item.id}: не удалось отправить на GitHub: ${String(e.stderr || e.message).trim().slice(0, 200)}`); }
+      git('commit', '-q', '-m', `feedback ${done.map((v) => v.id).join(', ')}: ${done[0].note.split('\n')[0].slice(0, 90)}\n\n${done.map((v) => `${v.id}: ${v.note}`).join('\n\n')}\n\nОбработано автоматически (src/feedback-worker.mjs).\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`);
       if (changed.includes('src/factorio.mjs')) restart();
     }
   }
-  setStatus(item.id, verdict.status, verdict.note);
-  log(`${item.id}: ${verdict.status} — ${verdict.note.replace(/\s+/g, ' ').slice(0, 300)}`);
+  if (problem) {
+    // Чтобы заход не повторялся бесконечно, заявки, которые сессия взяла (или первую в очереди), отдаём людям.
+    const taken = verdicts.length ? verdicts : [{ id: queue[0].id, note: '' }];
+    for (const v of taken) setStatus(v.id, 'discussion', `${problem}. ${v.note}`.trim());
+    return log(`заход не удался: ${problem}`);
+  }
+  for (const v of verdicts) {
+    setStatus(v.id, v.status, v.note);
+    log(`${v.id}: ${v.status} — ${v.note.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
+}
+
+// Всё закоммиченное (и обработчиком, и руками) регулярно уходит на GitHub.
+function push() {
+  try {
+    if (git('rev-parse', 'HEAD').trim() === git('rev-parse', 'origin/master').trim()) return;
+    git('push', '-q', 'origin', 'HEAD:master');
+    log('отправлено на GitHub');
+  } catch (e) {
+    log(`не удалось отправить на GitHub: ${String(e.stderr || e.message).trim().slice(0, 200)}`);
+  }
 }
 
 function restart() {
@@ -109,8 +130,9 @@ function restart() {
 log(`обработчик заявок запущен, модель ${MODEL}`);
 for (;;) {
   try {
-    const next = readItems().find((i) => i.status === 'new');
-    if (next) await handle(next);
+    const queue = readItems().filter((i) => i.status === 'new').sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0)).slice(0, 30);
+    if (queue.length) await handle(queue);
+    push();
   } catch (e) {
     log('ошибка обработчика:', e.message);
   }

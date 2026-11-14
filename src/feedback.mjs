@@ -5,6 +5,7 @@
 // Руками:  node src/feedback.mjs list [статус]
 //          node src/feedback.mjs show <id>
 //          node src/feedback.mjs set <id> <статус> [примечание]
+//          node src/feedback.mjs prio <id>                — разобрать в первую очередь
 //          node src/feedback.mjs add <от кого> <текст>
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,10 +24,11 @@ export function readItems() {
   return lines.map((l) => JSON.parse(l)).map((it) => ({ ...it, status: 'new', ...status[it.id] }));
 }
 
-export function setStatus(id, status, note) {
+export function setStatus(id, status, note, priority) {
   let all = {};
   try { all = JSON.parse(fs.readFileSync(STATUS, 'utf8')); } catch { /* первый статус */ }
-  all[id] = { status, note, updated: new Date().toISOString() };
+  // Приоритет ставят люди (команда prio); он сохраняется, пока заявка не разобрана.
+  all[id] = { status, note, priority: status === 'new' ? (priority ?? all[id]?.priority) : undefined, updated: new Date().toISOString() };
   fs.writeFileSync(STATUS, JSON.stringify(all, null, 1));
 }
 
@@ -44,9 +46,10 @@ export function submitFeedback(from, text) {
 if (import.meta.filename === process.argv[1]) {
   const [cmd, a, b, ...rest] = process.argv.slice(2);
   if (cmd === 'set' && a && b) { setStatus(a, b, rest.join(' ') || undefined); console.log(a, '→', b); }
+  else if (cmd === 'prio' && a) { setStatus(a, 'new', undefined, true); console.log(a, '→ в очередь с приоритетом'); }
   else if (cmd === 'add' && a && b) console.log(submitFeedback(a, [b, ...rest].join(' ')));
   else if (cmd === 'show' && a) console.log(readItems().find((i) => i.id === a) ?? 'нет такой заявки');
   else for (const i of readItems().filter((x) => !a || cmd !== 'list' || x.status === a)) {
-    console.log(`${i.id}  ${i.status.padEnd(11)} ${i.from.padEnd(14)} ${i.text.replace(/\s+/g, ' ').slice(0, 70)}${i.note ? `\n        ↳ ${i.note.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`);
+    console.log(`${i.id}${i.priority ? '!' : ' '} ${i.status.padEnd(11)} ${i.from.padEnd(14)} ${i.text.replace(/\s+/g, ' ').slice(0, 70)}${i.note ? `\n        ↳ ${i.note.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`);
   }
 }
