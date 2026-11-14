@@ -1,0 +1,28 @@
+name: robot
+services:
+  robot:
+    build: .
+    container_name: robot
+    hostname: robot
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s   # время сервисам на штатную остановку и сохранение
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 8g
+    cpus: 4
+    pids_limit: 4096
+    volumes:
+      - /home/darkkeks/robot:/home/robot
+    ports:
+      - "34197-34209:34197-34209/udp"   # игровые порты Factorio, видны снаружи
+      - "127.0.0.1:27015:27015"           # RCON Factorio — только для бота на хосте
+    networks: [net]
+networks:
+  net:
+    driver_opts:
+      com.docker.network.bridge.name: br-robot
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24

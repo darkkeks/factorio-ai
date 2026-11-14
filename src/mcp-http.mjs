@@ -1,0 +1,52 @@
+// Те же инструменты Factorio для внешних клиентов: MCP по HTTP (streamable HTTP, без сессий).
+// Каждый токен из mcp-tokens.json привязан к одному персонажу: { "токен": "имя персонажа" }.
+// Снаружи доступен как http://h1.darkkeks.me/factorio-mcp/ (nginx в контейнере karoo-apk).
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { ROOT, VOICE_HEARTBEAT } from './config.mjs';
+import { createFactorioServer } from './factorio.mjs';
+
+const HOST = process.env.MCP_HOST || '172.25.0.1'; // шлюз docker-сети server-stuff_default: виден nginx, не виден из интернета
+const PORT = Number(process.env.MCP_PORT || 8765);
+const TOKENS_FILE = path.join(ROOT, 'mcp-tokens.json');
+// Перед нами два nginx с таймаутом 60 с, поэтому долгие действия сворачиваем раньше: клиент просто вызовет ещё раз.
+const MAX_CALL_MS = 40_000;
+
+const stamp = () => new Date().toISOString().slice(11, 23);
+const chatSeen = new Map(); // персонаж -> экземпляр с памятью о прочитанном чате
+
+function botFor(req) {
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  let tokens = {};
+  try { tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8')); } catch { /* нет файла — нет доступа */ }
+  return Object.hasOwn(tokens, token) && token ? tokens[token] : null;
+}
+
+http.createServer(async (req, res) => {
+  const bot = botFor(req);
+  if (!bot) { res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}'); return; }
+  if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }).end(); return; }
+  const started = Date.now();
+  // Пока внешний бот действует, игра не должна стоять на паузе (см. pause-guard в контейнере robot).
+  const activity = () => { try { fs.writeFileSync(VOICE_HEARTBEAT, new Date().toISOString()); } catch { /* не критично */ } };
+  // Один экземпляр инструментов на персонажа, чтобы read_chat помнил, что уже прочитано.
+  const fx = createFactorioServer(bot, {
+    log: (line) => console.log(stamp(), line),
+    aborted: () => Date.now() - started > MAX_CALL_MS,
+    activity,
+    chatTool: chatSeen.get(bot) || chatSeen.set(bot, { seq: 0 }).get(bot),
+  });
+  try {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => { transport.close(); fx.server.instance.close(); });
+    await fx.server.instance.connect(transport);
+    await transport.handleRequest(req, res, JSON.parse(body));
+  } catch (e) {
+    console.log(stamp(), `${bot}: ошибка запроса: ${e.message}`);
+    if (!res.headersSent) res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: e.message }, id: null }));
+  }
+}).listen(PORT, HOST, () => console.log(stamp(), `MCP Factorio слушает http://${HOST}:${PORT}`));

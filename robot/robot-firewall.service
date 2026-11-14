@@ -1,0 +1,11 @@
+[Unit]
+Description=Firewall for the robot container network
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/darkkeks/claude/discord-voice/robot/firewall.sh
+
+[Install]
+WantedBy=multi-user.target

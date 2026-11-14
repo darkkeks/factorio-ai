@@ -1,0 +1,11 @@
+node_modules
+models
+workspace
+*.log
+rcon.json
+mcp-tokens.json
+state*.json
+feedback/queue.jsonl
+feedback/status.json
+feedback/verdict-*.json
+feedback/session-*.txt

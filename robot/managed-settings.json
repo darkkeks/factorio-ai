@@ -1,0 +1,6 @@
+{
+  "model": "claude-opus-5-5",
+  "availableModels": ["claude-opus-5-5"],
+  "availableModelsMatch": "exact",
+  "enforceAvailableModels": true
+}
