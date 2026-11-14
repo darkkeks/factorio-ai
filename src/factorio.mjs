@@ -78,7 +78,8 @@ const BODY = {
   status: `
     local e = bot()
     local players = {}
-    for _, p in pairs(game.connected_players) do players[#players+1] = {name=p.name, pos=P(p.position), dist=r1(dist(p.position, e.position))} end
+    -- Игрок camera — клиент-камера веб-карты (src/map.mjs), не человек.
+    for _, p in pairs(game.connected_players) do if p.name ~= 'camera' then players[#players+1] = {name=p.name, pos=P(p.position), dist=r1(dist(p.position, e.position))} end end
     local bots = {}
     for n, b in pairs(storage.vb) do if b.valid and n ~= A.bot then bots[#bots+1] = {name=n, pos=P(b.position)} end end
     local crafting = {}
