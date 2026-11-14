@@ -32,6 +32,13 @@ export function setStatus(id, status, note, priority) {
   fs.writeFileSync(STATUS, JSON.stringify(all, null, 1));
 }
 
+/** Пометить, что о решении по заявке уже сообщили в чат. */
+export function markAnnounced(id) {
+  const all = JSON.parse(fs.readFileSync(STATUS, 'utf8'));
+  if (all[id]) all[id].announced = true;
+  fs.writeFileSync(STATUS, JSON.stringify(all, null, 1));
+}
+
 export function submitFeedback(from, text) {
   fs.mkdirSync(DIR, { recursive: true });
   const items = readItems();

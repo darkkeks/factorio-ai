@@ -9,7 +9,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { ROOT } from './config.mjs';
-import { readItems, setStatus } from './feedback.mjs';
+import { readItems, setStatus, markAnnounced } from './feedback.mjs';
+import { lua } from './rcon.mjs';
 
 const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/claude-code/bin/claude');
 const MODEL = process.env.WORKER_MODEL || 'claude-fable-5-2';
@@ -117,12 +118,35 @@ function push() {
   }
 }
 
+// О каждом решении по заявке сообщаем в игровой чат ботов: голосовым сессиям оно придёт как «[игровой чат]»,
+// внешние клиенты увидят его в read_chat. Сообщаем не сразу после перезапуска ботов, иначе они его пропустят.
+let lastRestart = 0;
+const STATUS_RU = { done: 'выполнена', rejected: 'отклонена', discussion: 'вынесена на обсуждение людей' };
+async function announce() {
+  if (Date.now() - lastRestart < 40_000) return;
+  const fresh = readItems().filter((i) => STATUS_RU[i.status] && !i.announced && Date.now() - Date.parse(i.updated) < 3600_000);
+  for (const i of fresh) {
+    const message = `Заявка ${i.id} от ${i.from} ${STATUS_RU[i.status]}. ${(i.note ?? '').replace(/\s+/g, ' ').slice(0, 600)}`;
+    await lua(`
+      storage.vb_chat = storage.vb_chat or {seq=0, items={}}
+      local c = storage.vb_chat
+      c.seq = c.seq + 1
+      c.items[#c.items+1] = {seq=c.seq, from=A.from, text=A.message}
+      if #c.items > 50 then table.remove(c.items, 1) end
+      game.print('[color=0.6,0.8,1]'..A.from..':[/color] '..A.message)
+      return {sent=true}`, { from: 'разработчики', message });
+    markAnnounced(i.id);
+    log(`${i.id}: сообщено в чат`);
+  }
+}
+
 function restart() {
   const running = execFileSync('tmux', ['list-windows', '-t', '0:', '-F', '#W'], { encoding: 'utf8' }).split('\n');
   for (const [name, script] of Object.entries(RESTART)) {
     if (!running.includes(name)) continue;
     execFileSync('tmux', ['kill-window', '-t', `0:${name}`]);
     execFileSync('tmux', ['new-window', '-d', '-t', '0:', '-n', name, path.join(ROOT, script)]);
+    lastRestart = Date.now();
     log(`перезапущено окно ${name}`);
   }
 }
@@ -133,6 +157,7 @@ for (;;) {
     const queue = readItems().filter((i) => i.status === 'new').sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0)).slice(0, 30);
     if (queue.length) await handle(queue);
     push();
+    await announce();
   } catch (e) {
     log('ошибка обработчика:', e.message);
   }
