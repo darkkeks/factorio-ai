@@ -222,7 +222,11 @@ const BODY = {
       pcall(function() if t.held_stack.valid_for_read then r.holding = t.held_stack.name end end)
     end
     if BELT[t.type] then r.on_belt = belt_items(t) r.lanes = belt_lanes(t) end
-    if t.type == 'underground-belt' then r.underground = t.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли' end
+    if t.type == 'underground-belt' then r.underground = t.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
+      local o = t.underground_belt_neighbour
+      if o then r.paired_with = P(o.position)
+      else r.paired_with = t.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход, смотрящий туда же' or 'пары нет: позади по ходу в пределах дальности нужен вход, смотрящий туда же' end
+    end
     pcall(function() r.crafting_progress = r1(t.crafting_progress) end)
     pcall(function() if t.mining_target then r.mining_target = t.mining_target.name end end)
     local inv = {}
@@ -755,7 +759,7 @@ export function createFactorioServer(botName, hooks) {
       { name: z.string(), radius: z.number().min(1).max(1000).default(300) },
       (a) => run('find', a)),
 
-    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground).', coords, (a) => run('inspect', a)),
+    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with).', coords, (a) => run('inspect', a)),
 
     def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, препятствия обходит; если дойти не удалось, в ответе not_reached и место, где остановился.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio') },
