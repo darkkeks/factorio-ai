@@ -94,31 +94,90 @@ const BODY = {
     if not p or not p.connected then fail('игрок '..A.player..' не в игре') end
     return {x=p.position.x, y=p.position.y}`,
 
-  step: `
+  // Идти по ломаной A.points (первая точка — начало пути), A.i — номер точки, к которой сейчас идём. Точка считается
+  // пройденной, если персонаж рядом с ней или уже проскочил её по ходу отрезка: между опросами он успевает пройти
+  // полклетки и больше. Курс держится на точку отрезка чуть впереди персонажа, чтобы его не сносило с линии.
+  follow: `
     local e = bot()
-    local d = dist(e.position, A)
-    if d <= A.tol then e.walking_state = {walking=false, direction=e.walking_state.direction} return {done=true, x=e.position.x, y=e.position.y} end
-    local idx = math.floor(math.atan2(A.x-e.position.x, -(A.y-e.position.y))/(math.pi/4)+0.5) % 8
+    local p = e.position
+    local i = A.i
+    local a, w, vx, vy, len
+    while true do
+      a, w = A.points[i-1], A.points[i]
+      if not w then e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {done=true, x=p.x, y=p.y} end
+      vx, vy = w.x-a.x, w.y-a.y
+      len = (vx*vx+vy*vy)^0.5
+      local d = dist(p, w)
+      if d <= 0.2 or len < 0.01 or (d <= 0.8 and (p.x-w.x)*vx + (p.y-w.y)*vy >= 0) then i = i + 1 else break end
+    end
+    -- Куда идём этим шагом: к очередной точке, а если снесло с линии — наискосок обратно на линию.
+    local ux, uy = vx/len, vy/len
+    local t = (p.x-a.x)*ux + (p.y-a.y)*uy
+    local off = math.abs((p.x-a.x)*uy - (p.y-a.y)*ux)
+    local tx, ty = w.x, w.y
+    if off > 0.12 and t < len then local q = math.min(len, math.max(t, 0) + off) tx, ty = a.x+ux*q, a.y+uy*q end
+    local idx = math.floor(math.atan2(tx-p.x, -(ty-p.y))/(math.pi/4)+0.5) % 8
+    local ang = idx*math.pi/4
+    local go = (tx-p.x)*math.sin(ang) - (ty-p.y)*math.cos(ang)
+    -- Следующая команда придёт только через A.n тиков, и всё это время персонаж идёт сам. Чтобы он не проскочил
+    -- точку, перед ней он сбавляет шаг (только медленнее обычного, быстрее игрока — никогда).
+    e.character_running_speed_modifier = 0
+    local full = e.character_running_speed
+    if not (full > 0) then full = 0.15 end
+    -- На конвейере шаг сбавляем меньше: слишком медленного персонажа лента унесёт.
+    local on_belt = e.surface.count_entities_filtered{area={{p.x-0.2, p.y-0.2}, {p.x+0.2, p.y+0.2}}, type={'transport-belt', 'underground-belt', 'splitter'}} > 0
+    e.character_running_speed_modifier = math.max(on_belt and -0.6 or -0.95, math.min(0, go/(A.n*full) - 1))
     e.walking_state = {walking=true, direction=idx*2}
-    return {x=e.position.x, y=e.position.y}`,
+    return {i=i, d=dist(p, w), off=off, tick=game.tick}`,
 
-  stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} return {x=e.position.x, y=e.position.y}`,
+  stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {x=e.position.x, y=e.position.y}`,
 
-  // Обход препятствий: A* по клеткам от персонажа (проверяется только «можно ли здесь стоять»), идёт он потом сам, пешком.
-  // Если до цели не дотянулись за лимит узлов, возвращается путь до самой близкой к цели достигнутой клетки.
+  // Поиск пути: A* по клеткам от персонажа (проверяется только «можно ли здесь стоять» — постройки, деревья, вода,
+  // скалы), идёт он потом сам, пешком. Эвристика с весом: путь чуть длиннее кратчайшего, зато хватает на дальние переходы.
+  // Если в самой цели стоять нельзя, целью становится ближайшая к ней свободная клетка (near). Если до цели не дотянулись,
+  // возвращается путь до самой близкой к ней достигнутой клетки; unreachable — перебрали всё, куда можно дойти, цели там нет.
+  // В ответе только повороты пути, первая точка — клетка, где стоит персонаж.
   path: `
     local e = bot()
     local s = e.surface
-    local sx, sy = math.floor(e.position.x), math.floor(e.position.y)
+    -- Узлы стоят через полклетки (x, y здесь в половинках клетки): так персонаж проходит и в щель между соседними постройками.
+    local sx, sy = math.floor(e.position.x*2+0.5), math.floor(e.position.y*2+0.5)
     local function key(x, y) return (x+1000000)*4000000 + (y+1000000) end
     local fc = {}
     local function free(x, y)
       local k = key(x, y)
       local v = fc[k]
-      if v == nil then v = s.can_place_entity{name='character', position={x+0.5, y+0.5}} fc[k] = v end
+      if v == nil then v = s.can_place_entity{name='character', position={x/2, y/2}} fc[k] = v end
       return v
     end
-    local function h(x, y) local dx, dy = math.abs(x+0.5-A.x), math.abs(y+0.5-A.y) return math.max(dx, dy) + 0.41*math.min(dx, dy) end
+    -- Конвейеры проходимы, но сносят персонажа: путь по ним дороже, так что ленты он пересекает, а не идёт вдоль.
+    local belt = {}
+    local p0 = e.position
+    for _, b in pairs(s.find_entities_filtered{area={{math.min(p0.x, A.x)-20, math.min(p0.y, A.y)-20}, {math.max(p0.x, A.x)+20, math.max(p0.y, A.y)+20}}, type={'transport-belt', 'underground-belt', 'splitter'}}) do
+      local bb = b.bounding_box
+      for tx = math.floor(bb.left_top.x+0.1), math.floor(bb.right_bottom.x-0.1) do
+        for ty = math.floor(bb.left_top.y+0.1), math.floor(bb.right_bottom.y-0.1) do belt[key(tx, ty)] = true end
+      end
+    end
+    local function on_belt(x, y)
+      local ax, bx, ay, by = math.floor(x/2-0.2), math.floor(x/2+0.2), math.floor(y/2-0.2), math.floor(y/2+0.2)
+      return belt[key(ax, ay)] or belt[key(bx, ay)] or belt[key(ax, by)] or belt[key(bx, by)]
+    end
+    -- Есть ли где встать в пределах tol от цели; если нет — ищем ближайшее свободное место в 6 клетках от неё.
+    local tol, near = A.tol, false
+    local gx, gy = math.floor(A.x*2+0.5), math.floor(A.y*2+0.5)
+    local md
+    for pass = 1, 2 do
+      local r = pass == 1 and math.ceil(tol*2) or 12
+      if not md then
+        for x = gx-r, gx+r do for y = gy-r, gy+r do
+          local d = dist({x=x/2, y=y/2}, A)
+          if (not md or d < md) and (pass == 2 or d <= tol) and ((x == sx and y == sy) or free(x, y)) then md = d end
+        end end
+      end
+    end
+    if md and md > tol then tol = md + 0.01 near = true end
+    local function h(x, y) local dx, dy = math.abs(x/2-A.x), math.abs(y/2-A.y) return math.max(dx, dy) + 0.41*math.min(dx, dy) end
     local heap, n = {}, 0
     local function push(f, x, y)
       n = n + 1
@@ -145,37 +204,47 @@ const BODY = {
       end
       return top
     end
-    local g, from, closed = {[key(sx, sy)]=0}, {}, {}
-    push(h(sx, sy), sx, sy)
+    local g, from, closed, pc, belts = {[key(sx, sy)]=0}, {}, {}, {}, next(belt) ~= nil
+    push(1.3*h(sx, sy), sx, sy)
     local goal, best, bh, expanded = nil, nil, h(sx, sy), 0
-    while n > 0 and expanded < 2500 do
+    while n > 0 and expanded < 3000 do
       local c = pop()
       local x, y = c[2], c[3]
       local k = key(x, y)
       if not closed[k] then
         closed[k] = true
         expanded = expanded + 1
-        if dist({x=x+0.5, y=y+0.5}, A) <= A.tol then goal = {x, y} break end
+        if dist({x=x/2, y=y/2}, A) <= tol then goal = {x, y} break end
         if h(x, y) < bh - 0.01 then bh = h(x, y) best = {x, y} end
         for dx = -1, 1 do for dy = -1, 1 do
           local nx, ny = x+dx, y+dy
           local nk = key(nx, ny)
           if (dx ~= 0 or dy ~= 0) and not closed[nk] and free(nx, ny) and (dx == 0 or dy == 0 or (free(nx, y) and free(x, ny))) then
-            local cost = (dx ~= 0 and dy ~= 0) and 1.41 or 1
-            if not (free(nx+1, ny) and free(nx-1, ny) and free(nx, ny+1) and free(nx, ny-1)) then cost = cost + 1.5 end
-            local ng = g[k] + cost
-            if not g[nk] or ng < g[nk] then g[nk] = ng from[nk] = {x, y} push(ng + h(nx, ny), nx, ny) end
+            -- Вплотную к препятствию и по конвейеру идти дороже: где есть место, путь держится от них в стороне.
+            local pen = pc[nk]
+            if pen == nil then
+              pen = 0
+              if not (free(nx+1, ny) and free(nx-1, ny) and free(nx, ny+1) and free(nx, ny-1)) then pen = 0.75 end
+              if belts and on_belt(nx, ny) then pen = pen + 1.5 end
+              pc[nk] = pen
+            end
+            local ng = g[k] + ((dx ~= 0 and dy ~= 0) and 0.705 or 0.5) + pen
+            if not g[nk] or ng < g[nk] then g[nk] = ng from[nk] = {x, y} push(ng + 1.3*h(nx, ny), nx, ny) end
           end
         end end
       end
     end
-    local last = goal or best
     local rev = {}
-    local c = last
+    local c = goal or best
     while c and not (c[1] == sx and c[2] == sy) do rev[#rev+1] = c c = from[key(c[1], c[2])] end
-    local pts = {}
-    for i = #rev, 1, -1 do pts[#pts+1] = {x=rev[i][1]+0.5, y=rev[i][2]+0.5} end
-    return {found=goal ~= nil, count=#pts, points=pts}`,
+    local pts = {{x=sx/2, y=sy/2}}
+    for i = #rev, 1, -1 do pts[#pts+1] = {x=rev[i][1]/2, y=rev[i][2]/2} end
+    local out = {pts[1]}
+    for i = 2, #pts do
+      local a, b, c = pts[i-1], pts[i], pts[i+1]
+      if not c or b.x-a.x ~= c.x-b.x or b.y-a.y ~= c.y-b.y then out[#out+1] = b end
+    end
+    return {found=goal ~= nil, near=near, unreachable=goal == nil and n == 0, cells=#pts-1, points=out}`,
 
   look: `
     local e = bot()
@@ -669,57 +738,87 @@ export function createFactorioServer(botName, hooks) {
     return null;
   }
 
-  /** Идти по прямой к точке. Итог: done | stuck (упёрся или не уложился в limitMs) | interrupted. */
-  async function go(x, y, tol, pollMs, limitMs) {
-    const start = Date.now();
+  let walkSeq = 0; // новый поход отменяет прежний: двое не могут вести одного персонажа
+
+  /** Идти по ломаной points (BODY.follow). Итог: done | stuck (перестал продвигаться) | lost (снесло с пути) | timeout | interrupted | superseded. */
+  async function follow(points, my, deadline) {
+    let i = 2;
     let best = Infinity;
     let lastProgress = Date.now();
+    // Сколько тиков проходит между двумя командами (задержка RCON бывает и полсекунды): по нему персонаж рассчитывает шаг.
+    // Берём худший из двух последних промежутков; первая команда — с запасом.
+    let n = 30, lastTick = null, lastGap = 0, sent = Date.now(), gapMs = 0;
     for (;;) {
-      const s = await run('step', { x, y, tol });
-      if (s.done) return { done: true, x: s.x, y: s.y };
-      if (hooks.aborted()) return { interrupted: true, x: s.x, y: s.y };
-      // Застрял — значит, перестал приближаться к цели (а не просто стоит: по ленте может и возить туда-сюда).
-      const d = Math.hypot(s.x - x, s.y - y);
-      if (d < best - 0.3) { best = d; lastProgress = Date.now(); }
-      if (Date.now() - lastProgress > 1500 || Date.now() - start > limitMs) return { stuck: true, x: s.x, y: s.y };
-      await sleep(pollMs);
+      const s = await run('follow', { points, i, n });
+      gapMs = Date.now() - sent;
+      if (s.done) return { done: true };
+      if (my !== walkSeq) return { superseded: true };
+      if (hooks.aborted()) return { interrupted: true };
+      if (lastTick !== null) { const gap = s.tick - lastTick; n = Math.max(gap, lastGap) + 1; lastGap = gap; }
+      lastTick = s.tick;
+      // Снесло далеко от пути (например, задержка скакнула) — путь надо искать заново.
+      if (s.off > 1.5) return { lost: true };
+      // Застрял — значит, перестал приближаться к очередной точке (а не просто стоит: по ленте может и возить туда-сюда).
+      if (s.i > i) { i = s.i; best = Infinity; }
+      if (s.d < best - 0.05) { best = s.d; lastProgress = Date.now(); }
+      if (Date.now() - lastProgress > Math.max(1500, gapMs * 4)) return { stuck: true };
+      if (Date.now() >= deadline) return { timeout: true };
+      await sleep(30);
+      sent = Date.now();
     }
   }
 
-  // Ходьба только пешком. Сначала по прямой; упёрся — ищем обход (BODY.path) и идём по его клеткам.
-  // Не получилось — честно говорим, где остановились: переносить персонажа нельзя.
+  // Ходьба только пешком: ищем путь в обход препятствий (BODY.path) и идём по нему. Дальний путь строится кусками;
+  // если что-то помешало по дороге, путь ищется заново с нового места. Не получилось — честно говорим, где
+  // остановились: переносить персонажа нельзя. pos в ответе — настоящая позиция после остановки.
   async function walk(x, y, tol = 1.5) {
+    const my = ++walkSeq;
     const deadline = Date.now() + 90_000;
-    const pos = (s) => ({ x: Math.round(s.x), y: Math.round(s.y) });
+    const r1 = (v) => Math.round(v * 10) / 10;
+    let out = {};
     try {
-      let s = await go(x, y, tol, 120, 90_000);
-      let detours = 0;
-      let bestDist = Infinity;
-      while (s.stuck && Date.now() < deadline && detours < 12) {
+      let bestEnd = Infinity;
+      let stuckAt = null;
+      for (let plans = 0; ; plans++) {
+        if (plans >= 20) { out = { fail: 'не дошёл: слишком много обходов' }; break; }
         const p = await run('path', { x, y, tol });
         const points = Array.isArray(p.points) ? p.points : [];
-        if (!points.length) break;
-        // Неполный обход имеет смысл, только пока он приближает к цели, иначе будем ходить кругами.
+        const near = p.near ? 'в самой точке стоять нельзя (занято), встал как можно ближе' : undefined;
         const end = points[points.length - 1];
-        const endDist = Math.hypot(end.x - x, end.y - y);
-        if (!p.found && endDist > bestDist - 1) break;
-        bestDist = Math.min(bestDist, endDist);
-        detours++;
-        for (const w of points) {
-          s = await go(w.x, w.y, 0.45, 60, 4000);
-          if (!s.done) break;
+        const endDist = end ? Math.hypot(end.x - x, end.y - y) : Infinity;
+        // Неполный путь имеет смысл, только пока он приближает к цели, иначе будем ходить кругами.
+        if (points.length < 2 || (!p.found && endDist > bestEnd - 1)) {
+          if (p.found) out = { note: near };
+          else if (p.unreachable) out = { fail: 'пешком туда не дойти: цель отрезана препятствиями (вода, скалы, постройки). Стою в ближайшей к ней достижимой точке' };
+          else out = { fail: 'не нашёл обход препятствия. Стою в ближайшей к цели точке, до которой нашёл путь; осмотрись (look_around) и иди через промежуточные точки' };
+          break;
         }
-        if (s.interrupted) break;
-        if (s.done) s = await go(x, y, tol, 120, Math.max(1000, deadline - Date.now()));
+        bestEnd = Math.min(bestEnd, endDist);
+        const s = await follow(points, my, deadline);
+        if (s.superseded) { out = { interrupted: 'прервано другим действием с ходьбой' }; break; }
+        if (s.interrupted) { out = { interrupted: 'прервано новой репликой' }; break; }
+        if (s.timeout) { out = { fail: 'ещё не дошёл: вызови ещё раз' }; break; }
+        if (s.done && p.found) { out = { note: near }; break; }
+        if (s.stuck) {
+          // Дважды упёрся на одном месте — путь есть только на бумаге (или игра стоит на паузе).
+          const me = await run('pos');
+          if (stuckAt && Math.hypot(me.x - stuckAt.x, me.y - stuckAt.y) < 0.5) { out = { fail: 'упёрся в препятствие и не могу его обойти. Осмотрись (look_around) и иди через промежуточные точки' }; break; }
+          stuckAt = me;
+          bestEnd = Infinity;
+        }
       }
-      if (s.done) return detours ? { pos: pos(s), note: 'дошёл пешком в обход препятствия' } : { pos: pos(s) };
-      if (s.interrupted) return { interrupted: 'прервано новой репликой', pos: pos(s) };
-      const left = Math.round(Math.hypot(s.x - x, s.y - y));
-      if (Date.now() >= deadline) return { pos: pos(s), not_reached: `ещё не дошёл, осталось около ${left} клеток: вызови ещё раз` };
-      return { pos: pos(s), not_reached: `упёрся в препятствие и не нашёл обход, до цели около ${left} клеток. Осмотрись (look_around) и иди в обход через промежуточные точки` };
     } finally {
-      await run('stop').catch(() => {});
+      if (my === walkSeq) {
+        const at = await run('stop').catch(() => null);
+        if (at) out.pos = { x: r1(at.x), y: r1(at.y) };
+      }
     }
+    if (!out.pos) { const at = await run('pos'); out.pos = { x: r1(at.x), y: r1(at.y) }; }
+    const res = { pos: out.pos };
+    if (out.note) res.note = out.note;
+    if (out.interrupted) res.interrupted = out.interrupted;
+    if (out.fail) { res.not_reached = out.fail; res.distance_left = r1(Math.hypot(out.pos.x - x, out.pos.y - y)); }
+    return res;
   }
 
   /** Подойти, если цель дальше reach. */
@@ -761,7 +860,7 @@ export function createFactorioServer(botName, hooks) {
 
     def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with).', coords, (a) => run('inspect', a)),
 
-    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, препятствия обходит; если дойти не удалось, в ответе not_reached и место, где остановился.',
+    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Если дойти не удалось — not_reached с причиной и distance_left: персонаж остановился в ближайшей к цели точке, до которой нашёл путь.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio') },
       async (a) => {
         let target = a;
