@@ -87,6 +87,8 @@ async function handle(item) {
     } else {
       git('add', ...changed);
       git('commit', '-q', '-m', `feedback ${item.id}: ${verdict.note.split('\n')[0].slice(0, 100)}\n\nЗаявка от ${item.from}. Обработано автоматически (src/feedback-worker.mjs).\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`);
+      // Отправка на GitHub — по возможности: недоступная сеть не должна останавливать разбор заявок.
+      try { git('push', '-q', 'origin', 'HEAD'); } catch (e) { log(`${item.id}: не удалось отправить на GitHub: ${String(e.stderr || e.message).trim().slice(0, 200)}`); }
       if (changed.includes('src/factorio.mjs')) restart();
     }
   }
