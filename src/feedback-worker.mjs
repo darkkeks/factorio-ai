@@ -15,7 +15,7 @@ const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/
 const MODEL = process.env.WORKER_MODEL || 'claude-fable-5-2';
 const TIMEOUT_MS = 45 * 60_000;
 const ALLOWED_CHANGES = ['src/factorio.mjs', 'README.md'];
-const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)', 'Write(feedback/verdict-*.json)',
+const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)',
   'Bash(node --check *)', 'Bash(node src/tool-test.mjs *)', 'Bash(git diff *)', 'Bash(git status *)'];
 // Окна tmux, которые нужно перезапустить после изменения инструментов (только если они сейчас запущены).
 const RESTART = { 'discord-voice': 'run.sh', 'factorio-mcp': 'run-mcp.sh' };
@@ -43,8 +43,6 @@ function revert() {
 async function handle(item) {
   log(`${item.id} от ${item.from}: беру в работу`);
   setStatus(item.id, 'in_progress');
-  const verdictFile = path.join(ROOT, 'feedback', `verdict-${item.id}.json`);
-  fs.rmSync(verdictFile, { force: true });
   if (git('status', '--porcelain', '--untracked-files=no').trim()) {
     setStatus(item.id, 'discussion', 'обработчик не запускался: в рабочей папке есть незакоммиченные правки, их нужно разобрать руками');
     return log(`${item.id}: в репозитории незакоммиченные правки, пропускаю`);
@@ -56,11 +54,14 @@ async function handle(item) {
   try { summary = JSON.parse(out).result ?? ''; } catch { summary = out.slice(-2000); }
   fs.writeFileSync(path.join(ROOT, 'feedback', `session-${item.id}.txt`), summary);
 
+  // Вердикт — последний JSON-объект с полем status в итоговом сообщении сессии.
   let verdict = { status: 'discussion', note: `сессия обработчика не оставила вердикт (код завершения ${code})` };
-  try {
-    const v = JSON.parse(fs.readFileSync(verdictFile, 'utf8'));
-    if (['done', 'rejected', 'discussion'].includes(v.status)) verdict = { status: v.status, note: String(v.note ?? '').slice(0, 4000) };
-  } catch { /* вердикта нет */ }
+  for (const m of [...summary.matchAll(/\{[^{}]*"status"[^{}]*\}/g)].reverse()) {
+    try {
+      const v = JSON.parse(m[0]);
+      if (['done', 'rejected', 'discussion'].includes(v.status)) { verdict = { status: v.status, note: String(v.note ?? '').slice(0, 4000) }; break; }
+    } catch { /* не JSON — смотрим предыдущий */ }
+  }
 
   const changed = git('status', '--porcelain', '--untracked-files=no').split('\n').filter(Boolean).map((l) => l.slice(3));
   if (changed.length) {
@@ -79,8 +80,10 @@ async function handle(item) {
       }
     }
     if (problem) {
+      // Отменённую работу не выбрасываем: её можно посмотреть и применить руками (git apply).
+      fs.writeFileSync(path.join(ROOT, 'feedback', `rejected-${item.id}.diff`), git('diff'));
       revert();
-      verdict = { status: 'discussion', note: `правки отменены: ${problem}. Вердикт сессии был «${verdict.status}»: ${verdict.note}` };
+      verdict = { status: 'discussion', note: `правки отменены и сохранены в feedback/rejected-${item.id}.diff: ${problem}. Вердикт сессии был «${verdict.status}»: ${verdict.note}` };
     } else {
       git('add', ...changed);
       git('commit', '-q', '-m', `feedback ${item.id}: ${verdict.note.split('\n')[0].slice(0, 100)}\n\nЗаявка от ${item.from}. Обработано автоматически (src/feedback-worker.mjs).\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`);

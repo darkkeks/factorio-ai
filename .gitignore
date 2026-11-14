@@ -8,4 +8,5 @@ state*.json
 feedback/queue.jsonl
 feedback/status.json
 feedback/verdict-*.json
+feedback/rejected-*.diff
 feedback/session-*.txt
