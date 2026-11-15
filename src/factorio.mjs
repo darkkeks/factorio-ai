@@ -115,6 +115,11 @@ local function place_one(e, a)
     else r.paired_with = n.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход' or 'пары нет: позади по ходу в пределах дальности нужен вход' end
   end
   if n.type == 'inserter' then r.takes_from, r.puts_to = arm(n) end
+  -- Рецепт сборочного автомата из шаблона: то же, что set_recipe сразу после постройки.
+  if a.recipe and n.type == 'assembling-machine' then
+    local rc = e.force.recipes[a.recipe]
+    if rc and rc.enabled and pcall(function() n.set_recipe(rc) end) then r.recipe = a.recipe end
+  end
   return r
 end
 `;
@@ -424,6 +429,114 @@ const BODY = {
     end
     if used > 0 then storage.vb_pm[A.bot] = game.tick end
     return {results=out, waiting=waiting, far=far}`,
+
+  // Шаблоны построек: запомненная расстановка, которую персонаж потом ставит сам из инвентаря (как игрок по чертежу,
+  // только руками). Хранятся в storage.vb_tpl, общие для всех ботов; менять и удалять шаблон может только тот, кто сохранил.
+  // В шаблоне: предмет, смещение центра постройки от северо-западного угла шаблона, направление, вход/выход подземного
+  // конвейера, рецепт сборочного автомата. Сохранить можно только то, что персонаж видит рядом с собой.
+  tpl_save: `
+    local e = bot()
+    storage.vb_tpl = storage.vb_tpl or {}
+    local old = storage.vb_tpl[A.name]
+    if old and old.by ~= A.bot then fail('шаблон '..A.name..' уже есть, его сохранил '..old.by..': выбери другое имя') end
+    if A.x2 - A.x1 > 50 or A.y2 - A.y1 > 50 then fail('область больше 50×50 клеток') end
+    for _, c in pairs({{A.x1, A.y1}, {A.x2, A.y1}, {A.x1, A.y2}, {A.x2, A.y2}}) do
+      if dist(e.position, {x=c[1], y=c[2]}) > 60 then fail('область должна быть целиком в пределах 60 клеток от персонажа: подойди ближе') end
+    end
+    local mine = 0
+    for _, t in pairs(storage.vb_tpl) do if t.by == A.bot then mine = mine + 1 end end
+    if not old and mine >= 20 then fail('у тебя уже 20 шаблонов: удали ненужный (template_delete)') end
+    local found, not_saved = {}, {}
+    local bx0, by0, bx1, by1
+    for _, c in pairs(e.surface.find_entities_filtered{area={{A.x1+0.05, A.y1+0.05}, {A.x2-0.05, A.y2-0.05}}, force=e.force}) do
+      if not SKIP[c.type] and c.type ~= 'entity-ghost' and c.type ~= 'tile-ghost' then
+        local it = c.prototype.items_to_place_this and c.prototype.items_to_place_this[1]
+        if it and (it.count or 1) == 1 then
+          local bb = c.bounding_box
+          local ax, ay, cx, cy = math.floor(bb.left_top.x+0.01), math.floor(bb.left_top.y+0.01), math.ceil(bb.right_bottom.x-0.01), math.ceil(bb.right_bottom.y-0.01)
+          bx0 = math.min(bx0 or ax, ax) by0 = math.min(by0 or ay, ay) bx1 = math.max(bx1 or cx, cx) by1 = math.max(by1 or cy, cy)
+          local rec = {item=it.name, ent=c.name, x=c.position.x, y=c.position.y, dir=c.supports_direction and dirname(c.direction) or 'north'}
+          if c.type == 'underground-belt' then rec.ug = c.belt_to_ground_type end
+          if c.type == 'assembling-machine' then pcall(function() local rc = c.get_recipe() if rc then rec.recipe = rc.name end end) end
+          found[#found+1] = rec
+        else not_saved[c.name] = (not_saved[c.name] or 0) + 1 end
+      end
+    end
+    if #found == 0 then fail('в области нет построек, которые можно поставить из инвентаря') end
+    if #found > 100 then fail('в области '..#found..' построек, в шаблоне можно не больше 100: возьми область меньше') end
+    table.sort(found, function(a, b) if a.y ~= b.y then return a.y < b.y end return a.x < b.x end)
+    local items, cost = {}, {}
+    for i, f in ipairs(found) do
+      items[i] = {item=f.item, ent=f.ent, dx=f.x-bx0, dy=f.y-by0, dir=f.dir, ug=f.ug, recipe=f.recipe}
+      cost[f.item] = (cost[f.item] or 0) + 1
+    end
+    storage.vb_tpl[A.name] = {by=A.bot, w=bx1-bx0, h=by1-by0, items=items}
+    return {saved=A.name, replaced=old ~= nil, origin={x=bx0, y=by0}, size={w=bx1-bx0, h=by1-by0}, entities=#items, cost=cost, not_saved=not_saved}`,
+
+  // Разметка шаблона на месте: A.x, A.y — клетка северо-западного угла, A.rot — число поворотов на 90° по часовой.
+  // Что уже стоит (такая же постройка в той же точке) — в план не попадает. A.check — заодно проверить, свободно ли место.
+  tpl_plan: `
+    local e = bot()
+    local t = (storage.vb_tpl or {})[A.name]
+    if not t then fail('нет шаблона '..A.name..' (список шаблонов — template_cost без имени)') end
+    local s = e.surface
+    local ox, oy = math.floor(A.x), math.floor(A.y)
+    local w, h = t.w, t.h
+    if A.rot % 2 == 1 then w, h = h, w end
+    local can_check = A.check and dist(e.position, {x=ox+w/2, y=oy+h/2}) <= 60
+    local out, need, have, turned, blocked, already = {}, {}, {}, {}, {}, 0
+    for _, it in ipairs(t.items) do
+      local dx, dy, d = it.dx, it.dy, defines.direction[it.dir]
+      local ch = t.h
+      for k = 1, A.rot do dx, dy = ch - dy, dx ch = (ch == t.h) and t.w or t.h d = (d + 4) % 16 end
+      local x, y = ox + dx, oy + dy
+      local same
+      for _, c in pairs(s.find_entities_filtered{name=it.ent, area={{x-0.1, y-0.1}, {x+0.1, y+0.1}}}) do
+        if dist(c.position, {x=x, y=y}) < 0.1 then same = c end
+      end
+      if same then
+        already = already + 1
+        if same.supports_direction and same.direction ~= d and #turned < 10 then turned[#turned+1] = {item=it.item, x=x, y=y, stands=dirname(same.direction), template=dirname(d)} end
+      else
+        need[it.item] = (need[it.item] or 0) + 1
+        out[#out+1] = {item=it.item, x=x, y=y, direction=dirname(d), underground=it.ug, recipe=it.recipe}
+        if can_check and not s.can_place_entity{name=it.ent, position={x, y}, direction=d, force=e.force, build_check_type=defines.build_check_type.manual} then
+          blocked[#blocked+1] = {item=it.item, x=x, y=y}
+        end
+      end
+    end
+    for k in pairs(need) do have[k] = e.get_item_count(k) end
+    return {items=out, need=need, have=have, already=already, turned=turned, blocked=blocked, checked=can_check and true or false, total=#t.items, origin={x=ox, y=oy}, size={w=w, h=h}}`,
+
+  tpl_info: `
+    local e = bot()
+    local all = storage.vb_tpl or {}
+    if not A.name then
+      local list = {}
+      for n, t in pairs(all) do list[#list+1] = {name=n, by=t.by, size={w=t.w, h=t.h}, entities=#t.items} end
+      table.sort(list, function(a, b) return a.name < b.name end)
+      return {templates=list, count=#list}
+    end
+    local t = all[A.name]
+    if not t then fail('нет шаблона '..A.name..' (список шаблонов — template_cost без имени)') end
+    local cost, have, missing, layout = {}, {}, {}, {}
+    for i, it in ipairs(t.items) do
+      cost[it.item] = (cost[it.item] or 0) + 1
+      layout[i] = {item=it.item, dx=it.dx, dy=it.dy, direction=it.dir, underground=it.ug, recipe=it.recipe}
+    end
+    local enough = true
+    for k, v in pairs(cost) do
+      have[k] = e.get_item_count(k)
+      if have[k] < v then missing[k] = v - have[k] enough = false end
+    end
+    return {name=A.name, by=t.by, size={w=t.w, h=t.h}, entities=#t.items, cost=cost, have=have, missing=missing, enough=enough, layout=layout}`,
+
+  tpl_delete: `
+    local t = (storage.vb_tpl or {})[A.name]
+    if not t then fail('нет шаблона '..A.name) end
+    if t.by ~= A.bot then fail('шаблон '..A.name..' сохранил '..t.by..': удалить его может только он') end
+    storage.vb_tpl[A.name] = nil
+    return {deleted=A.name}`,
 
   targets: `
     local e = bot()
@@ -1105,6 +1218,43 @@ export function createFactorioServer(botName, hooks) {
     if (Math.hypot(me.x - x, me.y - y) > reach) await walk(x, y, Math.max(1.5, reach - 2));
   }
 
+  /**
+   * Поставить группу построек (BODY.place_many): подходит к первой непоставленной и ставит всё, до чего дотягивается.
+   * Общая часть place_many и template_place. В skipped у постройки, которой, похоже, мешает сам персонаж, стоит self.
+   */
+  async function placeMany(items) {
+    let pending = items.map((it, k) => ({ ...it, i: k + 1 }));
+    const built = [], skipped = [], left = {};
+    let stopped, walkedFor = null;
+    const deadline = Date.now() + 200_000;
+    while (pending.length) {
+      const r = await run('place_many', { items: pending });
+      const results = Array.isArray(r.results) ? r.results : [];
+      const gone = new Set();
+      for (const x of results) {
+        const it = pending.find((p) => p.i === x.i);
+        gone.add(x.i);
+        if (x.ok) { const { left: l, ...rest } = x.r; built.push({ n: x.i, ...rest }); left[it.item] = l; }
+        else {
+          const self = Boolean(x.near && /сюда поставить нельзя/.test(x.why));
+          skipped.push({ n: x.i, item: it.item, x: it.x, y: it.y, why: x.why + (self ? ' — возможно, мешает сам персонаж: он стоит рядом с этой клеткой' : ''), self: self || undefined });
+        }
+      }
+      pending = pending.filter((p) => !gone.has(p.i));
+      if (!pending.length) break;
+      stopped = await interrupted();
+      if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов';
+      if (stopped) break;
+      if (results.length || r.waiting > 0) { await sleep(100); continue; }
+      // Всё оставшееся далеко: идём к первой непоставленной. Не дошли — пропускаем её.
+      const t = pending[0];
+      if (walkedFor === t.i) { skipped.push({ n: t.i, item: t.item, x: t.x, y: t.y, why: 'не смог подойти на расстояние постройки' }); pending.shift(); continue; }
+      walkedFor = t.i;
+      await approach(t.x, t.y, 8);
+    }
+    return { built, skipped, left, pending: pending.map(({ i, ...it }) => it), stopped: stopped || undefined };
+  }
+
   const def = (name, description, shape, handler) => tool(name, description, shape, async (args) => {
     const shown = JSON.stringify(args);
     hooks.activity?.();
@@ -1240,35 +1390,74 @@ export function createFactorioServer(botName, hooks) {
           direction: z.enum(DIRECTIONS).default('north').describe('как в place: конвейер везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
           underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place') })).min(1).max(50) },
       async (a) => {
-        let pending = a.items.map((it, k) => ({ ...it, i: k + 1 }));
-        const built = [], skipped = [], left = {};
-        let stopped, walkedFor = null;
-        const deadline = Date.now() + 200_000;
-        while (pending.length) {
-          const r = await run('place_many', { items: pending });
-          const results = Array.isArray(r.results) ? r.results : [];
-          const gone = new Set();
-          for (const x of results) {
-            const it = pending.find((p) => p.i === x.i);
-            gone.add(x.i);
-            if (x.ok) { const { left: l, ...rest } = x.r; built.push({ n: x.i, ...rest }); left[it.item] = l; }
-            else skipped.push({ n: x.i, item: it.item, x: it.x, y: it.y, why: x.why + (x.near && /сюда поставить нельзя/.test(x.why) ? ' — возможно, мешает сам персонаж: он стоит рядом с этой клеткой' : '') });
-          }
-          pending = pending.filter((p) => !gone.has(p.i));
-          if (!pending.length) break;
-          stopped = await interrupted();
-          if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов';
-          if (stopped) break;
-          if (results.length || r.waiting > 0) { await sleep(100); continue; }
-          // Всё оставшееся далеко: идём к первой непоставленной. Не дошли — пропускаем её.
-          const t = pending[0];
-          if (walkedFor === t.i) { skipped.push({ n: t.i, item: t.item, x: t.x, y: t.y, why: 'не смог подойти на расстояние постройки' }); pending.shift(); continue; }
-          walkedFor = t.i;
-          await approach(t.x, t.y, 8);
-        }
-        return { placed: built.length, asked: a.items.length, built, left, skipped, skipped_count: skipped.length,
-          not_done: pending.length ? pending.map(({ i, ...it }) => it) : undefined, stopped: stopped || undefined };
+        const r = await placeMany(a.items);
+        return { placed: r.built.length, asked: a.items.length, built: r.built, left: r.left, skipped: r.skipped.map(({ self, ...x }) => x), skipped_count: r.skipped.length,
+          not_done: r.pending.length ? r.pending : undefined, stopped: r.stopped };
       }),
+
+    def('template_save', 'Запомнить постройки в прямоугольнике как шаблон, чтобы потом ставить такую же группу в других местах (template_place) — как чертёж, только строит сам персонаж из инвентаря. Запоминаются постройки своей команды, которых касается прямоугольник: предмет, место, направление, вход или выход подземного конвейера, рецепт сборочного автомата. Содержимое, топливо, фильтры и настройки разделителей не запоминаются. Область — до 50×50 клеток и до 100 построек, целиком в пределах 60 клеток от персонажа. Шаблоны общие для всех ботов; сохранить заново под тем же именем и удалить может только автор. В ответе origin — северо-западный угол шаблона (от него считается место в template_place) и cost — сколько каких предметов нужно.',
+      { name: z.string().min(1).max(40).describe('имя шаблона'), ...coords, x2: z.number().describe('x противоположного угла'), y2: z.number().describe('y противоположного угла') },
+      (a) => run('tpl_save', { name: a.name.trim(), x1: Math.floor(Math.min(a.x, a.x2)), y1: Math.floor(Math.min(a.y, a.y2)), x2: Math.floor(Math.max(a.x, a.x2)) + 1, y2: Math.floor(Math.max(a.y, a.y2)) + 1 })),
+
+    def('template_place', 'Поставить шаблон (template_save) из инвентаря: (x, y) — клетка, куда встанет северо-западный угол шаблона (уже после поворота), rotation — поворот по часовой стрелке. Персонаж сам подходит и ставит всё, до чего дотягивается, как place_many: с частотой быстро кликающего игрока, за дальними подходит. Постройки, которые уже стоят на своих местах, пропускаются (already_there), так что прерванный вызов можно просто повторить. Занятые клетки пропускаются (skipped с причиной). Если предметов не хватает, ставит, на что хватило, а недостающее — в missing. turned — стоит такая же постройка, но повёрнута иначе (поправь через rotate). С dry_run=true ничего не ставит: показывает, сколько чего нужно, чего не хватает и какие клетки заняты (blocked; виден только участок в 60 клетках от персонажа).',
+      { name: z.string().describe('имя шаблона'), ...coords,
+        rotation: z.number().default(0).describe('поворот по часовой стрелке в градусах: 0, 90, 180 или 270'),
+        dry_run: z.boolean().default(false).describe('только проверить: ничего не ставить') },
+      async (a) => {
+        if (![0, 90, 180, 270].includes(a.rotation)) throw new Error('rotation — 0, 90, 180 или 270');
+        const p = await run('tpl_plan', { name: a.name.trim(), x: a.x, y: a.y, rot: a.rotation / 90, check: a.dry_run });
+        const all = Array.isArray(p.items) ? p.items : [];
+        // Ставим только то, на что хватает предметов; остальное — в missing.
+        const budget = { ...p.have }, missing = {}, todo = [];
+        for (const it of all) {
+          if ((budget[it.item] || 0) > 0) { budget[it.item]--; todo.push(it); } else missing[it.item] = (missing[it.item] || 0) + 1;
+        }
+        const head = { template: a.name.trim(), origin: p.origin, rotation: a.rotation, size: p.size, total: p.total, already_there: p.already,
+          turned: Array.isArray(p.turned) && p.turned.length ? p.turned : undefined };
+        const miss = Object.keys(missing).length ? missing : undefined;
+        if (a.dry_run) {
+          const blocked = Array.isArray(p.blocked) ? p.blocked : [];
+          return { ...head, dry_run: true, to_place: all.length, need: p.need, have: p.have, missing: miss,
+            blocked: p.checked ? blocked.slice(0, 15) : undefined, blocked_count: p.checked ? blocked.length : undefined,
+            note: p.checked ? undefined : 'место дальше 60 клеток от персонажа: заняты ли клетки, отсюда не видно' };
+        }
+        let r = { built: [], skipped: [], left: {}, pending: [], stopped: undefined };
+        if (todo.length) {
+          r = await placeMany(todo);
+          // Тем постройкам, которым мешал сам персонаж, даём вторую попытку: отходим за ближайший край шаблона.
+          const own = r.skipped.filter((s) => s.self);
+          if (own.length && !r.stopped) {
+            const b = own[0], o = p.origin, sz = p.size;
+            const side = [[b.x - o.x, -1, 0], [o.x + sz.w - b.x, 1, 0], [b.y - o.y, 0, -1], [o.y + sz.h - b.y, 0, 1]].sort((u, v) => u[0] - v[0])[0];
+            const step = Math.min(side[0] + 2, 6);
+            await walk(b.x + side[1] * step, b.y + side[2] * step, 1);
+            const again = await placeMany(own.map((s) => todo[s.n - 1]));
+            r.skipped = [...r.skipped.filter((s) => !s.self), ...again.skipped];
+            r.built.push(...again.built);
+            Object.assign(r.left, again.left);
+            r.pending.push(...again.pending);
+            r.stopped = again.stopped;
+          }
+        }
+        const by = {};
+        for (const x of r.built) by[x.placed] = (by[x.placed] || 0) + 1;
+        return { ...head, placed: r.built.length, placed_by_name: by, left: r.left, missing: miss,
+          skipped: r.skipped.slice(0, 15).map(({ n, self, ...x }) => x), skipped_count: r.skipped.length,
+          not_done: r.pending.length || undefined, stopped: r.stopped,
+          completed: !miss && !r.skipped.length && !r.pending.length,
+          note: r.pending.length ? 'не всё успел: повтори тот же вызов, уже поставленное пропустится' : undefined };
+      }),
+
+    def('template_cost', 'Шаблоны построек. Без name — список всех шаблонов (имя, кто сохранил, размер, число построек). С name — сколько каких предметов нужно на шаблон (cost), сколько их у тебя в инвентаре (have), чего не хватает (missing) и раскладка: предмет, смещение от северо-западного угла, направление.',
+      { name: z.string().optional().describe('имя шаблона; без него — список шаблонов') },
+      async (a) => {
+        const r = await run('tpl_info', { name: a.name?.trim() });
+        if (!a.name && !Array.isArray(r.templates)) r.templates = [];
+        return r;
+      }),
+
+    def('template_delete', 'Удалить свой шаблон построек (сами постройки на карте не трогает).', { name: z.string() },
+      (a) => run('tpl_delete', { name: a.name.trim() })),
 
     def('insert_all', 'Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
       { name: z.string().describe('внутреннее имя объектов, например stone-furnace или burner-mining-drill'), item: z.string().describe('что класть, например coal'),
