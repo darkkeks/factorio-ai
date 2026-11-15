@@ -432,6 +432,24 @@ function renderSessionList(pick) {
   if (pick || !shown.some((x) => x.id === SS.id)) pickSession((shown.find((x) => x.current) || shown[0]).id);
   else { $('sess-list').value = SS.id; syncArchBtn(); }
 }
+// Список сессий перечитываем, пока окно открыто: после сброса у бота появляется новая сессия.
+// Если смотрели текущую — переходим на новую текущую сами; если выбрали старую руками — остаёмся на ней.
+async function refreshSessionList() {
+  if ($('sess').classList.contains('hidden') || !SS.bot) return;
+  const bot = SS.bot;
+  let list;
+  try { list = await api('api/sessions?bot=' + encodeURIComponent(bot)); } catch { return; }
+  if (bot !== SS.bot) return;
+  const was = (SS.list || []).find((x) => x.id === SS.id), cur = list.find((x) => x.current);
+  const changed = JSON.stringify(list.map((x) => [x.id, x.current, x.archived, x.active, x.title])) !== JSON.stringify((SS.list || []).map((x) => [x.id, x.current, x.archived, x.active, x.title]));
+  if (!changed) return;
+  SS.list = list;
+  const follow = cur && cur.id !== SS.id && (!SS.id || !was || was.current) && (SS.showArch || !cur.archived);
+  if (document.activeElement === $('sess-list')) return; // список раскрыт — не дёргаем его под рукой
+  renderSessionList(false);
+  if (follow) pickSession(cur.id);
+}
+setInterval(refreshSessionList, 5000);
 function syncArchBtn() { const cur = (SS.list || []).find((x) => x.id === SS.id); $('sess-arch').textContent = cur && cur.archived ? 'вернуть из архива' : 'в архив'; }
 async function archive(agent, on) {
   const r = await fetch('api/session/archive', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot: SS.bot, id: SS.id, agent, archived: on }) });
