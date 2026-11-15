@@ -92,12 +92,20 @@ const PLACE_FN = `
 local function place_one(e, a)
   local ip = prototypes.item[a.item]
   if not ip then fail('нет предмета '..a.item) end
-  if e.get_item_count(a.item) < 1 then fail('в инвентаре нет '..a.item) end
   local pr = ip.place_result
   if not pr then fail(a.item..' нельзя поставить на землю') end
   reach(e, a, 10)
   local dir = defines.direction[a.direction]
   local s = e.surface
+  -- Такая же постройка своей команды уже стоит в этой точке и смотрит туда же — дело сделано (already), предмет не тратится.
+  for _, c in pairs(s.find_entities_filtered{name=pr.name, area={{a.x-0.1, a.y-0.1}, {a.x+0.1, a.y+0.1}}, force=e.force}) do
+    if dist(c.position, a) < 0.1 then
+      if c.supports_direction and c.direction ~= dir then fail('здесь уже стоит '..c.name..', но смотрит на '..dirname(c.direction)..', а не на '..a.direction..': поверни (rotate)') end
+      if c.type == 'underground-belt' and a.underground and c.belt_to_ground_type ~= a.underground then fail('здесь уже стоит '..c.name..', но это '..(c.belt_to_ground_type == 'input' and 'вход' or 'выход')..': сними (pick_up) и поставь заново') end
+      return {already=true, placed=c.name, pos=P(c.position), direction=a.direction, left=e.get_item_count(a.item)}
+    end
+  end
+  if e.get_item_count(a.item) < 1 then fail('в инвентаре нет '..a.item) end
   if not s.can_place_entity{name=pr.name, position={a.x, a.y}, direction=dir, force=e.force, build_check_type=defines.build_check_type.manual} then
     fail('сюда поставить нельзя (занято, не та поверхность или нет руды под буром)')
   end
@@ -540,6 +548,36 @@ const BODY = {
   place: PLACE_FN + `
     return place_one(bot(), A)`,
 
+  // Ждать ли ручного крафта: каких предметов из A.items ({предмет: сколько нужно}; с A.recipe — ещё и ингредиентов на
+  // A.count штук рецепта) не хватает в инвентаре (short) и стоит ли хоть один из них в очереди ручного крафта (waiting).
+  // Промежуточные предметы чужого крафта (prerequisite) не в счёт: их заберёт тот крафт.
+  craft_wait: `
+    local e = bot()
+    local need = {}
+    for k, v in pairs(A.items or {}) do need[k] = v end
+    if A.recipe then
+      local rc = e.force.recipes[A.recipe]
+      if rc then for _, i in pairs(rc.ingredients) do if i.type ~= 'fluid' then need[i.name] = (need[i.name] or 0) + i.amount*(A.count or 1) end end end
+    end
+    local queued = {}
+    if e.crafting_queue_size > 0 then
+      for _, q in pairs(e.crafting_queue or {}) do
+        if not q.prerequisite then
+          local rp = prototypes.recipe[type(q.recipe) == 'string' and q.recipe or q.recipe.name]
+          if rp then for _, p in pairs(rp.products) do if p.type == 'item' then queued[p.name] = (queued[p.name] or 0) + (p.amount or 1)*q.count end end end
+        end
+      end
+    end
+    local short, waiting = {}, false
+    for k, v in pairs(need) do
+      local have = e.get_item_count(k)
+      if have < v then
+        short[k] = {have=have, need=v, queued=queued[k] or 0}
+        if queued[k] then waiting = true end
+      end
+    end
+    return {short=short, waiting=waiting, queue=e.crafting_queue_size}`,
+
   // Группа разных построек. За один вызов ставится только то, до чего персонаж дотягивается, и не больше, чем успел бы
   // опытный игрок: тот же предмет, что и прошлая постройка, — 2 тика (протяжка мышью с зажатой кнопкой, 30 в секунду),
   // другой предмет — 12 тиков (сменить предмет в руке и кликнуть, пять в секунду). В запасе — тики, прошедшие с прошлой
@@ -569,7 +607,8 @@ const BODY = {
       local cost = it.item == prev and 2 or 12
       if cost > avail then break end
       local ok, r = pcall(place_one, e, it)
-      if ok then avail = avail - cost prev = it.item used = used + 1 out[#out+1] = {i=it.i, ok=true, r=r}
+      if ok and r.already then out[#out+1] = {i=it.i, ok=true, r=r}
+      elseif ok then avail = avail - cost prev = it.item used = used + 1 out[#out+1] = {i=it.i, ok=true, r=r}
       else out[#out+1] = {i=it.i, ok=false, why=tostring(r), near=near[pick] < 2.5} end
       near[pick] = nil left = left - 1
     end
@@ -730,7 +769,10 @@ const BODY = {
         end
       end
     end
-    if #ents > 0 then storage.vb_ghost[A.name] = {by=A.bot, ents=ents} else storage.vb_ghost[A.name] = nil end
+    if #ents > 0 then
+      storage.vb_ghost[A.name] = {by=A.bot, ents=ents}
+      if storage.vb_ghost_done then storage.vb_ghost_done[A.name] = nil end
+    else storage.vb_ghost[A.name] = nil end
     return {placed=placed, already=already, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full}`,
 
   // Призраки плана A.name и/или в прямоугольнике A.x1..A.y2: сколько чего нужно, что есть в инвентаре, границы;
@@ -743,7 +785,12 @@ const BODY = {
     local function live(n)
       local pl, r = storage.vb_ghost[n], {}
       for _, g in pairs(pl.ents) do if g.valid then r[#r+1] = g end end
-      if #r == 0 then storage.vb_ghost[n] = nil else pl.ents = r end
+      if #r == 0 then
+        -- План без призраков исчезает, но имя помним: повторный ghost_build/ghost_list по нему — не ошибка.
+        storage.vb_ghost_done = storage.vb_ghost_done or {}
+        storage.vb_ghost_done[n] = {by=pl.by, tick=game.tick}
+        storage.vb_ghost[n] = nil
+      else pl.ents = r end
       return r
     end
     local function box(list)
@@ -770,6 +817,11 @@ const BODY = {
     end
     local list = {}
     if A.name then
+      if not storage.vb_ghost[A.name] then
+        local d = (storage.vb_ghost_done or {})[A.name]
+        if d then return {name=A.name, by=d.by, ghosts=0, already_built=true, cost={}, have={}, missing={}, enough=true, items={},
+          note='в плане не осталось призраков: всё построено (или призраки убрали с карты), план снят с учёта'} end
+      end
       if not storage.vb_ghost[A.name] then fail('нет плана '..A.name..' (список планов — ghost_list без аргументов; полностью построенный план исчезает сам)') end
       for _, g in pairs(live(A.name)) do
         local p = g.position
@@ -2041,6 +2093,33 @@ export function createFactorioServer(botName, hooks) {
     if (Math.hypot(me.x - x, me.y - y) > reach) await walk(x, y, Math.max(1.5, reach - 2));
   }
 
+  // Ожидание ручного крафта (fb-043): если предмета нет в инвентаре, но он стоит в очереди крафта персонажа, действие
+  // ждёт его, как ждал бы игрок, а не падает. q — аргументы BODY.craft_wait. Ответ — сколько секунд ждал, либо null,
+  // если ждать нечего (предмета в очереди нет) или ожидание выключено.
+  const waitCraftArg = z.number().min(0).max(120).default(30).describe('если предмета нет в инвентаре, но он стоит в твоей очереди ручного крафта — ждать его не дольше стольких секунд (waited_craft_s в ответе); 0 — не ждать');
+  async function awaitCraft(q, seconds) {
+    if (!(seconds > 0)) return null;
+    const start = Date.now();
+    let r = await run('craft_wait', q);
+    if (!r.waiting) return null;
+    while (r.waiting && Date.now() - start < seconds * 1000 && !(await interrupted())) {
+      await sleep(500);
+      r = await run('craft_wait', q);
+    }
+    return Math.round((Date.now() - start) / 100) / 10;
+  }
+  /** Выполнить fn; если он упал из-за нехватки предмета (pattern), а предмет в очереди крафта — дождаться и повторить один раз. */
+  async function withCraft(q, seconds, pattern, fn) {
+    try { return await fn(); } catch (e) {
+      if (!pattern.test(e.message)) throw e;
+      const waited = await awaitCraft(q, seconds);
+      if (waited === null) throw e;
+      const r = await fn();
+      if (r && typeof r === 'object') r.waited_craft_s = waited;
+      return r;
+    }
+  }
+
   /** Добавить призраки items в план name (BODY.ghost_add). Общая часть ghost_place и route. */
   async function ghostAdd(name, items) {
     const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
@@ -2193,9 +2272,10 @@ export function createFactorioServer(botName, hooks) {
 
     def('craft', 'Скрафтить предмет руками из инвентаря. По умолчанию ждёт готовности (до двух минут); с wait=false только ставит в очередь и сразу возвращается — крафт идёт сам, очередь видна в status (поле crafting). Если на всё количество не хватило, ставит сколько может (queued), а в ingredients_for_asked — прямые ингредиенты на всё запрошенное: сколько нужно и сколько было (недостающие промежуточные крафтятся из сырья сами).',
       { recipe: z.string().describe('внутреннее имя рецепта, например iron-gear-wheel'), count: z.number().int().min(1).max(200).default(1),
-        wait: z.boolean().default(true).describe('ждать ли готовности') },
+        wait: z.boolean().default(true).describe('ждать ли готовности'),
+        wait_craft_s: z.number().min(0).max(120).default(30).describe('если ингредиентов не хватает даже на одну штуку, но они стоят в твоей очереди ручного крафта (прошлый craft с wait=false) — ждать их не дольше стольких секунд; 0 — не ждать') },
       async (a) => {
-        const r = await run('craft', { recipe: a.recipe, count: a.count });
+        const r = await withCraft({ recipe: a.recipe, count: a.count }, a.wait_craft_s, /не хватает ингредиентов/, () => run('craft', { recipe: a.recipe, count: a.count }));
         if (!a.wait) return { ...r, note: 'поставлено в очередь, крафт идёт сам' };
         const start = Date.now();
         while (Date.now() - start < 120_000) {
@@ -2208,12 +2288,13 @@ export function createFactorioServer(botName, hooks) {
         return { ...r, note: 'крафт ещё идёт' };
       }),
 
-    def('place', 'Поставить одну постройку из инвентаря в точку. Сам подходит (move_to перед этим не нужен). Несколько построек ставь не по одной, а пачкой: place_many, place_line, template_place. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to). Подземный конвейер: direction у входа и у выхода одинаковый — куда едут предметы; вход это или выход, задаёт underground, а в ответе видно, чем он встал (underground) и с каким концом соединился (paired_with).',
+    def('place', 'Поставить одну постройку из инвентаря в точку. Сам подходит (move_to перед этим не нужен). Несколько построек ставь не по одной, а пачкой: place_many, place_line, template_place. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to). Подземный конвейер: direction у входа и у выхода одинаковый — куда едут предметы; вход это или выход, задаёт underground, а в ответе видно, чем он встал (underground) и с каким концом соединился (paired_with). Если в точке уже стоит такая же постройка с тем же направлением — это не ошибка: already=true, предмет не тратится.',
       { item: z.string().describe('внутреннее имя предмета'), ...coords, direction: z.enum(DIRECTIONS).default('north').describe('куда смотрит постройка: конвейер (и подземный тоже) везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
-        underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера: input — вход под землю, output — выход из-под земли. По умолчанию как в игре: выход, если позади по ходу в пределах дальности стоит вход без пары, иначе вход') },
-      async (a) => { await approach(a.x, a.y, 8); return run('place', a); }),
+        underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера: input — вход под землю, output — выход из-под земли. По умолчанию как в игре: выход, если позади по ходу в пределах дальности стоит вход без пары, иначе вход'),
+        wait_craft_s: waitCraftArg },
+      async (a) => { await approach(a.x, a.y, 8); return withCraft({ items: { [a.item]: 1 } }, a.wait_craft_s, /в инвентаре нет/, () => run('place', a)); }),
 
-    def('place_line', 'Поставить ряд одинаковых построек из инвентаря от точки (x, y) до точки (x2, y2): лента, столбы, трубы, стены. Идёт вдоль ряда и ставит по одной, как игрок с зажатой кнопкой. Занятые клетки пропускает, останавливается, когда предметы кончились. С параметром turn ряд идёт с одним поворотом под прямым углом: лента на углу сразу смотрит вдоль второго отрезка. Если действие прервалось, повтори тот же вызов: уже поставленное пропустится.',
+    def('place_line', 'Поставить ряд одинаковых построек из инвентаря от точки (x, y) до точки (x2, y2): лента, столбы, трубы, стены. Идёт вдоль ряда и ставит по одной, как игрок с зажатой кнопкой. Занятые клетки пропускает (где уже стоит такая же постройка с тем же направлением — считает сделанным, already), останавливается, когда предметы кончились. С параметром turn ряд идёт с одним поворотом под прямым углом: лента на углу сразу смотрит вдоль второго отрезка. Если действие прервалось, повтори тот же вызов: уже поставленное пропустится.',
       { item: z.string().describe('внутреннее имя предмета'), ...coords, x2: z.number().describe('x конца ряда'), y2: z.number().describe('y конца ряда'),
         step: z.number().min(1).max(64).default(1).describe('шаг между постройками в клетках: 1 для ленты, для столбов — их дальность провода'),
         direction: z.enum(DIRECTIONS).optional().describe('куда смотрят постройки; по умолчанию — вдоль ряда, от начала к концу (лента повезёт к концу ряда)'),
@@ -2241,14 +2322,15 @@ export function createFactorioServer(botName, hooks) {
         const n = points.length;
         if (n > 100) throw new Error(`в ряду получается ${n} построек, за один вызов можно не больше 100`);
         const direction = points[0].direction;
-        let placed = 0, left, stopped, last;
+        let placed = 0, already = 0, left, stopped, last;
         const skipped = [];
         for (let i = 0; i < n; i++) {
           const { x, y } = points[i];
           try {
             await approach(x, y, 8);
             const r = await run('place', { item: a.item, x, y, direction: points[i].direction });
-            placed++; left = r.left; last = r.pos;
+            if (r.already) already++; else placed++;
+            left = r.left; last = r.pos;
           } catch (e) {
             if (/в инвентаре нет|нет предмета|нельзя поставить на землю/.test(e.message)) { stopped = e.message.replace(/^Lua: /, ''); break; }
             skipped.push({ x, y, why: e.message.replace(/^Lua: /, '') });
@@ -2258,16 +2340,21 @@ export function createFactorioServer(botName, hooks) {
           if (stopped) break;
           await sleep(150);
         }
-        return { placed, asked: n, direction, turn_at, then_direction: turn_at ? points[n - 1].direction : undefined, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
+        return { placed, already: already || undefined, asked: n, direction, turn_at, then_direction: turn_at ? points[n - 1].direction : undefined, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
       }),
 
-    def('place_many', 'Поставить группу разных построек из инвентаря одним вызовом: items — список {item, x, y, direction} (до 50), например сборщики, манипуляторы, ленты и столбы одного блока. Персонаж подходит к первой непоставленной постройке и ставит подряд всё, до чего дотягивается с этого места, в темпе опытного игрока: одинаковые предметы подряд — протяжкой, до 30 в секунду, смена предмета в руке — около пяти в секунду; поэтому с одного места сначала ставятся все постройки того же предмета (в порядке списка), потом следующего. За дальними подходит. Порядок важен там, где он важен в игре (вход подземного конвейера раньше выхода) — для одного предмета он сохраняется. Что не встало — в skipped с причиной, остальное ставится дальше. Если действие прервалось, повтори вызов с тем, что в not_done.',
+    def('place_many', 'Поставить группу разных построек из инвентаря одним вызовом: items — список {item, x, y, direction} (до 50), например сборщики, манипуляторы, ленты и столбы одного блока. Персонаж подходит к первой непоставленной постройке и ставит подряд всё, до чего дотягивается с этого места, в темпе опытного игрока: одинаковые предметы подряд — протяжкой, до 30 в секунду, смена предмета в руке — около пяти в секунду; поэтому с одного места сначала ставятся все постройки того же предмета (в порядке списка), потом следующего. За дальними подходит. Порядок важен там, где он важен в игре (вход подземного конвейера раньше выхода) — для одного предмета он сохраняется. Что не встало — в skipped с причиной, остальное ставится дальше. Где уже стоит такая же постройка с тем же направлением — считается сделанным (в built с already=true, число — в already), предмет не тратится. Если действие прервалось, повтори вызов с тем, что в not_done.',
       { items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
           direction: z.enum(DIRECTIONS).default('north').describe('как в place: конвейер везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
-          underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place') })).min(1).max(50) },
+          underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place') })).min(1).max(50),
+        wait_craft_s: waitCraftArg },
       async (a) => {
+        const need = {};
+        for (const it of a.items) need[it.item] = (need[it.item] || 0) + 1;
+        const waited = await awaitCraft({ items: need }, a.wait_craft_s);
         const r = await placeMany(a.items);
-        return { placed: r.built.length, asked: a.items.length, built: r.built, left: r.left, skipped: r.skipped.map(({ self, ...x }) => x), skipped_count: r.skipped.length,
+        const already = r.built.filter((b) => b.already).length;
+        return { placed: r.built.length - already, already: already || undefined, waited_craft_s: waited ?? undefined, asked: a.items.length, built: r.built, left: r.left, skipped: r.skipped.map(({ self, ...x }) => x), skipped_count: r.skipped.length,
           not_done: r.pending.length ? r.pending : undefined, stopped: r.stopped };
       }),
 
@@ -2359,7 +2446,7 @@ export function createFactorioServer(botName, hooks) {
         return out;
       }),
 
-    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает.',
+    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает из списка, а по имени отвечает already_built=true и ghosts=0.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
         layout: z.boolean().default(false).describe('приложить список призраков (до 100 ближайших)') },
@@ -2372,12 +2459,17 @@ export function createFactorioServer(botName, hooks) {
         return r;
       }),
 
-    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов.',
+    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов. План, в котором призраков уже не осталось (всё построено), — не ошибка: already_built=true.',
       { name: z.string().optional().describe('имя плана'),
-        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области') },
+        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
+        wait_craft_s: waitCraftArg },
       async (a) => {
         const sel = { name: a.name?.trim(), ...ghostArea(a) };
         if (!sel.name && sel.x1 === undefined) throw new Error('укажи name или область (x, y, x2, y2)');
+        const q0 = await run('ghost_q', { ...sel, limit: 0 });
+        if (q0.already_built) return { plan: sel.name, already_built: true, placed: 0, ghosts_left: 0, completed: true, note: q0.note };
+        let waited = null;
+        if (q0.missing && Object.keys(q0.missing).length) waited = await awaitCraft({ items: q0.cost }, a.wait_craft_s);
         const key = (it) => `${it.item}@${it.x},${it.y}`;
         const tries = new Map(); // призрак → сколько раз не встал; тому, которому мешал сам персонаж, даём вторую попытку
         const built = [], skipped = new Map(), left = {};
@@ -2410,7 +2502,7 @@ export function createFactorioServer(botName, hooks) {
         for (const x of built) by[x.placed] = (by[x.placed] || 0) + 1;
         const miss = q && q.missing && Object.keys(q.missing).length ? q.missing : undefined;
         const sk = [...skipped.values()];
-        return { plan: sel.name, placed: built.length, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
+        return { plan: sel.name, placed: built.length, waited_craft_s: waited ?? undefined, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
           skipped: sk.slice(0, 15), skipped_count: sk.length, stopped, completed: q ? q.ghosts === 0 : undefined,
           note: q && q.ghosts > 0 && !miss && !sk.length ? 'не всё успел: повтори тот же вызов' : undefined };
       }),
@@ -2459,8 +2551,8 @@ export function createFactorioServer(botName, hooks) {
       async (a) => { await approach(a.x, a.y, 8); return run('pick_up', a); }),
 
     def('insert_items', 'Положить предметы из инвентаря в объект в точке (топливо, руду, ингредиенты). На клетку ленты за раз ложится не больше двух предметов — по одному в начало каждой полосы. Сам подходит.',
-      { ...coords, item: z.string(), count: z.number().int().min(1).default(5) },
-      async (a) => { await approach(a.x, a.y, 8); return run('insert', a); }),
+      { ...coords, item: z.string(), count: z.number().int().min(1).default(5), wait_craft_s: waitCraftArg },
+      async (a) => { await approach(a.x, a.y, 8); return withCraft({ items: { [a.item]: a.count } }, a.wait_craft_s, /в инвентаре нет/, () => run('insert', a)); }),
 
     def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Из трупа персонажа (character-corpse — вещи погибшего; координаты даёт find character-corpse) без item забирает всё, что влезет в инвентарь, left_in_corpse — сколько осталось. Сам подходит. Забрать из нескольких мест одним вызовом — gather (источники указываешь сам).',
       { ...coords, item: z.string().optional(), count: z.number().int().min(1).default(1000) },
@@ -2675,8 +2767,9 @@ export function createFactorioServer(botName, hooks) {
   // План: те же инструменты подряд одним вызовом. Каждый шаг — обычный вызов со всеми его проверками и скоростью;
   // выигрыш только в том, что между шагами нет круга «ответ → следующий вызов».
   const NOT_IN_PLAN = new Set(['plan', 'feedback', 'feedback_status', 'read_chat']);
-  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом — главный способ работать быстро: каждый отдельный вызов стоит многих секунд раздумий, а шаги плана идут без пауз, поэтому всё, что известно заранее, собирай в один план (например gather с выбранными источниками → craft → insert_all). steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана в чат пришло сообщение, обращённое к тебе (в нём твоё имя) либо со словом «стоп»; остальные шаги не выполняются (not_done). Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
-    { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы') })).min(1).max(20),
+  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом — главный способ работать быстро: каждый отдельный вызов стоит многих секунд раздумий, а шаги плана идут без пауз, поэтому всё, что известно заранее, собирай в один план (например gather с выбранными источниками → craft → insert_all). steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), вышло время шага; остальные шаги не выполняются (not_done). Шаг с on_fail=continue план не останавливает: он помечается ok=false, его номер попадает в failed_steps, план идёт дальше — ставь так шагам, от которых остальные не зависят (мир мог измениться: постройку снесли, забирать нечего). Шаг, сделавший часть работы (кончился предмет в insert_all, gather взял не всё, ghost_build не хватило предметов), — не сбой: ok=true, partial=true, номер в partial_steps, план идёт дальше; что сделано и чего не хватило — в result шага. Всегда останавливают план новая реплика, stop и сообщение в чате, обращённое к тебе (в нём твоё имя) либо со словом «стоп». Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
+    { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы'),
+        on_fail: z.enum(['stop', 'continue']).default('stop').describe('что делать, если шаг не удался: stop — остановить план; continue — пометить шаг ok=false и идти дальше (для шагов, от которых остальные не зависят: осмотр, заправка, сбор по списку мест)') })).min(1).max(20),
       stop_on_chat: z.enum(['addressed', 'any', 'never']).default('addressed').describe('какие сообщения игрового чата останавливают план: addressed — только с твоим именем или словом «стоп»; any — любое новое; never — никакие') },
     async (a) => {
       const prepared = a.steps.map((s, i) => {
@@ -2691,6 +2784,7 @@ export function createFactorioServer(botName, hooks) {
       const start = Date.now();
       const done = [];
       let stopped_at, why;
+      const skipped_fail = [], partial = [];
       try {
       for (let i = 0; i < prepared.length; i++) {
         if (i > 0) {
@@ -2707,20 +2801,33 @@ export function createFactorioServer(botName, hooks) {
         if (!res.isError) { try { result = JSON.parse(text); } catch { /* оставляем текстом */ } }
         const step = { step: i + 1, tool: t.name, ok: !res.isError, result };
         done.push(step);
-        if (res.isError) why = 'ошибка';
+        // failed — шаг не удался (с on_fail=continue план идёт дальше); why — план останавливается в любом случае.
+        let failed;
+        if (res.isError) failed = 'ошибка';
         else if (result && typeof result === 'object') {
-          if (result.not_reached) why = 'не дошёл';
-          else if (result.stopped || result.interrupted) why = `действие свернулось: ${result.stopped || result.interrupted}`;
-          else if (Array.isArray(result.chat) && i < prepared.length - 1) {
+          const cut = result.interrupted || result.stopped;
+          if (result.not_reached) failed = 'не дошёл';
+          else if (cut && (result.interrupted || /^прервано/.test(cut))) why = `действие свернулось: ${cut}`;
+          else if (cut && /^вышло время/.test(cut)) failed = `действие свернулось: ${cut}`;
+          // Сделал часть (кончился предмет, нечего больше добывать, чего-то не хватило) — это отчёт, а не сбой шага.
+          else if (cut || result.complete === false || result.completed === false) { step.partial = true; partial.push(i + 1); }
+          if (!why && Array.isArray(result.chat) && i < prepared.length - 1) {
             if (a.stop_on_chat === 'any') why = 'новое сообщение в чате (оно в поле chat этого шага)';
             else if (a.stop_on_chat === 'addressed' && result.chat.some(chatAddressed)) why = 'в чате сообщение для тебя или просьба остановиться (оно в поле chat этого шага)';
           }
         }
-        if (why) { step.ok = false; stopped_at = i + 1; break; }
+        if (failed) {
+          step.ok = false;
+          if (!why && a.steps[i].on_fail === 'continue' && !hooks.aborted()) { step.continued = true; skipped_fail.push(i + 1); }
+          else why = why || failed;
+        }
+        if (why) { stopped_at = i + 1; break; }
       }
       } finally { chatMode = 'any'; }
       const not_done = a.steps.slice(done.length).map((s, k) => ({ step: done.length + k + 1, tool: s.tool }));
-      return { completed: !why, steps_ok: done.filter((s) => s.ok).length, steps_total: a.steps.length, stopped_at, why, steps: done, not_done: not_done.length ? not_done : undefined,
+      return { completed: !why && !skipped_fail.length, steps_ok: done.filter((s) => s.ok).length, steps_total: a.steps.length, stopped_at, why,
+        failed_steps: skipped_fail.length ? skipped_fail : undefined, partial_steps: partial.length ? partial : undefined,
+        steps: done, not_done: not_done.length ? not_done : undefined,
         chat_before: before.length ? before : undefined };
     }));
 
