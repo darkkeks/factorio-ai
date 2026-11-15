@@ -9,6 +9,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { lua } from './rcon.mjs';
@@ -129,9 +131,69 @@ const LUA = {
     end
     return out`,
 
+  // Разведанные чанки и признак «виден прямо сейчас» (радар, игрок, бот): x, y, 0|1, …
   chunks: `
     local s, f, out = game.surfaces[A.surface], game.forces.player, {}
-    for c in s.get_chunks() do if f.is_chunk_charted(s, c) then out[#out+1] = c.x out[#out+1] = c.y end end
+    for c in s.get_chunks() do
+      if f.is_chunk_charted(s, c) then out[#out+1] = c.x out[#out+1] = c.y out[#out+1] = f.is_chunk_visible(s, c) and 1 or 0 end
+    end
+    return out`,
+
+  // Содержимое чанков для схемы тумана войны: местность (по флагу, она меняется редко) и рамки сущностей
+  // в восьмых долях клетки от угла чанка. С флагом no_enemy врагов не отдаём.
+  chart: `
+    local s = game.surfaces[A.surface]
+    local SKIP = {character=true, corpse=true, ['character-corpse']=true, ['item-entity']=true, fish=true, ['entity-ghost']=true,
+      ['tile-ghost']=true, ['item-request-proxy']=true, smoke=true, ['smoke-with-trigger']=true, particle=true, projectile=true,
+      explosion=true, fire=true, sticker=true, ['flying-text']=true, beam=true, ['highlight-box']=true, ['speech-bubble']=true,
+      unit=true, ['spider-unit']=true, car=true, ['spider-vehicle']=true}
+    local floor = math.floor
+    local res = {}
+    for i, c in pairs(A.chunks) do
+      local x0, y0 = c[1] * 32, c[2] * 32
+      local r = {ents={}, enames={}}
+      if c[3] then
+        local idx, n, buf = {}, 0, {}
+        r.tnames = {}
+        for y = y0, y0 + 31 do for x = x0, x0 + 31 do
+          local nm = s.get_tile(x, y).name
+          local k = idx[nm]
+          if not k then n = n + 1 k = n idx[nm] = k r.tnames[k] = nm end
+          buf[#buf+1] = string.char(47 + k)
+        end end
+        r.tiles = table.concat(buf)
+      end
+      local idx, n, ents = {}, 0, r.ents
+      for _, e in pairs(s.find_entities_filtered{area={{x0, y0}, {x0 + 32, y0 + 32}}}) do
+        local fc = e.force.name
+        if not SKIP[e.type] and not (c[4] and fc == 'enemy') then
+          local k = idx[e.name]
+          if not k then n = n + 1 k = n idx[e.name] = k r.enames[k] = e.name end
+          local b = e.bounding_box
+          local m = #ents
+          ents[m+1] = k
+          ents[m+2] = fc == 'player' and 1 or fc == 'enemy' and 2 or 0
+          ents[m+3] = floor((b.left_top.x - x0) * 8 + 0.5)
+          ents[m+4] = floor((b.left_top.y - y0) * 8 + 0.5)
+          ents[m+5] = floor((b.right_bottom.x - x0) * 8 + 0.5)
+          ents[m+6] = floor((b.right_bottom.y - y0) * 8 + 0.5)
+        end
+      end
+      res[i] = r
+    end
+    return res`,
+
+  // Цвета игровой карты для сущностей и местности.
+  protos: `
+    local out = {ents={}, tiles={}}
+    for _, n in pairs(A.ents) do
+      local p = prototypes.entity[n]
+      if p then out.ents[n] = {type=p.type, m=p.map_color, f=p.friendly_map_color, e=p.enemy_map_color} end
+    end
+    for _, n in pairs(A.tiles) do
+      local p = prototypes.tile[n]
+      if p then out.tiles[n] = p.map_color end
+    end
     return out`,
 
   // Снимки пачкой. Команда выполняется у всех, но рисует и пишет файл только клиент игрока-камеры.
@@ -176,7 +238,6 @@ const LUA = {
 // ---------- состояние ----------
 
 const tiles = new Map();   // "z/x/y" -> { z, x, y, ts } — все тайлы, задевающие разведанные чанки; ts — когда снят
-let charted = [];          // разведанные чанки: x, y, x, y, …
 let pausedAt = 0;          // когда игра встала на паузу (0 — идёт)
 const moved = new Map();   // "bot:имя" | "player:имя" -> когда последний раз сдвинулся
 const lastPos = new Map();
@@ -317,43 +378,210 @@ const key = (z, x, y) => `${z}/${x}/${y}`;
 const tileFile = (z, x, y) => path.join(TILES, String(z), `${x}_${y}.jpg`);
 const span = (z) => 16 * 2 ** (ZMAX - z); // клеток в стороне тайла
 
-function rebuildTileSet(chunkList) {
-  const want = new Set();
-  for (const [cx, cy] of chunkList) {
-    for (let dx = 0; dx < 2; dx++) for (let dy = 0; dy < 2; dy++) {
-      let x = cx * 2 + dx, y = cy * 2 + dy;
-      for (let z = ZMAX; z >= 0; z--) { want.add(key(z, x, y)); x >>= 1; y >>= 1; }
+// Туман войны — как в клиенте игры и на сервере, а не в браузере:
+//   чанк виден сейчас (радар, игрок, бот) — живая графика из снимка;
+//   разведан, но не виден — затемнённая схема в цветах игровой карты, какой она была, когда чанк видели последний раз;
+//   не разведан — чёрное.
+// Тайл, где видимых чанков нет, камера не снимает вовсе; смешанный тайл склеивается из снимка и схемы.
+
+const chunks = new Map();  // "x,y" -> { x, y, vis, snap (32×32×3, цвет клетки), snapV, snapTs, tiles, tnames, tilesTs }
+const colors = { ents: new Map(), tiles: new Map() };
+const ckey = (x, y) => `${x},${y}`;
+const FOG_DIM = 0.6;       // туман темнее живой карты
+const SNAP_MS = 20_000;    // как часто обновлять схему видимых чанков: настолько она «отстаёт» в момент ухода в туман
+const BLACK = [0, 0, 0];
+
+const tileRange = (t) => { const s = span(t.z); return { x0: Math.floor(t.x * s / 32), x1: Math.floor(((t.x + 1) * s - 1) / 32), y0: Math.floor(t.y * s / 32), y1: Math.floor(((t.y + 1) * s - 1) / 32) }; };
+function tileState(t) {
+  const r = tileRange(t), parts = [];
+  let vis = 0, total = 0, ready = true;
+  for (let cy = r.y0; cy <= r.y1; cy++) for (let cx = r.x0; cx <= r.x1; cx++) {
+    const c = chunks.get(ckey(cx, cy));
+    total++;
+    if (!c) parts.push('u');
+    else if (c.vis) { vis++; parts.push('v'); }
+    else { parts.push('f' + c.snapV); if (!c.snap) ready = false; }
+  }
+  // ready — у всех чанков в тумане уже есть схема; sig — из чего тайл должен быть собран.
+  return { vis, total, ready, sig: crypto.createHash('md5').update(parts.join(',')).digest('hex').slice(0, 16) };
+}
+// Чанк изменился (видимость или схема) — тайлы всех уровней над ним нужно собрать заново.
+function touchChunk(c) {
+  const seen = new Set();
+  for (let dx = 0; dx < 2; dx++) for (let dy = 0; dy < 2; dy++) {
+    let x = c.x * 2 + dx, y = c.y * 2 + dy;
+    for (let z = ZMAX; z >= 0; z--) {
+      const k = key(z, x, y);
+      if (!seen.has(k)) {
+        seen.add(k);
+        let t = tiles.get(k);
+        if (!t) { t = { z, x, y, ts: 0, sig: null, fog: false }; tiles.set(k, t); }
+        t.dirty = true;
+        t.vis = tileState(t).vis;
+      }
+      x >>= 1; y >>= 1;
     }
   }
-  for (const k of want) {
-    if (tiles.has(k)) continue;
-    const [z, x, y] = k.split('/').map(Number);
-    let ts = 0;
-    try { ts = Math.floor(fs.statSync(tileFile(z, x, y)).mtimeMs); } catch { /* ещё не снят */ }
-    tiles.set(k, { z, x, y, ts });
-  }
-  for (const k of tiles.keys()) if (!want.has(k)) tiles.delete(k);
 }
 
 async function chunkListLoop() {
-  let last = '';
   for (;;) {
     try {
       const flat = list(await lua(LUA.chunks, { surface: SURFACE }));
-      if (flat.join() !== last) {
-        last = flat.join();
-        charted = flat;
-        const pairs = [];
-        for (let i = 0; i < flat.length; i += 2) pairs.push([flat[i], flat[i + 1]]);
-        rebuildTileSet(pairs);
-        broadcast({ t: 'chunks', chunks: charted });
+      for (let i = 0; i < flat.length; i += 3) {
+        const k = ckey(flat[i], flat[i + 1]), vis = flat[i + 2] === 1;
+        let c = chunks.get(k);
+        if (!c) { c = { x: flat[i], y: flat[i + 1], vis: null, snap: null, snapV: 0, snapTs: 0, tiles: null, tnames: null, tilesTs: 0 }; chunks.set(k, c); }
+        if (c.vis !== vis) { c.vis = vis; touchChunk(c); }
       }
+      chunksKnown = true;
     } catch (e) { log('список чанков:', e.message); }
-    await sleep(30_000);
+    await sleep(3000);
+  }
+}
+let chunksKnown = false; // видимость чанков уже получена от игры
+
+// --- схема чанка ---
+
+async function learnColors(ents, tileNames) {
+  const e = ents.filter((n) => !colors.ents.has(n)), t = tileNames.filter((n) => !colors.tiles.has(n));
+  if (!e.length && !t.length) return;
+  const r = await lua(LUA.protos, { ents: e, tiles: t });
+  for (const n of e) colors.ents.set(n, r.ents?.[n] ?? null);
+  for (const n of t) { const c = r.tiles?.[n]; colors.tiles.set(n, c ? [c.r, c.g, c.b] : BLACK); }
+}
+
+const LAYER = { resource: 0, tree: 1, 'simple-entity': 1, cliff: 1 };
+function drawSnap(c, r) {
+  const snap = Buffer.alloc(32 * 32 * 3);
+  if (c.tiles) {
+    const pal = c.tnames.map((n) => colors.tiles.get(n) ?? BLACK);
+    for (let i = 0; i < 1024; i++) { const col = pal[c.tiles.charCodeAt(i) - 48] ?? BLACK; snap[i * 3] = col[0]; snap[i * 3 + 1] = col[1]; snap[i * 3 + 2] = col[2]; }
+  }
+  const names = list(r.enames), flat = list(r.ents), boxes = [];
+  for (let i = 0; i < flat.length; i += 6) {
+    const p = colors.ents.get(names[flat[i] - 1]);
+    if (!p) continue;
+    const col = flat[i + 1] === 1 ? (p.f ?? p.m) : flat[i + 1] === 2 ? (p.e ?? p.m) : (p.m ?? p.f);
+    if (col) boxes.push({ col, layer: LAYER[p.type] ?? 2, x1: Math.floor(flat[i + 2] / 8), y1: Math.floor(flat[i + 3] / 8), x2: Math.ceil(flat[i + 4] / 8), y2: Math.ceil(flat[i + 5] / 8) });
+  }
+  boxes.sort((a, b) => a.layer - b.layer);
+  for (const b of boxes) {
+    const a = (b.col.a ?? 255) / 255;
+    for (let y = Math.max(0, b.y1); y < Math.min(32, Math.max(b.y2, b.y1 + 1)); y++) for (let x = Math.max(0, b.x1); x < Math.min(32, Math.max(b.x2, b.x1 + 1)); x++) {
+      const o = (y * 32 + x) * 3;
+      snap[o] = snap[o] * (1 - a) + b.col.r * a; snap[o + 1] = snap[o + 1] * (1 - a) + b.col.g * a; snap[o + 2] = snap[o + 2] * (1 - a) + b.col.b * a;
+    }
+  }
+  return snap;
+}
+
+// Схему обновляем, только пока чанк виден: ушёл в туман — остаётся такой, какой его видели в последний раз.
+// Чанки, которые сервис ни разу не застал видимыми, получают схему один раз и без врагов: что там сейчас, команда не знает.
+async function chartLoop() {
+  for (;;) {
+    let batch = [];
+    if (live.ok && chunksKnown) {
+      const now = Date.now(), all = [...chunks.values()];
+      batch = all.filter((c) => !c.snap).sort((a, b) => (b.vis ? 1 : 0) - (a.vis ? 1 : 0)).slice(0, 6);
+      if (!batch.length) batch = all.filter((c) => c.vis && now - c.snapTs > SNAP_MS).sort((a, b) => a.snapTs - b.snapTs).slice(0, 6);
+      if (batch.length) {
+        try {
+          const res = list(await lua(LUA.chart, { surface: SURFACE, chunks: batch.map((c) => [c.x, c.y, !c.tiles || now - c.tilesTs > 600_000, !c.vis]) }));
+          await learnColors([...new Set(res.flatMap((r) => list(r.enames)))], [...new Set(res.flatMap((r) => list(r.tnames)))]);
+          batch.forEach((c, i) => {
+            const r = res[i];
+            if (!r) return;
+            if (r.tiles) { c.tiles = r.tiles; c.tnames = list(r.tnames); c.tilesTs = now; }
+            const snap = drawSnap(c, r);
+            c.snapTs = now;
+            if (c.snap && snap.equals(c.snap)) return;
+            c.snap = snap; c.snapV++; fogChanged = true;
+            if (!c.vis) touchChunk(c);
+          });
+        } catch (e) { log('схема чанков:', e.message); await sleep(2000); }
+      }
+    }
+    await sleep(batch.length ? 120 : 1000);
+  }
+}
+let fogChanged = false;
+
+// --- сборка тайлов ---
+
+const CRC = new Int32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c; });
+function pngChunk(type, data) {
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0); out.write(type, 4, 'latin1'); data.copy(out, 8);
+  let c = -1;
+  for (let i = 4; i < 8 + data.length; i++) c = CRC[(c ^ out[i]) & 0xff] ^ (c >>> 8);
+  out.writeUInt32BE((c ^ -1) >>> 0, 8 + data.length);
+  return out;
+}
+function encodePng(rgb) {
+  const row = TILE * 3, raw = Buffer.alloc((row + 1) * TILE);
+  for (let y = 0; y < TILE; y++) rgb.copy(raw, y * (row + 1) + 1, y * row, (y + 1) * row);
+  const head = Buffer.alloc(13);
+  head.writeUInt32BE(TILE, 0); head.writeUInt32BE(TILE, 4); head[8] = 8; head[9] = 2;
+  return Buffer.concat([Buffer.from('\x89PNG\r\n\x1a\n', 'latin1'), pngChunk('IHDR', head), pngChunk('IDAT', zlib.deflateSync(raw, { level: 4 })), pngChunk('IEND', Buffer.alloc(0))]);
+}
+
+/** Картинка тумана для тайла: bpp=3 — тайл целиком в тумане; bpp=4 — накладка на снимок, прозрачная над видимыми чанками. */
+function fogImage(t, bpp) {
+  const img = Buffer.alloc(TILE * TILE * bpp), s = span(t.z), p = TILE / s, r = tileRange(t), gx0 = t.x * s, gy0 = t.y * s;
+  if (bpp === 4) for (let i = 3; i < img.length; i += 4) img[i] = 255; // по умолчанию — непрозрачное чёрное
+  for (let cy = r.y0; cy <= r.y1; cy++) for (let cx = r.x0; cx <= r.x1; cx++) {
+    const c = chunks.get(ckey(cx, cy));
+    if (!c || (!c.vis && !c.snap)) continue; // не разведано или схемы ещё нет — чёрное
+    const ax = Math.max(cx * 32, gx0), bx = Math.min(cx * 32 + 32, gx0 + s), ay = Math.max(cy * 32, gy0), by = Math.min(cy * 32 + 32, gy0 + s);
+    for (let gy = ay; gy < by; gy++) for (let gx = ax; gx < bx; gx++) {
+      const so = ((gy - cy * 32) * 32 + (gx - cx * 32)) * 3;
+      const cr = c.vis ? 0 : c.snap[so] * FOG_DIM, cg = c.vis ? 0 : c.snap[so + 1] * FOG_DIM, cb = c.vis ? 0 : c.snap[so + 2] * FOG_DIM, al = c.vis ? 0 : 255;
+      for (let py = (gy - gy0) * p; py < (gy - gy0 + 1) * p; py++) {
+        let o = (py * TILE + (gx - gx0) * p) * bpp;
+        for (let px = 0; px < p; px++) { img[o] = cr; img[o + 1] = cg; img[o + 2] = cb; if (bpp === 4) img[o + 3] = al; o += bpp; }
+      }
+    }
+  }
+  return img;
+}
+
+function publish(t, st, fog, updates) {
+  t.ts = Date.now(); t.sig = st.sig; t.fog = fog; t.vis = st.vis; t.dirty = false;
+  updates.push([t.z, t.x, t.y, t.ts, fog ? 1 : 0]);
+  indexChanged = true;
+}
+let indexChanged = false;
+function writeTile(t, data) {
+  fs.mkdirSync(path.join(TILES, String(t.z)), { recursive: true });
+  const file = tileFile(t.z, t.x, t.y);
+  fs.writeFileSync(file + '.tmp', data);
+  fs.renameSync(file + '.tmp', file);
+}
+
+// Тайлы без видимых чанков: рисуем сами, камера не нужна.
+async function fogLoop() {
+  for (;;) {
+    const updates = [];
+    let done = 0;
+    if (chunksKnown) {
+      for (const t of tiles.values()) {
+        if (!t.dirty || t.vis > 0) continue;
+        const st = tileState(t);
+        if (st.vis > 0) { t.vis = st.vis; continue; }
+        if (!st.ready) continue;                          // схемы ещё подгружаются
+        if (st.sig === t.sig) { t.dirty = false; continue; } // уже собран именно так
+        writeTile(t, encodePng(fogImage(t, 3)));
+        publish(t, st, true, updates);
+        if (++done >= 12) break;                          // не занимаем процесс надолго
+      }
+    }
+    if (updates.length) broadcast({ t: 'tiles', up: updates });
+    await sleep(done ? 30 : 500);
   }
 }
 
-// Приоритеты: 1) поле зрения зрителей, 2) окрестности ботов и игроков, 3) фоновый обход.
+// Приоритеты камеры: 0) тайл нужно пересобрать, 1) поле зрения зрителей, 2) окрестности ботов и игроков, 3) фоновый обход.
 function pick() {
   const hot = new Set();
   const s = span(ZMAX);
@@ -366,10 +594,12 @@ function pick() {
   for (const ws of clients) for (const k of ws.view ?? []) viewed.add(k);
   const now = Date.now(), due = [];
   for (const [k, t] of tiles) {
+    if (!(t.vis > 0)) continue;                             // целиком в тумане — не снимаем
+    if (t.dirty) { due.push([viewed.has(k) ? Infinity : 1e9, t]); continue; }
     if (live.paused && pausedAt && t.ts > pausedAt) continue; // на паузе картинка не меняется
     const want = viewed.has(k) ? VIEW_MS : hot.has(k) ? FRESH_MS : SWEEP_MS;
     const score = (now - t.ts) / want;
-    if (score >= 1) due.push([t.ts === 0 && want !== SWEEP_MS ? Infinity : score, t]);
+    if (score >= 1) due.push([score, t]);
   }
   due.sort((a, b) => b[0] - a[0]);
   return due.slice(0, BATCH).map((d) => d[1]);
@@ -387,6 +617,33 @@ const jpegDone = (file) => {
   } catch { return false; }
 };
 
+// Наложить картинку тумана на снимок (ffmpeg): возвращает JPEG.
+function overlay(shotFile, rgba) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', ['-loglevel', 'error', '-i', shotFile, '-f', 'rawvideo', '-pix_fmt', 'rgba', '-video_size', `${TILE}x${TILE}`, '-i', 'pipe:0',
+      '-filter_complex', 'overlay', '-frames:v', '1', '-q:v', '4', '-f', 'mjpeg', 'pipe:1'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+    const out = [];
+    ff.stdout.on('data', (d) => out.push(d));
+    ff.on('error', reject);
+    ff.on('close', (code) => (code === 0 && out.length ? resolve(Buffer.concat(out)) : reject(new Error(`ffmpeg: код ${code}`))));
+    ff.stdin.on('error', () => {});
+    ff.stdin.end(rgba);
+  });
+}
+
+// Снимок готов: смотрим, что в тайле видно прямо сейчас, и публикуем только это.
+async function finishShot(t, src, updates) {
+  const st = tileState(t);
+  try {
+    if (st.vis === 0) { t.vis = 0; t.dirty = true; return; }           // пока снимали, всё ушло в туман — соберёт fogLoop
+    if (st.vis === st.total) { fs.mkdirSync(path.join(TILES, String(t.z)), { recursive: true }); fs.renameSync(src, tileFile(t.z, t.x, t.y)); }
+    else writeTile(t, await overlay(src, fogImage(t, 4)));
+    publish(t, st, false, updates);
+    rendered++;
+  } catch (e) { log(`тайл ${key(t.z, t.x, t.y)}:`, e.message); }
+  finally { fs.rmSync(src, { force: true }); }
+}
+
 let shotId = 0, failures = 0;
 async function renderBatch(batch) {
   const shots = batch.map((t) => {
@@ -394,21 +651,18 @@ async function renderBatch(batch) {
     return { t, name: `${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZMAX)] };
   });
   await lua(LUA.shots, { camera: CAMERA, surface: SURFACE, dir: SHOT_DIR, size: TILE, quality: JPEG_QUALITY, shots: shots.map((s) => [...s.args, s.name]) });
-  const deadline = Date.now() + SHOT_TIMEOUT_MS, updates = [];
+  const deadline = Date.now() + SHOT_TIMEOUT_MS, updates = [], work = [];
   let left = shots;
   while (left.length && Date.now() < deadline) {
     await sleep(15);
     left = left.filter((s) => {
       const src = path.join(SHOTS, s.name);
       if (!jpegDone(src)) return true;
-      fs.mkdirSync(path.join(TILES, String(s.t.z)), { recursive: true });
-      fs.renameSync(src, tileFile(s.t.z, s.t.x, s.t.y));
-      s.t.ts = Date.now();
-      updates.push([s.t.z, s.t.x, s.t.y, s.t.ts]);
-      rendered++;
+      work.push(finishShot(s.t, src, updates));
       return false;
     });
   }
+  await Promise.all(work);
   if (updates.length) broadcast({ t: 'tiles', up: updates });
   if (left.length) {
     failures++;
@@ -419,12 +673,45 @@ async function renderBatch(batch) {
 
 async function renderLoop() {
   for (;;) {
-    const batch = live.ok && live.camera && (!CAMERA_MANAGE || camera?.joined) ? pick() : [];
+    const batch = live.ok && live.camera && chunksKnown && (!CAMERA_MANAGE || camera?.joined) ? pick() : [];
     if (batch.length) {
       try { await renderBatch(batch); } catch (e) { log('перерисовка:', e.message); await sleep(2000); }
     }
     await sleep(batch.length ? PAUSE_MS : 300);
   }
+}
+
+// --- то, что переживает перезапуск сервиса: схемы чанков и из чего собран каждый тайл ---
+
+const FOG_BIN = path.join(TILES, 'fog.bin'), FOG_IDX = path.join(TILES, 'fog.json'), TILE_IDX = path.join(TILES, 'index.json');
+function saveState() {
+  try {
+    if (fogChanged) {
+      const have = [...chunks.values()].filter((c) => c.snap);
+      fs.writeFileSync(FOG_BIN + '.tmp', Buffer.concat(have.map((c) => c.snap)));
+      fs.writeFileSync(FOG_IDX + '.tmp', JSON.stringify(have.map((c) => [c.x, c.y, c.snapV])));
+      fs.renameSync(FOG_BIN + '.tmp', FOG_BIN); fs.renameSync(FOG_IDX + '.tmp', FOG_IDX);
+      fogChanged = false;
+    }
+    if (indexChanged) {
+      const idx = {};
+      for (const [k, t] of tiles) if (t.sig) idx[k] = [t.ts, t.sig, t.fog ? 1 : 0];
+      fs.writeFileSync(TILE_IDX + '.tmp', JSON.stringify(idx));
+      fs.renameSync(TILE_IDX + '.tmp', TILE_IDX);
+      indexChanged = false;
+    }
+  } catch (e) { log('сохранение состояния карты:', e.message); }
+}
+function loadState() {
+  try {
+    const idx = JSON.parse(fs.readFileSync(FOG_IDX, 'utf8')), bin = fs.readFileSync(FOG_BIN);
+    idx.forEach(([x, y, v], i) => chunks.set(ckey(x, y), { x, y, vis: null, snap: Buffer.from(bin.subarray(i * 3072, i * 3072 + 3072)), snapV: v, snapTs: 0, tiles: null, tnames: null, tilesTs: 0 }));
+    for (const [k, [ts, sig, fog]] of Object.entries(JSON.parse(fs.readFileSync(TILE_IDX, 'utf8')))) {
+      const [z, x, y] = k.split('/').map(Number);
+      if (fs.existsSync(tileFile(z, x, y))) tiles.set(k, { z, x, y, ts, sig, fog: !!fog, vis: 0, dirty: false });
+    }
+    log(`загружено: схем чанков ${chunks.size}, тайлов ${tiles.size}`);
+  } catch { /* первый запуск: всё соберётся заново */ }
 }
 
 // ---------- клиент-камера ----------
@@ -840,11 +1127,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/names.json') return reply(200, 'application/json', NAMES, 'max-age=3600');
     const t = url.pathname.match(/^\/tiles\/(\d)\/(-?\d{1,6})\/(-?\d{1,6})\.jpg$/);
     if (t) {
-      if (!tiles.get(key(+t[1], +t[2], +t[3]))?.ts) return reply(404, 'text/plain', '');
+      if (!tiles.get(key(+t[1], +t[2], +t[3]))?.sig) return reply(404, 'text/plain', ''); // ещё не собран с учётом тумана
       let body;
       try { body = fs.readFileSync(tileFile(+t[1], +t[2], +t[3])); } catch { return reply(404, 'text/plain', ''); }
+      const type = body[0] === 0x89 ? 'image/png' : 'image/jpeg'; // тайлы тумана — PNG, снимки — JPEG
       // Версия в адресе (?v=), поэтому сам файл можно кешировать навсегда.
-      return reply(200, 'image/jpeg', body, url.searchParams.has('v') ? 'public, max-age=31536000, immutable' : 'no-cache');
+      return reply(200, type, body, url.searchParams.has('v') ? 'public, max-age=31536000, immutable' : 'no-cache');
     }
     if (url.pathname.startsWith('/api/session')) {
       const q = url.searchParams, bot = q.get('bot') ?? '';
@@ -896,8 +1184,8 @@ wss.on('connection', (ws) => {
   if (clients.size >= MAX_CLIENTS) return ws.close(1013, 'слишком много зрителей');
   clients.add(ws);
   const tl = [];
-  for (const t of tiles.values()) tl.push([t.z, t.x, t.y, t.ts]);
-  send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, chunks: charted, summary, events, live, now: Date.now() });
+  for (const t of tiles.values()) if (t.sig) tl.push([t.z, t.x, t.y, t.ts, t.fog ? 1 : 0]);
+  send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, summary, events, live, now: Date.now() });
   ws.on('message', (data) => {
     try {
       const m = JSON.parse(data);
@@ -929,6 +1217,7 @@ setInterval(() => { log(`зрителей ${clients.size}, тайлов ${tiles.
 // Штатная остановка сервиса останавливает и клиент-камеру; после падения сервиса клиент остаётся, и следующий запуск его подхватит.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
+    saveState();
     if (encoder) encoder.kill('SIGTERM');
     if (camera) { try { process.kill(-camera.pid, 'SIGTERM'); } catch { /* уже нет */ } fs.rmSync(PID_FILE, { force: true }); }
     const x = xvfbPid();
@@ -937,6 +1226,8 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   });
 }
 // Перезапуск сервиса без остановки камеры (после правок кода): kill -USR2 <pid>; новый процесс подхватит её по camera.pid.
-process.on('SIGUSR2', () => { if (encoder) encoder.kill('SIGTERM'); process.exit(0); });
+process.on('SIGUSR2', () => { saveState(); if (encoder) encoder.kill('SIGTERM'); process.exit(0); });
 fs.mkdirSync(TILES, { recursive: true });
-liveLoop(); chunkListLoop(); summaryLoop(); renderLoop(); cameraLoop();
+loadState();
+setInterval(saveState, 60_000);
+liveLoop(); chunkListLoop(); chartLoop(); fogLoop(); summaryLoop(); renderLoop(); cameraLoop();
