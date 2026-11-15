@@ -70,6 +70,130 @@ E.handlers[defines.events.on_entity_died] = function(ev)
   end
 end
 
+-- Постройки ставят и снимают пачками: в журнал идёт сводка раз в секунду на автора, а не событие на каждую.
+local function tally(kind, by, e)
+  if not (e and e.valid) or e.force.name ~= 'player' or e.type == 'entity-ghost' or e.type == 'tile-ghost' then return end
+  local buf = storage.agent.tally
+  local k = kind .. '|' .. by
+  local t = buf[k]
+  if not t then
+    t = {kind = kind, by = by, count = 0, names = {}, x1 = e.position.x, y1 = e.position.y, x2 = e.position.x, y2 = e.position.y}
+    buf[k] = t
+  end
+  t.count = t.count + 1
+  t.names[e.name] = (t.names[e.name] or 0) + 1
+  t.x1, t.y1 = math.min(t.x1, e.position.x), math.min(t.y1, e.position.y)
+  t.x2, t.y2 = math.max(t.x2, e.position.x), math.max(t.y2, e.position.y)
+end
+E.tally = tally
+
+local function flush_tally()
+  local buf = storage.agent.tally
+  for k, t in pairs(buf) do
+    J.add(t.kind, nil, {by = t.by, count = t.count, names = t.names, area = {x1 = t.x1, y1 = t.y1, x2 = t.x2, y2 = t.y2}})
+    buf[k] = nil
+  end
+end
+
+E.handlers[defines.events.on_built_entity] = function(ev)
+  local p = game.get_player(ev.player_index)
+  tally('entities_built', p and p.name or '?', ev.entity)
+end
+E.handlers[defines.events.on_player_mined_entity] = function(ev)
+  local p = game.get_player(ev.player_index)
+  tally('entities_removed', p and p.name or '?', ev.entity)
+end
+E.handlers[defines.events.on_robot_built_entity] = function(ev) tally('entities_built', 'robots', ev.entity) end
+E.handlers[defines.events.on_robot_mined_entity] = function(ev) tally('entities_removed', 'robots', ev.entity) end
+
+-- Угрозы: отряд врагов собрался в атаку; враги построили новую базу на открытой карте.
+E.handlers[defines.events.on_unit_group_finished_gathering] = function(ev)
+  local g = ev.group
+  if not (g and g.valid) or g.force.name ~= 'enemy' then return end
+  local force = game.forces.player
+  local pos = g.position
+  if not force.is_chunk_charted(g.surface, {math.floor(pos.x / 32), math.floor(pos.y / 32)}) then return end
+  if J.due('group', 600) then J.add('attack_group', nil, {size = #g.members, position = U.pos(pos)}) end
+end
+E.handlers[defines.events.on_biter_base_built] = function(ev)
+  local e = ev.entity
+  if not (e and e.valid) then return end
+  if game.forces.player.is_chunk_charted(e.surface, {math.floor(e.position.x / 32), math.floor(e.position.y / 32)}) then
+    J.add('enemy_base_built', nil, {name = e.name, position = U.pos(e.position)})
+  end
+end
+
+-- Раз в 2 секунды: враги рядом с персонажем бота (в пределах экрана).
+local function scan_threats()
+  local st = storage.agent
+  for name, A in pairs(st.agents) do
+    local e = A.entity
+    if e and e.valid then
+      local units = e.surface.find_enemy_units(e.position, 32, e.force)
+      if #units > 0 and J.due('near' .. name, 600) then
+        local best, bd
+        for _, u in pairs(units) do
+          local d = U.dist(u.position, e.position)
+          if not bd or d < bd then best, bd = u, d end
+        end
+        J.add('enemies_near', name, {count = #units, nearest = {name = best.name, x = U.r2(best.position.x), y = U.r2(best.position.y), distance = U.r2(bd)}})
+      end
+    end
+  end
+end
+
+-- Раз в 5 секунд: турели без патронов.
+local function scan_turrets()
+  for _, t in pairs(game.surfaces.nauvis.find_entities_filtered{type = 'ammo-turret', force = 'player'}) do
+    local inv = t.get_inventory(defines.inventory.turret_ammo)
+    if inv and inv.is_empty() and J.due('ammo' .. t.unit_number, 3600) then
+      J.add('turret_no_ammo', nil, {name = t.name, unit = t.unit_number, position = U.pos(t.position)})
+    end
+  end
+end
+
+-- Тревоги при появлении: машины, у которых кончилось топливо или пропала энергия. Список машин обходится порциями,
+-- в журнал идёт сводка по состоянию за проход, а не событие на каждую машину.
+local WATCHED = {'assembling-machine', 'furnace', 'mining-drill', 'lab', 'boiler', 'generator', 'burner-generator', 'reactor', 'rocket-silo'}
+local ALERT = {[defines.entity_status.no_fuel] = 'no_fuel', [defines.entity_status.no_power] = 'no_power'}
+local SLICE = 300
+
+local function scan_alerts()
+  local w = storage.agent.watch
+  if not w.list or w.i > #w.list then
+    -- Проход закончен: сводка и новый список.
+    for status, t in pairs(w.pending or {}) do
+      J.add('alert', nil, {status = status, count = t.count, examples = t.examples})
+    end
+    w.pending = {}
+    w.list = game.surfaces.nauvis.find_entities_filtered{type = WATCHED, force = 'player'}
+    w.i = 1
+    for unit in pairs(w.bad) do w.bad[unit] = w.bad[unit] == 2 and 1 or nil end -- 2 — виден в этом проходе
+    return
+  end
+  local last = math.min(w.i + SLICE - 1, #w.list)
+  for i = w.i, last do
+    local e = w.list[i]
+    if e.valid then
+      local status = ALERT[e.status]
+      local unit = e.unit_number
+      if status then
+        if not w.bad[unit] then
+          local t = w.pending[status]
+          if not t then
+            t = {count = 0, examples = {}}
+            w.pending[status] = t
+          end
+          t.count = t.count + 1
+          if #t.examples < 5 then t.examples[#t.examples + 1] = {name = e.name, unit = unit, x = e.position.x, y = e.position.y} end
+        end
+        w.bad[unit] = 2
+      end
+    end
+  end
+  w.i = last + 1
+end
+
 E.handlers[defines.events.on_research_finished] = function(ev)
   local t = ev.research
   if t.force.name ~= 'player' then return end
@@ -79,7 +203,7 @@ end
 E.handlers[defines.events.on_console_chat] = function(ev)
   if not ev.player_index then return end
   local p = game.get_player(ev.player_index)
-  J.add('chat', nil, {from = p and p.name or '?', text = ev.message})
+  J.chat(p and p.name or '?', ev.message)
 end
 
 E.handlers[defines.events.on_player_joined_game] = function(ev)
@@ -108,7 +232,13 @@ E.handlers[defines.events.on_tick] = function(ev)
       end
     end
   end
-  if ev.tick % 60 == 0 then Fog.tick(ev.tick) end
+  if ev.tick % 60 == 0 then
+    Fog.tick(ev.tick)
+    flush_tally()
+    scan_alerts()
+  end
+  if ev.tick % 120 == 7 then scan_threats() end
+  if ev.tick % 300 == 13 then scan_turrets() end
   if ev.tick % 3600 == 0 then J.prune_throttle(DAMAGE_EVERY) end
 end
 

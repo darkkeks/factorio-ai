@@ -2,6 +2,8 @@
 // уходят сразу, без ожидания ответа на предыдущую (ответы сопоставляются по номеру пакета).
 import net from 'node:net';
 
+const NUDGE_ID = 0x7ffffffe;
+
 export class Rcon {
   constructor({ host = '127.0.0.1', port, password, timeoutMs = 10000, name = 'rcon' }) {
     Object.assign(this, { host, port, password, timeoutMs, name });
@@ -46,6 +48,7 @@ export class Rcon {
       const s = net.connect(this.port, this.host);
       s.setNoDelay(true);
       let buf = Buffer.alloc(0);
+      let nudged = false;
       s.once('error', (e) => { reject(e); });
       s.on('data', (d) => {
         buf = buf.length ? Buffer.concat([buf, d]) : d;
@@ -55,6 +58,7 @@ export class Rcon {
           const type = buf.readInt32LE(8);
           const body = buf.toString('utf8', 12, 4 + size - 2);
           buf = buf.subarray(4 + size);
+          if (id === NUDGE_ID) continue;
           if (type === 2 && id === -1) {
             for (const w of this.waiting.values()) w.reject(new Error('RCON: неверный пароль'));
             this.waiting.clear();
@@ -63,6 +67,12 @@ export class Rcon {
           const w = this.waiting.get(id);
           if (w) { this.waiting.delete(id); w.resolve(body); }
         }
+        // Большой ответ приходит несколькими сегментами TCP. Сервер игры не шлёт хвост, пока не получит подтверждение
+        // первого сегмента (алгоритм Нейгла), а ядро откладывает подтверждение на ~40 мс. Пустой пакет в ответ
+        // несёт подтверждение сразу. Пакет — повторная авторизация: игра отвечает на неё пакетом, который здесь никто не ждёт,
+        // и ничего не пишет в свой журнал (на пакет неизвестного типа она пишет ошибку).
+        if (buf.length > 0 && !nudged) { nudged = true; s.write(Rcon.packet(NUDGE_ID, 3, this.password)); }
+        else if (buf.length === 0) nudged = false;
       });
       s.on('close', () => {
         if (this.sock === s) this.sock = null;

@@ -8,7 +8,7 @@ local Fog = require('agent.fog')
 local BP = require('agent.blueprints')
 
 local S = {}
-S.VERSION = 3
+S.VERSION = 5
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}

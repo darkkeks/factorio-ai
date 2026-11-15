@@ -19,6 +19,7 @@ local Tour = {}
 local function settle(it, ok, res)
   if ok then
     it.state, it.result = 'done', res
+    if Tour.on_done then Tour.on_done(it, res) end
   else
     it.state, it.error = 'skipped', {code = res.code, message = res.message, data = res.data}
   end

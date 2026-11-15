@@ -6,6 +6,18 @@ J.MAX = 10000
 function J.init(st)
   st.journal = st.journal or {seq = 0, first = 1, items = {}}
   st.throttle = st.throttle or {}
+  st.chat = st.chat or {seq = 0, items = {}}
+  st.tally = st.tally or {}
+  st.watch = st.watch or {i = 1, bad = {}, pending = {}}
+end
+
+--- Сообщение игрового чата: в журнал событий и в ленту чата (последние 200 сообщений людей и ботов).
+function J.chat(from, text, bot)
+  local c = storage.agent.chat
+  c.seq = c.seq + 1
+  c.items[#c.items + 1] = {seq = c.seq, from = from, text = text, bot = bot or nil, tick = game.tick}
+  if #c.items > 200 then table.remove(c.items, 1) end
+  J.add('chat', nil, {from = from, text = text, bot = bot or nil})
 end
 
 function J.add(kind, agent, data)

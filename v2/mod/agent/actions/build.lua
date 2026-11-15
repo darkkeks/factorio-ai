@@ -5,6 +5,7 @@ local T = require('agent.target')
 local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
 local Plans = require('agent.plans')
+local E = require('agent.events')
 
 local B = {}
 
@@ -128,6 +129,7 @@ local function place_one(A, it)
   end
 
   e.remove_item{name = it.item, count = need, quality = quality}
+  E.tally('entities_built', A.name, n)
   local extra = {}
   if replaced then extra.replaced = replaced end
   if it.recipe and (n.type == 'assembling-machine' or n.type == 'rocket-silo') then
@@ -193,6 +195,7 @@ local function build_ghost(A, it)
       quality = qn, fast_replace = true, character = e, spill = false, raise_built = true}
     if not n then U.fail('blocked', 'замена на месте не удалась') end
     e.remove_item{name = item, count = need, quality = qn}
+    E.tally('entities_built', A.name, n)
     return describe(n, {replaced = old})
   end
   local proto = g.ghost_prototype
@@ -209,7 +212,10 @@ local function build_ghost(A, it)
     U.fail('blocked', 'место под призраком занято: мешает постройка (возможно, помеченная на снос), дерево, камень или персонаж')
   end
   e.remove_item{name = item, count = need, quality = quality}
-  if revived then return describe(revived, {plan = plan}) end
+  if revived then
+    E.tally('entities_built', A.name, revived)
+    return describe(revived, {plan = plan})
+  end
   return {name = name, x = pos.x, y = pos.y, tile = tile or nil, plan = plan}
 end
 

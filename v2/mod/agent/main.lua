@@ -15,6 +15,8 @@ require('agent.actions.craft')
 require('agent.actions.configure')
 require('agent.actions.research')
 require('agent.planning')
+require('agent.observe')
+require('agent.stats')
 local Fog = require('agent.fog')
 
 local M = {events = {}}
@@ -51,8 +53,15 @@ local function handle(raw)
   end
   local params = req.params
   if type(params) ~= 'table' then params = {} end
+  -- Замер времени исполнения внутри игры (администратору): поле profile в запросе.
+  local prof = req.profile and req.admin and helpers.create_profiler() or nil
   local ok, res = xpcall(op.fn, Q.on_error, A, params, req)
   local out = reply(ok, res)
+  if prof then
+    prof.stop()
+    rcon.print({'', 'PROFILE ', prof, ' bytes=' .. #out})
+    return nil
+  end
   if A and id ~= nil and op.write then
     -- Для повтора храним краткий ответ: итоги действий лежат в журнале событий (action_done).
     S.remember(A, id, (ok and op.compact) and reply(true, op.compact(res)) or out)
@@ -91,7 +100,8 @@ M.add_commands = function()
       return
     end
     S.ensure()
-    rcon.print(handle(cmd.parameter))
+    local out = handle(cmd.parameter)
+    if out then rcon.print(out) end
   end)
 end
 

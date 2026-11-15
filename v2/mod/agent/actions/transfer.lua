@@ -4,32 +4,15 @@ local U = require('agent.util')
 local T = require('agent.target')
 local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
+local Inv = require('agent.inv')
 
 local BELT = {['transport-belt'] = true, ['underground-belt'] = true, splitter = true, ['lane-splitter'] = true, loader = true, ['loader-1x1'] = true}
 
-local MAIN = {'chest', 'car_trunk', 'cargo_wagon', 'spider_trunk', 'character_corpse', 'hub_main', 'cargo_landing_pad_main', 'linked_container_main', 'roboport_material'}
-local INPUT = {'crafter_input', 'lab_input', 'agricultural_tower_input'}
-local AMMO = {'turret_ammo', 'car_ammo', 'artillery_turret_ammo', 'artillery_wagon_ammo', 'spider_ammo'}
-
-local function first(ent, names)
-  for _, n in ipairs(names) do
-    local inv = ent.get_inventory(defines.inventory[n])
-    if inv then return inv end
-  end
-end
-
 --- Инвентарь объекта по имени: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory.
 local function inventory(ent, name)
-  if name == 'fuel' then return ent.get_fuel_inventory() end
-  if name == 'output' then return ent.get_output_inventory() end
-  if name == 'modules' then return ent.get_module_inventory() end
-  if name == 'burnt' then return ent.get_burnt_result_inventory() end
-  if name == 'input' then return first(ent, INPUT) end
-  if name == 'main' then return first(ent, MAIN) end
-  if name == 'ammo' then return first(ent, AMMO) end
-  local id = defines.inventory[name]
-  if not id then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory') end
-  return ent.get_inventory(id)
+  local inv, unknown = Inv.named(ent, name)
+  if unknown then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory') end
+  return inv
 end
 
 -- Копия свойств стопки для вставки: количество задаём сами, остальное (качество, прочность, патроны) — как было.
@@ -144,9 +127,9 @@ local function transfer_one(A, it)
         if not src then U.fail('not_found', 'у ' .. ent.name .. ' нет инвентаря ' .. it.inventory) end
         sources[1] = src
       else
-        -- Без inventory: выходной слот машины, а у сундуков, машин без выхода и трупов — всё содержимое.
-        local out = ent.get_output_inventory()
-        if out and ent.type ~= 'container' and ent.type ~= 'logistic-container' then
+        -- Без inventory: выходной слот машины или содержимое сундука; у остальных (лаборатория, турель) — всё, что в них лежит.
+        local out = Inv.named(ent, 'output') or Inv.named(ent, 'main')
+        if out then
           sources[1] = out
         else
           for i = 1, ent.get_max_inventory_index() do

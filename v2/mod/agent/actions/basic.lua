@@ -52,7 +52,7 @@ local function say(A, text)
   c.items[#c.items + 1] = {seq = c.seq, from = A.name, text = text}
   if #c.items > 50 then table.remove(c.items, 1) end
   game.print('[color=1,0.8,0.2]' .. A.name .. ':[/color] ' .. text)
-  J.add('chat', nil, {from = A.name, text = text, bot = true})
+  J.chat(A.name, text, true)
 end
 
 Q.register('say', {

@@ -13,7 +13,7 @@ export const API = {
       'off_path (снесло с пути дальше 2 клеток), damaged (получил урон). Обход врагов и промежуточные точки — твоё решение.',
     params: {
       x: 'число — точка назначения (вместе с y)', y: 'число',
-      target: 'объект вместо точки: {unit} или {x, y, name?}',
+      target: 'объект вместо точки: {x, y, name?}',
       distance: 'число — на каком расстоянии от цели остановиться; по умолчанию 0 для точки (точность около 0,25 клетки) и 2 для объекта',
       stop_on_damage: 'false — не прерывать ходьбу при уроне (по умолчанию прерывает)',
       resolution: 'целое -2…3 — мелкость сетки поиска пути; 0 — клетка, 1 — полклетки (проходы между манипуляторами), по умолчанию 0',
@@ -46,7 +46,7 @@ export const API = {
     summary: 'Добывать руками ресурс, дерево, камень или снять постройку в инвентарь (с её содержимым). Время добычи считает игра. ' +
       'Дальность: ресурс — 2,7 клетки, остальное — 10. Призрак снимается сразу.',
     params: {
-      target: 'одна цель: {unit} или {x, y, name?}',
+      target: 'одна цель: {x, y, name?}',
       count: 'целое — для ресурса: сколько единиц добыть (по умолчанию 1); дерево, камень и постройка снимаются целиком',
       targets: 'или список целей (у цели может быть свой count)',
       marked: 'или true — всё помеченное на снос в area или в плане plan',
@@ -90,7 +90,7 @@ export const API = {
     summary: 'Построить из инвентаря призраки (постройки и плитку): по списку, в области или по имени плана. В области заодно исполняются пометки на замену ' +
       '(быстрая замена на месте). Чего нет в инвентаре или куда нельзя поставить — попадает в отчёт с причиной.',
     params: {
-      ghosts: 'список целей {unit} или {x, y}', area: 'или {x1, y1, x2, y2}', plan: 'и/или имя плана',
+      ghosts: 'список целей {x, y}', area: 'или {x1, y1, x2, y2}', plan: 'и/или имя плана',
       upgrades: 'false — не исполнять пометки на замену в области', approach: 'true — самому обходить цели вне досягаемости',
     },
     result: '{done, skipped, left, total, items: [{name, x, y, ok, code?, message?}]}',
@@ -101,7 +101,7 @@ export const API = {
     summary: 'Переложить предметы между инвентарём персонажа и объектом в досягаемости (10 клеток): один перенос или список items. ' +
       'Что, откуда и сколько — задаёшь ты; исполнитель ничего не подбирает сам.',
     params: {
-      target: 'объект: {unit} или {x, y, name?}', direction: 'put — положить в объект, take — забрать из объекта',
+      target: 'объект: {x, y, name?}', direction: 'put — положить в объект, take — забрать из объекта',
       item: 'имя предмета (для take можно не указывать — забрать всё)', count: 'сколько (по умолчанию всё)',
       inventory: 'fuel, input, output, modules, main, ammo, burnt; по умолчанию put — как ctrl-клик (игра сама выбирает слот), take — выход машины или всё содержимое сундука',
       lane: 'left | right — полоса конвейера по ходу движения', quality: 'качество',
@@ -114,7 +114,7 @@ export const API = {
     kind: 'action', instant: true,
     summary: 'Настройки постройки в досягаемости — то, что игрок делает в её окне и клавишами: одна цель или список items.',
     params: {
-      target: 'объект: {unit} или {x, y, name?}',
+      target: 'объект: {x, y, name?}',
       recipe: 'рецепт сборочного автомата (false — снять); лишние ингредиенты возвращаются в инвентарь',
       direction: 'повернуть в сторону north | east | south | west', rotate: 'true — повернуть по часовой, "reverse" — против',
       filters: 'список предметов: фильтры манипулятора или фильтр разделителя', filter_mode: 'whitelist | blacklist',
@@ -131,7 +131,7 @@ export const API = {
   },
   research: {
     kind: 'action', instant: true,
-    summary: 'Очередь исследований команды: добавить в конец, убрать, задать порядок целиком.',
+    summary: 'Очередь исследований команды: добавить в конец, убрать, задать порядок целиком. Посмотреть исследования — research_info.',
     params: { add: 'имя или список имён технологий', remove: 'имя или список', set: 'список — новая очередь целиком' },
     result: '{queue, current, skipped: [{name, reason}]}',
     example: { add: ['logistics-2', 'steel-axe'] },
@@ -161,7 +161,7 @@ export const API = {
     kind: 'action', instant: true,
     summary: 'Убрать призраки: своего плана целиком (вместе с его пометками сноса и замены), в области или по списку. Постройки не трогает. ' +
       'В области убираются только призраки своих планов; all: true — любые призраки команды.',
-    params: { plan: 'имя плана', area: '{x1, y1, x2, y2}', ghosts: 'список целей {unit} или {x, y}', all: 'true — и чужие призраки в области' },
+    params: { plan: 'имя плана', area: '{x1, y1, x2, y2}', ghosts: 'список целей {x, y}', all: 'true — и чужие призраки в области' },
     result: '{removed, unmarked, kept}', example: { plan: 'smelter-1' },
   },
   mark_deconstruct: {
@@ -229,6 +229,107 @@ export const API = {
     params: { items: 'список построек', tiles: 'список плитки', blueprint: 'или имя чертежа', string: 'или строка', x: 'клетка северо-западного угла', y: '', rotation: '', flip: '' },
     result: '{origin, size, total, will_place, already, already_planned, replace, blocked, blocked_items, replace_items, cost, have, missing, charted}',
     example: { blueprint: 'furnace-pair', x: 20, y: -4, rotation: 90 },
+  },
+
+  // ── Наблюдение: то, что игрок видит на экране, на карте и в окнах игры ──
+  inspect: {
+    kind: 'query',
+    summary: 'Окно объекта: рецепт, состояние, содержимое по слотам, топливо, направление, жидкости, провода. Одна цель или список targets (до 200). ' +
+      'Объекта нет — обычный ответ {found: false}. Вне обзора — только вид и место по памяти карты (memory: true).',
+    params: { target: '{x, y, name?}', targets: 'или список целей' },
+    result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo}, fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
+    example: { target: { x: 10, y: 5 } },
+  },
+  area: {
+    kind: 'query',
+    summary: 'Карта прямоугольника символами: клетка — символ, расшифровка в legend. По запросу — список объектов. До 4096 клеток за вызов (например 64×64); большее запрашивай частями.',
+    params: {
+      area: '{x1, y1, x2, y2}', radius: 'или квадрат вокруг x, y (без них — вокруг персонажа)', x: '', y: '',
+      objects: 'true — приложить список объектов (name, x, y, unit, direction)', details: 'true — объекты с полным описанием, как inspect',
+      nature: 'true — включить в список деревья и камни', limit: 'сколько объектов отдать (по умолчанию 300)', offset: 'с какого',
+    },
+    result: "{x1, y1, x2, y2, width, height, rows: [строка на ряд клеток], legend: {символ: имя}, resources: {имя: {tiles, amount}}, fog_rows? ('v' видно, 'm' по памяти карты, '?' не открыто), objects?, more?}",
+    example: { radius: 12, objects: true },
+  },
+  find: {
+    kind: 'query',
+    summary: 'Поиск на карте по имени или типу в радиусе (до 300) вокруг точки или персонажа: ближайшие объекты и сводка по именам. Скрытое туманом не находится.',
+    params: { name: 'имя объекта (iron-ore, stone-furnace, …)', names: 'или список имён', type: 'или тип (tree, resource, furnace, …)', ghost: 'true — искать призраки с таким именем',
+      x: '', y: '', radius: 'по умолчанию 60', limit: 'по умолчанию 30' },
+    result: '{total, by_name: {имя: {count, nearest, x, y, amount?}}, objects: [{name, type, x, y, unit, distance, amount?, memory?}], more?}',
+    example: { name: 'iron-ore', radius: 150 },
+  },
+  production: {
+    kind: 'query',
+    summary: 'Окно производства: сколько каждого предмета и жидкости произведено и потреблено в минуту за интервал, и всего.',
+    params: { window: '5s | 1m | 10m (по умолчанию) | 1h | 10h | 50h', items: 'список имён — только они', limit: 'по умолчанию 40' },
+    result: '{window, items: [{name, produced_per_min, consumed_per_min, produced_total, consumed_total}], fluids: [...]}',
+    example: { window: '10m', items: ['iron-plate', 'copper-plate'] },
+  },
+  power: {
+    kind: 'query',
+    summary: 'Окно электросети столба (по умолчанию ближайшего в 80 клетках): выработка и потребление по видам машин, аккумуляторы, машины без питания.',
+    params: { target: 'столб: {x, y}', radius: 'в каком радиусе от столба искать машины без питания (по умолчанию 48)' },
+    result: '{pole, network, production_kw, production: [{name, kw}], consumption_kw, consumption, accumulators: {charge, capacity_mj}, machines: {ok, low_power, no_power}, satisfied, problems: [{name, x, y, status}]}',
+    example: {},
+  },
+  alerts: {
+    kind: 'query',
+    summary: 'Что на базе встало: машины с проблемным состоянием в радиусе (нет топлива, нет энергии, нет патронов, кончился ресурс), и тревоги игрока, если в команде есть люди. ' +
+      'all: true — вместе с «мягкими» состояниями (нет сырья, выход забит, нет рецепта).',
+    params: { x: '', y: '', radius: 'по умолчанию 150', all: 'true — и мягкие состояния', limit: 'по умолчанию 100' },
+    result: '{by_status: {состояние: количество}, problems: [{status, name, x, y, unit}], player_alerts: [{alert, name, x, y}]}',
+    example: { radius: 200 },
+  },
+  pollution: {
+    kind: 'query',
+    summary: 'Слой загрязнения на карте: значения по чанкам вокруг точки или персонажа.',
+    params: { x: '', y: '', radius: 'по умолчанию 160' },
+    result: '{here, max, max_at, total, chunk_x1, chunk_y1, rows: [[…]]} — rows[j][i] — чанк (chunk_x1 + i, chunk_y1 + j), -1 — не открыт',
+    example: {},
+  },
+  enemies: {
+    kind: 'query',
+    summary: 'Слой врагов на карте: гнёзда и черви на открытой карте, отряды — только в видимой зоне; эволюция.',
+    params: { x: '', y: '', radius: 'по умолчанию 150 (до 500)' },
+    result: '{evolution, nests: [{name, x, y, distance, memory?}], worms, units: {имя: количество}, units_total, nearest_unit}',
+    example: { radius: 300 },
+  },
+  logistics: {
+    kind: 'query',
+    summary: 'Окно логистической сети в точке или у персонажа: роботы, запасы, число запросчиков и поставщиков.',
+    params: { x: '', y: '' },
+    result: '{in_network, roboports, logistic_robots: {total, available}, construction_robots, items: {предмет: количество}, requesters, providers, storages} или {in_network: false, networks}',
+    example: {},
+  },
+  trains: { kind: 'query', summary: 'Обзор поездов и станций команды.', params: {}, result: '{trains: [{id, state, speed, x, y, at_station, going_to, schedule, cargo}], stations: [{station, x, y, trains_count, trains_limit}]}', example: {} },
+  recipes: {
+    kind: 'query',
+    summary: 'Справочник рецептов: по имени рецепта или предмета, который он даёт (name), либо все рецепты с ингредиентом (uses).',
+    params: { name: 'рецепт или предмет', uses: 'или предмет-ингредиент' },
+    result: '{recipes: [{recipe, ingredients, products, seconds, unlocked, by_hand, categories, unlocked_by?}]}',
+    example: { name: 'electronic-circuit' },
+  },
+  prototypes: {
+    kind: 'query',
+    summary: 'Справочник: предмет, постройка, жидкость или плитка по внутреннему имени — размер, рамка столкновений, скорости, энергия, слоты.',
+    params: { name: 'внутреннее имя' },
+    result: '{item: {stack_size, places, fuel_mj}, entity: {type, width, height, collision_box, crafting_speed, energy_usage_kw, …}}',
+    example: { name: 'assembling-machine-2' },
+  },
+  research_info: {
+    kind: 'query',
+    summary: 'Окно исследований: текущее (с прогрессом), очередь, доступные сейчас технологии со стоимостью; с name — одна технология и что она открывает. ' +
+      'Менять очередь — действие research.',
+    params: { name: 'имя технологии', limit: 'сколько доступных показать (по умолчанию 30)' },
+    result: '{current: {name, progress, units, ingredients}, queue: [...], available: [{name, units, seconds_per_unit, ingredients}], technology?}',
+    example: {},
+  },
+  chat: {
+    kind: 'query',
+    summary: 'Игровой чат: последние сообщения людей и ботов. Новые сообщения приходят и событием chat.',
+    params: { since: 'номер последнего виденного сообщения', limit: 'по умолчанию 50' },
+    result: '{messages: [{seq, from, text, bot?, tick}], seq}', example: {},
   },
 
   // ── Управление очередью ──
@@ -337,6 +438,15 @@ export const EVENT_TYPES = {
   player_joined: 'человек зашёл в игру: {name}',
   player_left: 'человек вышел: {name}',
   agent_created: 'появился новый бот: {name}',
+  entities_built: 'кто-то другой (человек, бот, роботы) построил: {by, count, names: {имя: количество}, area}; сводка раз в секунду',
+  entities_removed: 'кто-то другой снял постройки: {by, count, names, area}',
+  enemies_near: 'враги в 32 клетках от твоего персонажа: {count, nearest: {name, x, y, distance}}; не чаще раза в 10 секунд',
+  attack_group: 'отряд врагов собрался в атаку: {size, position}',
+  enemy_base_built: 'враги построили новую базу на открытой карте: {name, position}',
+  turret_no_ammo: 'турель без патронов: {name, unit, position}; по одной турели не чаще раза в минуту',
+  alert: 'у машин кончилось топливо или пропала энергия: {status: no_fuel | no_power, count, examples: [{name, unit, x, y}]}',
+  inventory_full: 'добыча остановлена: инвентарь персонажа полон',
+  research_queue: 'бот изменил очередь исследований: {by, queue}',
 };
 
 export const ERROR_CODES = {
@@ -384,7 +494,8 @@ export function helpDocument(info) {
         'Несколько действий подряд — одним запросом act.',
       idempotency: 'К пишущему запросу можно приложить свой "id" (строка). Повтор с тем же id вернёт сохранённый ответ и ничего не выполнит второй раз ' +
         '(для повтора после потерянного ответа). Запросы с разными id или без id исполняются каждый.',
-      targets: 'Объект мира задаётся как {unit: номер} (поле unit из ответов) или {x, y, name?} — объект в этой точке.',
+      targets: 'Объект мира (цель) задаётся координатами: {x, y} — объект в этой точке (любая точка внутри постройки), {x, y, name} — именно такой объект ' +
+        '(например руда под буром). Номер unit из ответов можно приложить для сверки: {x, y, unit} найдёт объект, только если это он же.',
       coordinates: 'x растёт на восток, y — на юг. Клетка (tile) с углом (10, 5) имеет центр (10.5, 5.5). 60 тиков — секунда игры.',
       events: 'О происходящем узнавай из events (долгий опрос из параллельного скрипта), а не опросом мира.',
       pause: 'Игра стоит на паузе, когда в ней нет людей и у всех ботов пустые очереди; поставленное действие само снимает паузу, чтение — нет.',

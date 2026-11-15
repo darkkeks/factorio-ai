@@ -176,12 +176,60 @@ const special = {
     if (body.since == null || waitS === 0) await game.pull();
     if (body.since == null && waitS === 0) return { events: [], seq: game.seq ?? 0, first: game.first };
     const since = body.since == null ? (game.seq ?? 0) : Number(body.since);
-    const match = (ev) => (me ? mine(me)(ev) : true) && (!types || types.has(ev.type)) && !(ev.type === 'chat' && ev.from === me);
+    // Своё не приходит: собственные реплики в чате и сводки о собственной стройке и сносе («кем-то другим»).
+    const match = (ev) => (me ? mine(me)(ev) : true) && (!types || types.has(ev.type)) && !(ev.type === 'chat' && ev.from === me) && !(ev.by === me && ev.agent == null);
     const got = await game.wait({ since, match, done: (l) => l.length > 0, timeoutMs: waitS * 1000 });
     const events = got.slice(0, limit);
     // seq — номер, с которого спрашивать дальше: если отдали не всё, это номер последнего отданного события.
     const seq = events.length < got.length ? events[events.length - 1].seq : Math.max(game.seq ?? 0, since);
     return { events, seq, first: game.first, more: events.length < got.length || undefined, missed: since < game.first - 1 ? true : undefined };
+  },
+
+  // Карта области: одна команда в игре считает не больше 32×32 клеток (чтобы не задерживать тик),
+  // большую область сервер запрашивает частями и склеивает.
+  async area(who, body) {
+    const p = stripControl(body);
+    let x1, y1, x2, y2;
+    if (p.area) {
+      const a = p.area;
+      const v = [a.x1 ?? a[0], a.y1 ?? a[1], a.x2 ?? a[2], a.y2 ?? a[3]].map(Number);
+      if (v.some((n) => !Number.isFinite(n))) throw new GameError('bad_request', 'area: {x1, y1, x2, y2} — числа');
+      [x1, y1, x2, y2] = [Math.floor(Math.min(v[0], v[2])), Math.floor(Math.min(v[1], v[3])), Math.ceil(Math.max(v[0], v[2])), Math.ceil(Math.max(v[1], v[3]))];
+    } else if (p.radius != null) {
+      let c = { x: p.x, y: p.y };
+      if (typeof c.x !== 'number' || typeof c.y !== 'number') c = (await game.call({ agent: who.agent, op: 'status' })).position;
+      [x1, y1, x2, y2] = [Math.floor(c.x - p.radius), Math.floor(c.y - p.radius), Math.ceil(c.x + p.radius), Math.ceil(c.y + p.radius)];
+    } else throw new GameError('bad_request', 'нужна area {x1, y1, x2, y2} или radius (вокруг x, y или вокруг персонажа)');
+    const w = x2 - x1, h = y2 - y1;
+    if (w < 1 || h < 1) throw new GameError('bad_request', 'пустая область');
+    if (w * h > 16384) throw new GameError('bad_request', 'область больше 16384 клеток (например 128×128): запрашивай частями');
+    const one = (a, extra = {}) => game.call({ agent: who.agent, op: 'area', params: { ...p, x: undefined, y: undefined, radius: undefined, area: a, ...extra } });
+    if (w * h <= 1024) return one({ x1, y1, x2, y2 });
+    const limit = Math.min(p.limit ?? 300, 2000), offset = p.offset ?? 0;
+    const SYMBOLS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*+=<>^!/|{}[]();:';
+    const symbolOf = new Map(), legend = {};
+    const sym = (label) => { let s = symbolOf.get(label); if (!s) { s = SYMBOLS[symbolOf.size] ?? '?'; symbolOf.set(label, s); legend[s] = label; } return s; };
+    const rows = Array.from({ length: h }, () => new Array(w).fill(' '));
+    const fog = Array.from({ length: h }, () => new Array(w).fill('v'));
+    let anyFog = false, total = 0;
+    const objects = [], resources = {};
+    for (let ty = y1; ty < y2; ty += 32) for (let tx = x1; tx < x2; tx += 32) {
+      const a = { x1: tx, y1: ty, x2: Math.min(tx + 32, x2), y2: Math.min(ty + 32, y2) };
+      const r = await one(a, { limit: 2000, offset: 0 });
+      const map = {};
+      for (const [s, label] of Object.entries(r.legend)) map[s] = sym(label);
+      r.rows.forEach((row, j) => { for (let i = 0; i < row.length; i++) { const ch = row[i]; rows[a.y1 - y1 + j][a.x1 - x1 + i] = map[ch] ?? ch; } });
+      if (r.fog_rows) { anyFog = true; r.fog_rows.forEach((row, j) => { for (let i = 0; i < row.length; i++) fog[a.y1 - y1 + j][a.x1 - x1 + i] = row[i]; }); }
+      total += r.objects_total;
+      for (const o of r.objects || []) objects.push(o);
+      for (const [name, t] of Object.entries(r.resources || {})) { const g = (resources[name] ??= { tiles: 0, amount: 0 }); g.tiles += t.tiles; g.amount += t.amount; }
+    }
+    const out = { x1, y1, x2, y2, width: w, height: h, rows: rows.map((r) => r.join('')), legend,
+      note: "rows[j][i] — клетка с углом (x1 + i, y1 + j), считая с нуля; '.' — свободно, '~' — вода или обрыв, ' ' — не открыто, '@' — ты",
+      objects_total: total, resources: Object.keys(resources).length ? resources : undefined };
+    if (anyFog) out.fog_rows = fog.map((r) => r.join(''));
+    if (p.objects) { out.objects = objects.slice(offset, offset + limit); out.more = objects.length > offset + limit || undefined; }
+    return out;
   },
 
   async metrics(who) {

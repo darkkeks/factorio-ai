@@ -11,12 +11,13 @@ local SKIP = {character = true, corpse = true, ['item-entity'] = true, fish = tr
 --- Найти объект по ссылке; nil, если его нет.
 function T.find(surface, ref)
   if type(ref) ~= 'table' then U.fail('bad_request', 'цель: ожидается {unit} или {x, y, name?}') end
-  if ref.unit then
+  if ref.unit and ref.x == nil then
+    -- Движок находит по номеру не все виды построек: надёжная ссылка — координаты (номер можно приложить для сверки).
     local e = game.get_entity_by_unit_number(ref.unit)
     if e and e.valid and e.surface == surface then return e end
     return nil
   end
-  if type(ref.x) ~= 'number' or type(ref.y) ~= 'number' then U.fail('bad_request', 'цель: нужны unit или x и y') end
+  if type(ref.x) ~= 'number' or type(ref.y) ~= 'number' then U.fail('bad_request', 'цель: нужны x и y (и, по желанию, name или unit)') end
   local list = surface.find_entities_filtered{position = {ref.x, ref.y}, name = ref.name}
   if #list == 0 then
     -- Точка может попасть в зазор между рамками; пробуем клетку целиком.
@@ -24,6 +25,11 @@ function T.find(surface, ref)
     list = surface.find_entities_filtered{area = {{fx + 0.05, fy + 0.05}, {fx + 0.95, fy + 0.95}}, name = ref.name}
   end
   local best, rank = nil, 0
+  if ref.unit then
+    -- Номер приложен к координатам: это должен быть тот самый объект.
+    for _, e in pairs(list) do if e.unit_number == ref.unit then return e end end
+    return nil
+  end
   for _, e in pairs(list) do
     local r
     if SKIP[e.type] then r = 0

@@ -6,6 +6,8 @@ local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
 local Plans = require('agent.plans')
 local B = require('agent.actions.build')
+local E = require('agent.events')
+local J = require('agent.journal')
 
 local IDLE_LIMIT = 90   -- тиков без добычи, после которых разбираемся, почему движок её остановил
 local STALL_LIMIT = 300 -- тиков без единого добытого предмета (ни один ресурс руками не добывается так долго)
@@ -40,6 +42,7 @@ local function begin(A, it)
   if not ent.minable then U.fail('not_allowed', ent.name .. ' нельзя добыть или снять') end
   it.name = ent.name
   it.resource = ent.type == 'resource'
+  if ent.force == e.force and ent.unit_number then E.tally('entities_removed', A.name, ent) end
   it.products = {}
   for _, pr in pairs(ent.prototype.mineable_properties.products or {}) do
     if pr.type == 'item' then it.products[pr.name] = true end
@@ -82,6 +85,7 @@ local function step(A, it)
         U.fail('out_of_reach', 'до ресурса не дотянуться: дальность добычи ' .. U.r2(e.resource_reach_distance), {distance = U.r2(d), gained = gained})
       end
       if e.get_main_inventory().count_empty_stacks() == 0 then
+        J.add('inventory_full', A.name, {})
         U.fail('no_space', 'инвентарь полон', {gained = gained})
       end
       U.fail('not_allowed', 'игра не даёт это добыть руками (нужна жидкость, инструмент или объект не добывается)', {gained = gained})
