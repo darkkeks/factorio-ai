@@ -14,6 +14,13 @@ RCON_JSON=${RCON_JSON:-$D/../../rcon.json}
 
 echo "останавливаю сервер игры ($SERVICE)…"
 docker exec "$CONTAINER" supervisorctl stop "$SERVICE"
+# При остановке сервер сохраняет карту в тот же файл; если файл не обновился — последнее состояние не в нём.
+AGE=$(( $(date +%s) - $(stat -c %Y "$GAME/$SAVE") ))
+if [ "$AGE" -gt 120 ]; then
+  echo "сохранение $SAVE не обновилось при остановке (ему $AGE с): ничего не меняю, запускаю сервер как был"
+  docker exec "$CONTAINER" supervisorctl start "$SERVICE"
+  exit 1
+fi
 mkdir -p "$GAME/backups"
 BACKUP="$GAME/backups/${SAVE%.zip}.$(date +%Y%m%d-%H%M%S).zip"
 cp -p "$GAME/$SAVE" "$BACKUP"
