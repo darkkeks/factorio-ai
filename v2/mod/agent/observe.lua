@@ -8,6 +8,7 @@ local Fog = require('agent.fog')
 local Plans = require('agent.plans')
 local B = require('agent.actions.build')
 local Inv = require('agent.inv')
+local Rails = require('agent.rails')
 
 local Obs = {}
 
@@ -171,6 +172,9 @@ local function full(e, force)
     r.trains_limit = e.trains_limit
     r.trains_count = e.trains_count
   end
+  -- Рельс: оба конца и что к ним пристыковано (видно на земле).
+  local rail_ends = try(function() return Rails.describe(e) end)
+  if rail_ends then r.rail_ends = rail_ends end
   if e.type == 'accumulator' then r.charge = U.r2(e.energy / math.max(e.electric_buffer_size, 1)) end
   if e.prototype.electric_energy_source_prototype then
     r.electric_network = try(function() return e.electric_network_id end)

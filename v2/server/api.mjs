@@ -178,7 +178,8 @@ export const API = {
         'с востока на запад, с путём на юг. Остальные три дуги — поворот набора на 90° по часовой вокруг (x, y), сколько нужно раз: смещение (dx, dy) → (−dy, dx), ' +
         'direction — следующее через одно по кругу north, northeast, east, southeast, south, southwest, west, northwest (north → east, northeast → southeast, west → north). ' +
         'Диагональ (поворот на 45°): между двумя curved-rail-b вставь n диагональных straight-rail direction northeast в (x+5+2i, y−11−2i), i = 0…n−1, ' +
-        'а всё, что после них, сдвинь на (+2n, −2n). Перед постановкой проверь blueprint_check, после постройки — trains и inspect',
+        'а всё, что после них, сдвинь на (+2n, −2n). Проще — rail_path: он сам считает части пути по шагам straight / left / right. ' +
+        'Перед постановкой проверь blueprint_check, после постройки — inspect рельса (rail_ends: стыки) и trains',
       tiles: 'список плитки {name: stone-path | concrete | landfill | …, x, y}',
       blueprint: 'или имя сохранённого чертежа', string: 'или строка чертежа в формате игры',
       x: 'клетка северо-западного угла чертежа', y: '',
@@ -264,6 +265,27 @@ export const API = {
     result: '{origin, size, total, will_place, already, already_planned, replace, blocked, blocked_items, replace_items, cost, have, missing, charted}',
     example: { blueprint: 'furnace-pair', x: 20, y: -4, rotation: 90 },
   },
+  rail_path: {
+    kind: 'query',
+    summary: 'Рельсовый планировщик: координаты частей пути (прямые, кривые, диагонали) по твоим шагам — готовый список items для ghost_place. ' +
+      'Ничего не ставит, местность не смотрит и маршрут не выбирает: считает только геометрию, как планировщик рельсов игры. ' +
+      'from — рельс, от которого продолжаешь (построенный или задуманный: name, x, y, direction как в inspect), heading — в какую сторону от него идти ' +
+      '(один из двух концов рельса; у прямого north–south это north или south). Шаги: straight — часть прямо, left / right — часть с поворотом на 22,5° ' +
+      'против / по часовой стрелке. Поворот на 90° — четыре одинаковых шага подряд (конец пути уходит на 13 клеток вперёд и 13 вбок); ' +
+      "на 45° — два, дальше straight идёт по диагонали; ['left', 'right'] — сдвиг пути вбок на 2 клетки с прежним направлением. " +
+      'Прямой шаг по горизонтали и вертикали — 2 клетки, по диагонали — 2 по x и 2 по y. ' +
+      'end — конец получившегося пути: точка стыка и направление движения в ней; следующий запрос продолжай от последней части items с heading = end.direction. ' +
+      'Чтобы прийти в уже стоящий рельс, передай его в to: joins — состыкуется ли путь, to_ends — какие end для этого годятся ' +
+      '(подбери шаги так, чтобы end совпал с одним из них). Сам from в items не входит.',
+    params: {
+      from: '{name?: straight-rail | curved-rail-a | curved-rail-b | half-diagonal-rail (по умолчанию straight-rail), x, y, direction}',
+      heading: 'north | northnortheast | northeast | … — направление движения с конца рельса from; при ошибке в data.headings — допустимые',
+      moves: "список шагов 'straight' | 'left' | 'right', с повтором: 'straight*10' (до 600 частей за запрос)",
+      to: 'необязательно: рельс {name?, x, y, direction}, в который путь должен прийти',
+    },
+    result: '{items: [{name, x, y, direction}], count, end: {x, y, direction}, joins?, to_ends?: [{x, y, direction}]}',
+    example: { from: { x: -125, y: 151, direction: 'north' }, heading: 'north', moves: ['straight*3', 'right*4', 'straight*5'] },
+  },
 
   // ── Наблюдение: то, что игрок видит на экране, на карте и в окнах игры ──
   inspect: {
@@ -271,7 +293,9 @@ export const API = {
     summary: 'Окно объекта: рецепт, состояние, содержимое по слотам, топливо, направление, жидкости, провода. Одна цель или список targets (до 200). ' +
       'Объекта нет — обычный ответ {found: false}. Вне обзора — только вид и место по памяти карты (memory: true). ' +
       'fluids — ёмкости жидкости по порядку окна: [{name, amount, capacity, temperature, segment?}]; пустая ёмкость видна, только если жидкость задана рецептом ' +
-      'или фильтром (amount: 0); у труб segment {name, amount, capacity} — вся связанная труба целиком.',
+      'или фильтром (amount: 0); у труб segment {name, amount, capacity} — вся связанная труба целиком. ' +
+      'У рельса rail_ends — оба конца: [{x, y, heading, open, connected: [{name, x, y, direction, turn: left | straight | right}]}]; ' +
+      'open: true — к концу ничего не пристыковано (разрыв или тупик). Призраки рельсов стыков не показывают — проверяй после постройки.',
     params: { target: '{x, y, name?}', targets: 'или список целей' },
     result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo}, fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
     example: { target: { x: 10, y: 5 } },

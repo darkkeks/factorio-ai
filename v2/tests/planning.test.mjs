@@ -338,4 +338,48 @@ test('рельсы: поворот на 90° из help встаёт призра
   }
 });
 
+test('rail_path: части пути по шагам встают призраками, после постройки путь непрерывен; to и rail_ends в inspect (fb-072)', async () => {
+  await reset({}, 2.5, 2.5);
+  const from = { name: 'straight-rail', ...P(11, 27), direction: 'north' };
+  const moves = ['straight', 'right*4', 'straight*2', 'right', 'right', 'straight*2', 'left*2', 'straight'];
+  const r = await call(A, 'rail_path', { from, heading: 'north', moves });
+  ok(r.ok && r.count === 14 && r.items.length === 14 && r.end.direction === 'east', JSON.stringify(r));
+  eq([r.end.x, r.end.y], [O.x + 52, O.y + 23], 'конец пути: 13 вперёд и 13 вбок на поворот 90°');
+  const to = { name: 'straight-rail', x: r.end.x + 1, y: r.end.y, direction: 'east' };
+  const j = await call(A, 'rail_path', { from, heading: 'north', moves, to });
+  ok(j.ok && j.joins === true && j.to_ends.some((e) => e.x === r.end.x && e.y === r.end.y && e.direction === 'east'), JSON.stringify(j.to_ends));
+  const miss = await call(A, 'rail_path', { from, heading: 'north', moves, to: { ...to, x: to.x + 2 } });
+  ok(miss.ok && miss.joins === false, 'рельс to дальше конца пути — стыка нет');
+  let bad = await call(A, 'rail_path', { from, heading: 'east', moves });
+  ok(!bad.ok && bad.error.code === 'bad_request' && /north/.test(bad.error.message), JSON.stringify(bad));
+  bad = await call(A, 'rail_path', { from: { ...from, x: from.x + 1 }, heading: 'north', moves });
+  ok(!bad.ok && bad.error.code === 'bad_position', JSON.stringify(bad));
+  bad = await call(A, 'rail_path', { from, heading: 'north', moves: ['straight*601'] });
+  ok(!bad.ok && bad.error.code === 'bad_request', JSON.stringify(bad));
+
+  const items = [from, ...r.items, to];
+  const g = await call(A, 'ghost_place', { plan: 'rp', items });
+  ok(g.ok && g.placed === items.length && g.blocked === 0, JSON.stringify(g));
+  const w = await world(`local s = game.surfaces.nauvis
+    local area = {{A.ox - 2, A.oy - 2}, {A.ox + 62, A.oy + 32}}
+    local at = {}
+    for _, g in pairs(s.find_entities_filtered{area = area, type = 'entity-ghost'}) do at[#at + 1] = g.ghost_name .. ' ' .. g.position.x .. ' ' .. g.position.y g.revive() end
+    table.sort(at)
+    local first = s.find_entities_filtered{area = area, name = 'straight-rail', position = {A.x, A.y}, radius = 0.5}[1]
+    local best = 0
+    for _, d in pairs{defines.rail_direction.front, defines.rail_direction.back} do
+      local re, n = first.get_rail_end(d), 0
+      while n < 50 and re.move_natural() do n = n + 1 end
+      best = math.max(best, n)
+    end
+    return {at = at, chain = best}`, { x: from.x, y: from.y });
+  eq(w.at, items.map((e) => `${e.name} ${e.x} ${e.y}`).sort(), 'призраки стоят там, где посчитал rail_path');
+  eq(w.chain, items.length - 1, 'путь от from до to непрерывен');
+  const ins = await call(A, 'inspect', { target: { x: from.x, y: from.y, name: 'straight-rail' } });
+  ok(ins.found && ins.rail_ends.length === 2, JSON.stringify(ins));
+  const north = ins.rail_ends.find((e) => e.heading === 'north'), south = ins.rail_ends.find((e) => e.heading === 'south');
+  ok(north && !north.open && north.connected.length === 1 && north.connected[0].turn === 'straight' && north.connected[0].y === from.y - 2, JSON.stringify(north));
+  ok(south && south.open === true && south.connected.length === 0 && south.y === from.y + 1, JSON.stringify(south));
+});
+
 run(async () => { admin.close(); });
