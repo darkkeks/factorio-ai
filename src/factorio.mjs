@@ -72,6 +72,53 @@ local function belt_items(t)
 end
 `;
 
+// Поставить одну постройку из инвентаря персонажа e; a — {item, x, y, direction, underground}. Общая часть place и place_many.
+const PLACE_FN = `
+local function place_one(e, a)
+  local ip = prototypes.item[a.item]
+  if not ip then fail('нет предмета '..a.item) end
+  if e.get_item_count(a.item) < 1 then fail('в инвентаре нет '..a.item) end
+  local pr = ip.place_result
+  if not pr then fail(a.item..' нельзя поставить на землю') end
+  reach(e, a, 10)
+  local dir = defines.direction[a.direction]
+  local s = e.surface
+  if not s.can_place_entity{name=pr.name, position={a.x, a.y}, direction=dir, force=e.force, build_check_type=defines.build_check_type.manual} then
+    fail('сюда поставить нельзя (занято, не та поверхность или нет руды под буром)')
+  end
+  local kind
+  -- Ближайший такой же подземный конвейер, смотрящий туда же: sign=-1 — позади по ходу, sign=1 — впереди.
+  local function ug_near(p, sign)
+    local v = dir == defines.direction.north and {0,-1} or dir == defines.direction.east and {1,0} or dir == defines.direction.south and {0,1} or {-1,0}
+    for k = 1, pr.max_underground_distance do
+      local o = s.find_entities_filtered{name=pr.name, position={p.x+v[1]*k*sign, p.y+v[2]*k*sign}}[1]
+      if o and o.direction == dir then return o end
+    end
+  end
+  if pr.type == 'underground-belt' then
+    -- Как в игре: подземный конвейер ставится входом, а если позади него по ходу в пределах дальности
+    -- стоит такой же вход, смотрящий туда же, — выходом. Явный a.underground важнее.
+    kind = a.underground
+    if not kind then
+      local o = ug_near(a, -1)
+      kind = (o and o.belt_to_ground_type == 'input') and 'output' or 'input'
+    end
+  end
+  local n = s.create_entity{name=pr.name, position={a.x, a.y}, direction=dir, force=e.force, raise_built=true, type=kind}
+  if not n then fail('сюда поставить нельзя') end
+  e.remove_item{name=a.item, count=1}
+  local r = {placed=n.name, pos=P(n.position), direction=a.direction, left=e.get_item_count(a.item)}
+  if n.type == 'underground-belt' then
+    r.underground = n.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
+    local o = ug_near(n.position, n.belt_to_ground_type == 'input' and 1 or -1)
+    if o and o.belt_to_ground_type ~= n.belt_to_ground_type then r.paired_with = P(o.position)
+    else r.paired_with = n.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход' or 'пары нет: позади по ходу в пределах дальности нужен вход' end
+  end
+  if n.type == 'inserter' then r.takes_from, r.puts_to = arm(n) end
+  return r
+end
+`;
+
 const BODY = {
   ensure: `local e = bot() return {pos=P(e.position)}`,
 
@@ -352,48 +399,31 @@ const BODY = {
     if n < A.count then r.ingredients_for_asked = list end
     return r`,
 
-  place: `
+  place: PLACE_FN + `
+    return place_one(bot(), A)`,
+
+  // Группа разных построек. За один вызов ставится только то, до чего персонаж дотягивается, и не больше, чем успел бы
+  // игрок, быстро кликающий мышью: одна постройка на 12 тиков (пять в секунду) с прошлой постройки этой группы,
+  // не больше пяти за вызов; после паузы дольше секунды — одна. Счёт идёт по тикам игры, а не по часам клиента.
+  place_many: PLACE_FN + `
     local e = bot()
-    local ip = prototypes.item[A.item]
-    if not ip then fail('нет предмета '..A.item) end
-    if e.get_item_count(A.item) < 1 then fail('в инвентаре нет '..A.item) end
-    local pr = ip.place_result
-    if not pr then fail(A.item..' нельзя поставить на землю') end
-    reach(e, A, 10)
-    local dir = defines.direction[A.direction]
-    local s = e.surface
-    if not s.can_place_entity{name=pr.name, position={A.x, A.y}, direction=dir, force=e.force, build_check_type=defines.build_check_type.manual} then
-      fail('сюда поставить нельзя (занято, не та поверхность или нет руды под буром)')
-    end
-    local kind
-    -- Ближайший такой же подземный конвейер, смотрящий туда же: sign=-1 — позади по ходу, sign=1 — впереди.
-    local function ug_near(p, sign)
-      local v = dir == defines.direction.north and {0,-1} or dir == defines.direction.east and {1,0} or dir == defines.direction.south and {0,1} or {-1,0}
-      for k = 1, pr.max_underground_distance do
-        local o = s.find_entities_filtered{name=pr.name, position={p.x+v[1]*k*sign, p.y+v[2]*k*sign}}[1]
-        if o and o.direction == dir then return o end
+    storage.vb_pm = storage.vb_pm or {}
+    local last = storage.vb_pm[A.bot]
+    local budget = 1
+    if last and game.tick - last <= 60 then budget = math.min(5, math.floor((game.tick - last)/12)) end
+    local out, waiting, far, used = {}, 0, 0, 0
+    for _, it in ipairs(A.items) do
+      local d = dist(e.position, it)
+      if d > 10 then far = far + 1
+      elseif used >= budget then waiting = waiting + 1
+      else
+        local ok, r = pcall(place_one, e, it)
+        if ok then used = used + 1 out[#out+1] = {i=it.i, ok=true, r=r}
+        else out[#out+1] = {i=it.i, ok=false, why=tostring(r), near=d < 2.5} end
       end
     end
-    if pr.type == 'underground-belt' then
-      -- Как в игре: подземный конвейер ставится входом, а если позади него по ходу в пределах дальности
-      -- стоит такой же вход, смотрящий туда же, — выходом. Явный A.underground важнее.
-      kind = A.underground
-      if not kind then
-        local o = ug_near(A, -1)
-        kind = (o and o.belt_to_ground_type == 'input') and 'output' or 'input'
-      end
-    end
-    local n = s.create_entity{name=pr.name, position={A.x, A.y}, direction=dir, force=e.force, raise_built=true, type=kind}
-    e.remove_item{name=A.item, count=1}
-    local r = {placed=n.name, pos=P(n.position), direction=A.direction, left=e.get_item_count(A.item)}
-    if n.type == 'underground-belt' then
-      r.underground = n.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
-      local o = ug_near(n.position, n.belt_to_ground_type == 'input' and 1 or -1)
-      if o and o.belt_to_ground_type ~= n.belt_to_ground_type then r.paired_with = P(o.position)
-      else r.paired_with = n.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход' or 'пары нет: позади по ходу в пределах дальности нужен вход' end
-    end
-    if n.type == 'inserter' then r.takes_from, r.puts_to = arm(n) end
-    return r`,
+    if used > 0 then storage.vb_pm[A.bot] = game.tick end
+    return {results=out, waiting=waiting, far=far}`,
 
   targets: `
     local e = bot()
@@ -1203,6 +1233,41 @@ export function createFactorioServer(botName, hooks) {
           await sleep(150);
         }
         return { placed, asked: n, direction, turn_at, then_direction: turn_at ? points[n - 1].direction : undefined, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
+      }),
+
+    def('place_many', 'Поставить группу разных построек из инвентаря одним вызовом: items — список {item, x, y, direction} (до 50), например сборщики, манипуляторы, ленты и столбы одного блока. Персонаж подходит к первой непоставленной постройке и ставит подряд всё, до чего дотягивается с этого места, в порядке списка, с частотой быстро кликающего игрока (около пяти в секунду); за дальними подходит. Порядок важен там, где он важен в игре (вход подземного конвейера раньше выхода). Что не встало — в skipped с причиной, остальное ставится дальше. Если действие прервалось, повтори вызов с тем, что в not_done.',
+      { items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
+          direction: z.enum(DIRECTIONS).default('north').describe('как в place: конвейер везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
+          underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place') })).min(1).max(50) },
+      async (a) => {
+        let pending = a.items.map((it, k) => ({ ...it, i: k + 1 }));
+        const built = [], skipped = [], left = {};
+        let stopped, walkedFor = null;
+        const deadline = Date.now() + 200_000;
+        while (pending.length) {
+          const r = await run('place_many', { items: pending });
+          const results = Array.isArray(r.results) ? r.results : [];
+          const gone = new Set();
+          for (const x of results) {
+            const it = pending.find((p) => p.i === x.i);
+            gone.add(x.i);
+            if (x.ok) { const { left: l, ...rest } = x.r; built.push({ n: x.i, ...rest }); left[it.item] = l; }
+            else skipped.push({ n: x.i, item: it.item, x: it.x, y: it.y, why: x.why + (x.near && /сюда поставить нельзя/.test(x.why) ? ' — возможно, мешает сам персонаж: он стоит рядом с этой клеткой' : '') });
+          }
+          pending = pending.filter((p) => !gone.has(p.i));
+          if (!pending.length) break;
+          stopped = await interrupted();
+          if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов';
+          if (stopped) break;
+          if (results.length || r.waiting > 0) { await sleep(100); continue; }
+          // Всё оставшееся далеко: идём к первой непоставленной. Не дошли — пропускаем её.
+          const t = pending[0];
+          if (walkedFor === t.i) { skipped.push({ n: t.i, item: t.item, x: t.x, y: t.y, why: 'не смог подойти на расстояние постройки' }); pending.shift(); continue; }
+          walkedFor = t.i;
+          await approach(t.x, t.y, 8);
+        }
+        return { placed: built.length, asked: a.items.length, built, left, skipped, skipped_count: skipped.length,
+          not_done: pending.length ? pending.map(({ i, ...it }) => it) : undefined, stopped: stopped || undefined };
       }),
 
     def('insert_all', 'Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
