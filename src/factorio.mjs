@@ -12,6 +12,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PRELUDE = `
 storage.vb = storage.vb or {}
 storage.vb_kit = storage.vb_kit or {}
+-- Предохранитель ходьбы (fb-047): шаг (follow) действует до своего срока. Команды всех ботов идут через одну очередь RCON,
+-- и если следующая команда идущего персонажа застряла в ней, он не уходит вслепую: его останавливает любая чужая команда.
+for n, t in pairs(storage.vb_until or {}) do if game.tick > t then local w = storage.vb[n] if w and w.valid then w.walking_state = {walking=false, direction=w.walking_state.direction} w.character_running_speed_modifier = 0 end storage.vb_until[n] = nil end end
 local function fail(m) error(m, 0) end
 local function bot()
   local e = storage.vb[A.bot]
@@ -187,6 +190,7 @@ const BODY = {
     local N = #pts
     if N < 2 or dist(p, pts[N]) <= 0.2 then
       e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0
+      if storage.vb_until then storage.vb_until[A.bot] = nil end
       return {done=true, x=p.x, y=p.y}
     end
     e.character_running_speed_modifier = 0
@@ -269,9 +273,12 @@ const BODY = {
     end
     e.character_running_speed_modifier = math.max(on_belt and -0.6 or -0.95, math.min(0, bf - 1))
     e.walking_state = {walking=true, direction=bdir*2}
+    -- Срок шага: следующая команда ждётся через A.n тиков; не пришла за вдвое большее время — персонажа остановят (см. PRELUDE).
+    storage.vb_until = storage.vb_until or {}
+    storage.vb_until[A.bot] = game.tick + A.n*2 + 15
     return {i=math.max(A.i, bseg+1), d=cur, off=off, tick=game.tick, x=p.x, y=p.y, en=en}`,
 
-  stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {x=e.position.x, y=e.position.y}`,
+  stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 if storage.vb_until then storage.vb_until[A.bot] = nil end return {x=e.position.x, y=e.position.y}`,
 
   // Поиск пути: A* по клеткам от персонажа (проверяется только «можно ли здесь стоять» — постройки, деревья, вода,
   // скалы), идёт он потом сам, пешком. Эвристика с весом: путь чуть длиннее кратчайшего, зато хватает на дальние переходы.
@@ -2092,6 +2099,7 @@ const coords = { x: z.number().describe('координата x'), y: z.number()
 // позже, а персонаж между командами идёт вслепую. Здесь нет общей части (PRELUDE), комментариев и отступов, а путь
 // лежит на сервере (его кладёт path) — так команда приходит заметно чаще.
 const FOLLOW = (`
+  for n, t in pairs(storage.vb_until or {}) do if game.tick > t then local w = storage.vb and storage.vb[n] if w and w.valid then w.walking_state = {walking=false, direction=w.walking_state.direction} w.character_running_speed_modifier = 0 end storage.vb_until[n] = nil end end
   local function dist(a, b) return ((a.x-b.x)^2+(a.y-b.y)^2)^0.5 end
   local function bot() local e = storage.vb and storage.vb[A.bot] if e and e.valid and storage.vb_path and storage.vb_path[A.bot] then return e end error('нет пути', 0) end
 ` + BODY.follow).split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
@@ -2192,6 +2200,7 @@ export function createFactorioServer(botName, hooks) {
       // Пройденный путь — по настоящим позициям персонажа от команды к команде.
       if (odo && s.x !== undefined) { if (odo.x !== undefined) odo.moved += Math.hypot(s.x - odo.x, s.y - odo.y); odo.x = s.x; odo.y = s.y; }
       if (s.done) return { done: true, left: 0 };
+      if (odo?.out && s.x !== undefined && odo.out(s.x, s.y)) return { strayed: true, left: best };
       if (my !== walkSeq) return { superseded: true };
       if (hooks.aborted()) return { interrupted: true };
       if (watch) {
@@ -2245,7 +2254,13 @@ export function createFactorioServer(botName, hooks) {
       for (let plans = 0; ; plans++) {
         if (plans >= maxPlans) { out = { fail: 'не дошёл: слишком много обходов' }; break; }
         if (!me) me = await run('pos');
-        if (straight0 === null) { straight0 = Math.hypot(me.x - x, me.y - y); odo.x = me.x; odo.y = me.y; }
+        if (straight0 === null) {
+          straight0 = Math.hypot(me.x - x, me.y - y); odo.x = me.x; odo.y = me.y;
+          // Поводок (fb-047): любой допустимый маршрут (не длиннее четырёх прямых или 60 клеток) лежит внутри эллипса
+          // «от старта до персонажа плюс от персонажа до цели»; оказался снаружи — персонажа снесло, дальше не идём.
+          const sx0 = me.x, sy0 = me.y, lim = Math.max(60, straight0 * 4) + 10;
+          if (!longWay) odo.out = (px, py) => Math.hypot(px - sx0, py - sy0) + Math.hypot(px - x, py - y) > lim;
+        }
         if (useFar && !dense && Math.hypot(me.x - x, me.y - y) > 10) {
           if (plans > 0) { const h = await run('stop'); me = { x: h.x, y: h.y }; }
           const c = await run('far', { x, y, tol, avoid, margin: longWay ? 150 : 60, budget: longWay ? 25000 : 10000 });
@@ -2334,6 +2349,9 @@ export function createFactorioServer(botName, hooks) {
         walked = odo.moved;
         if (s.handoff) { me = { x: s.x, y: s.y }; continue; }
         if (s.superseded) { out = { interrupted: 'прервано другим действием с ходьбой' }; break; }
+        if (s.strayed) { out = { fail: 'персонажа снесло далеко в сторону от маршрута (сервер отвечал с задержкой) — остановился. pos — где он стоит на самом деле; повтори move_to оттуда' }; break; }
+        // Новый путь ищется стоя: пока длинная команда поиска идёт до сервера, персонаж шёл бы вслепую в прежнюю сторону (fb-047).
+        if (s.lost) { const h = await run('stop'); me = { x: h.x, y: h.y }; }
         if (s.interrupted) { out = { interrupted: 'прервано новой репликой' }; break; }
         if (s.enemies) {
           await run('stop').catch(() => null);
@@ -2345,7 +2363,7 @@ export function createFactorioServer(botName, hooks) {
         if (s.done && p.found && final) { out = { note: near }; break; }
         if (s.stuck) {
           // Дважды упёрся на одном месте — путь есть только на бумаге (или игра стоит на паузе).
-          me = await run('pos');
+          me = await run('stop');
           if (stuckAt && Math.hypot(me.x - stuckAt.x, me.y - stuckAt.y) < 0.5) { out = { fail: 'упёрся в препятствие и не могу его обойти. Посмотри area_map и иди через промежуточные точки', soft: true }; break; }
           stuckAt = me;
           bestEnd = Infinity;
@@ -2358,6 +2376,8 @@ export function createFactorioServer(botName, hooks) {
       }
     }
     if (!out.pos) { const at = await run('pos'); out.pos = { x: r1(at.x), y: r1(at.y) }; }
+    // Пройденное — до настоящей точки остановки, а не до последней команды шага.
+    if (odo.x !== undefined) walked = odo.moved + Math.hypot(out.pos.x - odo.x, out.pos.y - odo.y);
     const res = { pos: out.pos };
     if (out.note) res.note = out.note;
     if (out.interrupted) res.interrupted = out.interrupted;
