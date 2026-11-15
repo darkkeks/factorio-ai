@@ -63,6 +63,13 @@ Glob, Grep. Она нужна, чтобы автоматизировать св�
 - Границы: не трогай сервер игры и его файлы (~/factorio, ~/services, ~/logs), папки других помощников, ~/.claude.
   В игру — только через инструменты factorio и fx: никакого RCON, консоли и прямых правок сохранений, это читерство.
 
+Сброс сессии. Контекст разговора растёт, и со временем ты начинаешь отвечать медленно. Если хозяин просит сбросить
+сессию (или начать заново, очистить контекст): 1) останови саб-агента, если он работает; 2) запиши в $FX_HOME/notes.md
+всё, что понадобится тебе после сброса: устройство базы и координаты, текущий план и на чём остановился, договорённости
+с хозяином и другими помощниками, свои скрипты и как ими пользоваться; 3) ответь хозяину одной строкой; 4) создай пустой
+файл $FX_HOME/RESET — через пару секунд сессия начнётся заново. Сам, без просьбы хозяина, сессию не сбрасывай.
+В начале новой сессии первым делом прочитай $FX_HOME/notes.md.
+
 Как действовать:
 - Приняв реплику на свой счёт, первым делом напиши одну короткую строку: что понял и что сейчас сделаешь. Хозяин видит
   твой текст в чате, и молчание для него выглядит так, будто ты не услышал.
@@ -98,7 +105,7 @@ export function tokenFor(bot) {
   return token;
 }
 
-const slug = (name) => name.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'bot';
+export const slug = (name) => name.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'bot';
 
 // Сессии живут долго и привыкают работать по-старому, поэтому о смене правил возобновлённой сессии сообщаем отдельно.
 const RULES_VERSION = 3;
@@ -118,6 +125,13 @@ function saveSession(key, sessionId) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
 }
 
+/** Забыть сессию человека: следующий Agent с этим ключом начнёт с чистого контекста. */
+export function forgetSession(key) {
+  const s = loadState();
+  delete s[key];
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
+}
+
 /** События: 'text' (законченный текстовый блок), 'turn-end', 'error'. */
 export class Agent extends EventEmitter {
   /**
@@ -130,6 +144,7 @@ export class Agent extends EventEmitter {
     Object.assign(this, { key, human, bot, token: tokenFor(bot), busy: false, stopped: false });
     const state = loadState();
     this.#run(state[key]);
+    if (!state[key]) this.send('[система]: началась новая сессия. Прочитай свои заметки в $FX_HOME/notes.md (если файл есть) и посмотри status, отвечать на это сообщение не нужно — ответь точкой.');
     if (state[key] && state[`${key}:rules`] !== RULES_VERSION) this.send(RULES_NOTICE);
   }
 

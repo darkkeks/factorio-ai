@@ -6,7 +6,9 @@ import { joinVoiceChannel, entersState, getVoiceConnection, VoiceConnectionStatu
 import OpusScript from 'opusscript';
 import * as cfg from './config.mjs';
 import { transcribe, fromDiscordPcm, Utterances } from './speech.mjs';
-import { Agent } from './agent.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import { Agent, forgetSession, slug } from './agent.mjs';
 import fs from 'node:fs';
 import { createFactorioServer, readChat } from './factorio.mjs';
 
@@ -34,6 +36,29 @@ setInterval(() => {
 const agents = new Map(); // userId -> Agent; не удаляются при выходе человека из канала
 const people = new Map(); // userId -> { name, bot, agent, utt, decoder, stream, lastPacket, silenceFed, gone }
 
+function startAgent(id, name, bot) {
+  const agent = new Agent(id, name, bot);
+  agent.on('text', (text) => log(`🤖 ${bot}: ${text}`));
+  agent.on('error', (e) => log(`⚠️ ${bot}: ${e.message}`));
+  agents.set(id, agent);
+  return agent;
+}
+
+// Сброс сессии по просьбе хозяина: бот сохраняет заметки и создаёт файл RESET в своей папке (см. промпт),
+// мы закрываем сессию и начинаем новую с чистого контекста.
+setInterval(() => {
+  for (const [id, agent] of agents) {
+    const flag = path.join(os.homedir(), 'robot/bots', slug(agent.bot), 'RESET');
+    if (!fs.existsSync(flag)) continue;
+    fs.rmSync(flag, { force: true });
+    agent.close();
+    forgetSession(id);
+    const fresh = startAgent(id, agent.human, agent.bot);
+    if (people.has(id)) people.get(id).agent = fresh;
+    log(`♻️ ${agent.bot}: сессия сброшена по просьбе хозяина, начата новая`);
+  }
+}, 2000);
+
 function join(connection, member) {
   if (people.has(member.id) || member.user.bot) return;
   if (cfg.ALLOWED_USERS.length && !cfg.ALLOWED_USERS.includes(member.id)) return;
@@ -45,13 +70,7 @@ function join(connection, member) {
   // Здесь экземпляр инструментов нужен только чтобы создать персонажа; сессия ходит за ними в отдельный процесс MCP.
   const fx = createFactorioServer(p.bot, { log: () => {}, aborted: () => false });
   // Сессия живёт дольше присутствия человека в канале: вышел — бот продолжает начатое, вернулся — та же сессия.
-  p.agent = agents.get(member.id);
-  if (!p.agent) {
-    p.agent = new Agent(member.id, name, p.bot);
-    p.agent.on('text', (text) => log(`🤖 ${p.bot}: ${text}`));
-    p.agent.on('error', (e) => log(`⚠️ ${p.bot}: ${e.message}`));
-    agents.set(member.id, p.agent);
-  }
+  p.agent = agents.get(member.id) ?? startAgent(member.id, name, p.bot);
   fx.ensure().then(
     (r) => log(`➕ ${name} в канале: персонаж «${p.bot}» на сервере в точке ${r.pos.x}, ${r.pos.y}`),
     (e) => log(`⚠️ ${p.bot}: сервер Factorio недоступен: ${e.message}`),
