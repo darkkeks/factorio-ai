@@ -147,41 +147,101 @@ const BODY = {
     if not p or not p.connected then fail('игрок '..A.player..' не в игре') end
     return {x=p.position.x, y=p.position.y}`,
 
-  // Идти по ломаной A.points (первая точка — начало пути), A.i — номер точки, к которой сейчас идём. Точка считается
-  // пройденной, если персонаж рядом с ней или уже проскочил её по ходу отрезка: между опросами он успевает пройти
-  // полклетки и больше. Курс держится на точку отрезка чуть впереди персонажа, чтобы его не сносило с линии.
+  // Идти по ломаной A.points (первая точка — начало пути), A.i — номер точки, к которой сейчас идём. Следующая команда
+  // придёт только через A.n тиков (задержка RCON), и всё это время персонаж идёт сам в одну из восьми сторон. Поэтому
+  // каждый раз перебираются варианты «куда и сколько пройти до следующей команды» и берётся тот, после которого до
+  // конца пути остаётся меньше всего: на полной скорости, если отрезок свободен, — срезая угол или поворачивая раньше;
+  // шаг сбавляется, только когда иначе персонаж проскочит поворот или цель (быстрее игрока — никогда).
   follow: `
     local e = bot()
+    local s = e.surface
     local p = e.position
-    local i = A.i
-    local a, w, vx, vy, len
-    while true do
-      a, w = A.points[i-1], A.points[i]
-      if not w then e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {done=true, x=p.x, y=p.y} end
-      vx, vy = w.x-a.x, w.y-a.y
-      len = (vx*vx+vy*vy)^0.5
-      local d = dist(p, w)
-      if d <= 0.2 or len < 0.01 or (d <= 0.8 and (p.x-w.x)*vx + (p.y-w.y)*vy >= 0) then i = i + 1 else break end
+    local pts = storage.vb_path[A.bot]
+    local N = #pts
+    if N < 2 or dist(p, pts[N]) <= 0.2 then
+      e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0
+      return {done=true, x=p.x, y=p.y}
     end
-    -- Куда идём этим шагом: к очередной точке, а если снесло с линии — наискосок обратно на линию.
-    local ux, uy = vx/len, vy/len
-    local t = (p.x-a.x)*ux + (p.y-a.y)*uy
-    local off = math.abs((p.x-a.x)*uy - (p.y-a.y)*ux)
-    local tx, ty = w.x, w.y
-    if off > 0.12 and t < len then local q = math.min(len, math.max(t, 0) + off) tx, ty = a.x+ux*q, a.y+uy*q end
-    local idx = math.floor(math.atan2(tx-p.x, -(ty-p.y))/(math.pi/4)+0.5) % 8
-    local ang = idx*math.pi/4
-    local go = (tx-p.x)*math.sin(ang) - (ty-p.y)*math.cos(ang)
-    -- Следующая команда придёт только через A.n тиков, и всё это время персонаж идёт сам. Чтобы он не проскочил
-    -- точку, перед ней он сбавляет шаг (только медленнее обычного, быстрее игрока — никогда).
     e.character_running_speed_modifier = 0
     local full = e.character_running_speed
     if not (full > 0) then full = 0.15 end
+    local L = A.n*full
+    local rem = {[N]=0}
+    for j = N-1, 1, -1 do rem[j] = rem[j+1] + dist(pts[j], pts[j+1]) end
+    -- Можно ли стоять в точке (то, что видит игрок: постройки, деревья, вода, скалы). Сам персонаж себе не мешает.
+    local fc = {}
+    local function free(x, y)
+      if math.abs(x-p.x) < 0.41 and math.abs(y-p.y) < 0.41 then return true end
+      local k = (math.floor(x*8+0.5)+4000000)*8000000 + math.floor(y*8+0.5)+4000000
+      local v = fc[k]
+      if v == nil then v = s.can_place_entity{name='character', position={x, y}} fc[k] = v end
+      return v
+    end
+    local function clear(ax, ay, bx, by)
+      local k = math.ceil(((bx-ax)^2+(by-ay)^2)^0.5/0.25)
+      for t = 1, k do if not free(ax+(bx-ax)*t/k, ay+(by-ay)*t/k) then return false end end
+      return true
+    end
+    local function oct(dx, dy) dx, dy = math.abs(dx), math.abs(dy) return math.max(dx, dy) + 0.4142*math.min(dx, dy) end
+    -- Сколько осталось идти из точки q: вернуться на путь (на один из ближайших отрезков, не дальше 3 клеток) и пройти остаток.
+    local i0 = math.max(1, A.i-1)
+    local function score(qx, qy, check)
+      local bs, bj, bo
+      for j = i0, math.min(N-1, i0+6) do
+        local a, w = pts[j], pts[j+1]
+        local vx, vy = w.x-a.x, w.y-a.y
+        local len = (vx*vx+vy*vy)^0.5
+        if len > 0.01 then
+          local t = math.max(0, math.min(len, ((qx-a.x)*vx+(qy-a.y)*vy)/len))
+          local perp = dist({x=qx, y=qy}, {x=a.x+vx*t/len, y=a.y+vy*t/len})
+          -- Вернуться на путь можно под прямым углом или наискосок вперёд.
+          for _, tt in pairs{t, math.min(len, t+perp)} do
+            local cx, cy = a.x+vx*tt/len, a.y+vy*tt/len
+            local o = oct(qx-cx, qy-cy)
+            if o <= 3 then
+              local sc = o*1.1 + (len-tt) + rem[j+1]
+              if (not bs or sc < bs) and (o < 0.3 or not check or clear(qx, qy, cx, cy)) then bs, bj, bo = sc, j, o end
+            end
+          end
+        end
+      end
+      return bs, bj, bo
+    end
+    local cur, curj, off = score(p.x, p.y, false)
+    if not cur then return {i=A.i, d=rem[1], off=99, tick=game.tick} end
     -- На конвейере шаг сбавляем меньше: слишком медленного персонажа лента унесёт.
-    local on_belt = e.surface.count_entities_filtered{area={{p.x-0.2, p.y-0.2}, {p.x+0.2, p.y+0.2}}, type={'transport-belt', 'underground-belt', 'splitter'}} > 0
-    e.character_running_speed_modifier = math.max(on_belt and -0.6 or -0.95, math.min(0, go/(A.n*full) - 1))
-    e.walking_state = {walking=true, direction=idx*2}
-    return {i=i, d=dist(p, w), off=off, tick=game.tick}`,
+    local on_belt = s.count_entities_filtered{area={{p.x-0.2, p.y-0.2}, {p.x+0.2, p.y+0.2}}, type={'transport-belt', 'underground-belt', 'splitter'}} > 0
+    local minf = on_belt and 0.4 or 0.05
+    local best, bdir, bf, bseg = cur - 0.02, nil, nil, nil
+    for d = 0, 7 do
+      local ux, uy = math.sin(d*math.pi/4), -math.cos(d*math.pi/4)
+      local far = 0
+      for t = 1, math.ceil((L*1.1+0.1)/0.25) do if free(p.x+ux*t*0.25, p.y+uy*t*0.25) then far = t*0.25 else break end end
+      -- Доли полного шага; плюс такие, чтобы встать ровно напротив ближайших поворотов и конца пути.
+      local fr = {1, 0.8, 0.6, 0.45, 0.3, 0.2, 0.1, 0.05}
+      for _, w in pairs{pts[curj+1], pts[curj+2] or pts[N], pts[N]} do
+        local g = (w.x-p.x)*ux + (w.y-p.y)*uy
+        if g > 0 and g < L then fr[#fr+1] = g/L end
+      end
+      for _, f in pairs(fr) do
+        local len = f*L
+        if f >= minf and len*1.1 <= far + 0.1 then
+          local sc, j = score(p.x+ux*len, p.y+uy*len, true)
+          if sc and sc < best - 0.001 then best, bdir, bf, bseg = sc, d, f, j end
+        end
+      end
+    end
+    if not bdir then
+      -- Свободного хода не нашлось (тесно): идём прямо к очередной точке пути; упрёмся — путь поищут заново.
+      local w = pts[curj+1]
+      if dist(p, w) < 0.2 and pts[curj+2] then curj = curj + 1 w = pts[curj+1] end
+      bdir = math.floor(math.atan2(w.x-p.x, -(w.y-p.y))/(math.pi/4)+0.5) % 8
+      local g = (w.x-p.x)*math.sin(bdir*math.pi/4) - (w.y-p.y)*math.cos(bdir*math.pi/4)
+      bf, bseg = math.max(minf, math.min(1, g/L)), curj
+    end
+    e.character_running_speed_modifier = math.max(on_belt and -0.6 or -0.95, math.min(0, bf - 1))
+    e.walking_state = {walking=true, direction=bdir*2}
+    return {i=math.max(A.i, bseg+1), d=cur, off=off, tick=game.tick}`,
 
   stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {x=e.position.x, y=e.position.y}`,
 
@@ -258,6 +318,17 @@ const BODY = {
       return top
     end
     local g, from, closed, pc, belts = {[key(sx, sy)]=0}, {}, {}, {}, next(belt) ~= nil
+    local function penalty(x, y)
+      local k = key(x, y)
+      local pen = pc[k]
+      if pen == nil then
+        pen = 0
+        if not (free(x+1, y) and free(x-1, y) and free(x, y+1) and free(x, y-1)) then pen = 0.75 end
+        if belts and on_belt(x, y) then pen = pen + 1.5 end
+        pc[k] = pen
+      end
+      return pen
+    end
     push(1.3*h(sx, sy), sx, sy)
     local goal, best, bh, expanded = nil, nil, h(sx, sy), 0
     while n > 0 and expanded < 3000 do
@@ -274,13 +345,7 @@ const BODY = {
           local nk = key(nx, ny)
           if (dx ~= 0 or dy ~= 0) and not closed[nk] and free(nx, ny) and (dx == 0 or dy == 0 or (free(nx, y) and free(x, ny))) then
             -- Вплотную к препятствию и по конвейеру идти дороже: где есть место, путь держится от них в стороне.
-            local pen = pc[nk]
-            if pen == nil then
-              pen = 0
-              if not (free(nx+1, ny) and free(nx-1, ny) and free(nx, ny+1) and free(nx, ny-1)) then pen = 0.75 end
-              if belts and on_belt(nx, ny) then pen = pen + 1.5 end
-              pc[nk] = pen
-            end
+            local pen = penalty(nx, ny)
             local ng = g[k] + ((dx ~= 0 and dy ~= 0) and 0.705 or 0.5) + pen
             if not g[nk] or ng < g[nk] then g[nk] = ng from[nk] = {x, y} push(ng + 1.3*h(nx, ny), nx, ny) end
           end
@@ -290,14 +355,58 @@ const BODY = {
     local rev = {}
     local c = goal or best
     while c and not (c[1] == sx and c[2] == sy) do rev[#rev+1] = c c = from[key(c[1], c[2])] end
-    local pts = {{x=sx/2, y=sy/2}}
-    for i = #rev, 1, -1 do pts[#pts+1] = {x=rev[i][1]/2, y=rev[i][2]/2} end
+    local C = {{sx, sy}}
+    for i = #rev, 1, -1 do C[#C+1] = rev[i] end
+    -- Сглаживание: A* по сетке даёт лесенку. Где свободно (не вплотную к препятствиям и не по конвейеру), кусок пути
+    -- заменяется двумя прямыми отрезками — наискосок и по прямой: персонаж ходит в восемь сторон, как игрок на WASD.
+    local budget = 60000
+    local function good(x, y) budget = budget - 1 return free(x, y) and penalty(x, y) == 0 end
+    local function legs(a, b, diag_first)
+      local dx, dy = b[1]-a[1], b[2]-a[2]
+      local ux, uy = dx > 0 and 1 or dx < 0 and -1 or 0, dy > 0 and 1 or dy < 0 and -1 or 0
+      local m = math.min(math.abs(dx), math.abs(dy))
+      local st = math.max(math.abs(dx), math.abs(dy)) - m
+      local wx, wy = math.abs(dx) > math.abs(dy) and ux or 0, math.abs(dy) > math.abs(dx) and uy or 0
+      local x, y, mid = a[1], a[2], nil
+      for part = 1, 2 do
+        local diag = (part == 1) == diag_first
+        for _ = 1, diag and m or st do
+          local nx, ny = x + (diag and ux or wx), y + (diag and uy or wy)
+          if not good(nx, ny) or (diag and not (free(nx, y) and free(x, ny))) then return false end
+          x, y = nx, ny
+        end
+        if part == 1 then mid = {x, y} end
+      end
+      return mid
+    end
+    local S, k = {C[1]}, 1
+    while k < #C do
+      local j, mid = k + 1, nil
+      if budget > 0 then
+        for t = math.min(#C, k + 80), k + 2, -1 do
+          mid = legs(C[k], C[t], true) or legs(C[k], C[t], false)
+          if mid then j = t break end
+          if budget <= 0 then break end
+        end
+      end
+      if mid then S[#S+1] = mid end
+      S[#S+1] = C[j]
+      k = j
+    end
+    local pts = {}
+    for _, c in ipairs(S) do
+      local q = pts[#pts]
+      if not q or q.x ~= c[1]/2 or q.y ~= c[2]/2 then pts[#pts+1] = {x=c[1]/2, y=c[2]/2} end
+    end
     local out = {pts[1]}
     for i = 2, #pts do
       local a, b, c = pts[i-1], pts[i], pts[i+1]
-      if not c or b.x-a.x ~= c.x-b.x or b.y-a.y ~= c.y-b.y then out[#out+1] = b end
+      if not c or math.abs((b.x-a.x)*(c.y-b.y) - (b.y-a.y)*(c.x-b.x)) > 0.001 or (b.x-a.x)*(c.x-b.x) + (b.y-a.y)*(c.y-b.y) <= 0 then out[#out+1] = b end
     end
-    return {found=goal ~= nil, near=near, unreachable=goal == nil and n == 0, cells=#pts-1, points=out}`,
+    -- Путь запоминается на сервере: команда шага (follow) должна быть короткой, см. FOLLOW.
+    storage.vb_path = storage.vb_path or {}
+    storage.vb_path[A.bot] = out
+    return {found=goal ~= nil, near=near, unreachable=goal == nil and n == 0, cells=#C-1, points=out}`,
 
   look: `
     local e = bot()
@@ -1102,8 +1211,16 @@ const coords = { x: z.number().describe('координата x'), y: z.number()
  *              вызывается при каждом обращении к инструменту; chatTool добавляет инструмент read_chat
  *              (сессиям голосового бота чат доставляется сам, внешним клиентам его нужно читать)
  */
+// Команда шага ходьбы. Сервер принимает команду RCON кусками примерно раз в 0,2 с, поэтому длинная команда доходит
+// позже, а персонаж между командами идёт вслепую. Здесь нет общей части (PRELUDE), комментариев и отступов, а путь
+// лежит на сервере (его кладёт path) — так команда приходит заметно чаще.
+const FOLLOW = (`
+  local function dist(a, b) return ((a.x-b.x)^2+(a.y-b.y)^2)^0.5 end
+  local function bot() local e = storage.vb and storage.vb[A.bot] if e and e.valid and storage.vb_path and storage.vb_path[A.bot] then return e end error('нет пути', 0) end
+` + BODY.follow).split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
+
 export function createFactorioServer(botName, hooks) {
-  const run = (body, args = {}) => lua(PRELUDE + BODY[body], { bot: botName, ...args });
+  const run = (body, args = {}) => lua(body === 'follow' ? FOLLOW : PRELUDE + BODY[body], { bot: botName, ...args });
 
   // Чат для внешних клиентов (hooks.chatTool): новые сообщения сами прикладываются к ответу любого инструмента
   // в поле chat, а долгие действия сворачиваются, как только в чате появилось что-то новое.
@@ -1144,7 +1261,7 @@ export function createFactorioServer(botName, hooks) {
 
   let walkSeq = 0; // новый поход отменяет прежний: двое не могут вести одного персонажа
 
-  /** Идти по ломаной points (BODY.follow). Итог: done | stuck (перестал продвигаться) | lost (снесло с пути) | timeout | interrupted | superseded. */
+  /** Идти по пути, который только что нашёл и запомнил на сервере path (FOLLOW). Итог: done | stuck (перестал продвигаться) | lost (снесло с пути) | timeout | interrupted | superseded. */
   async function follow(points, my, deadline) {
     let i = 2;
     let best = Infinity;
@@ -1153,7 +1270,7 @@ export function createFactorioServer(botName, hooks) {
     // Берём худший из двух последних промежутков; первая команда — с запасом.
     let n = 30, lastTick = null, lastGap = 0, sent = Date.now(), gapMs = 0;
     for (;;) {
-      const s = await run('follow', { points, i, n });
+      const s = await run('follow', { i, n });
       gapMs = Date.now() - sent;
       if (s.done) return { done: true };
       if (my !== walkSeq) return { superseded: true };
@@ -1161,9 +1278,9 @@ export function createFactorioServer(botName, hooks) {
       if (lastTick !== null) { const gap = s.tick - lastTick; n = Math.max(gap, lastGap) + 1; lastGap = gap; }
       lastTick = s.tick;
       // Снесло далеко от пути (например, задержка скакнула) — путь надо искать заново.
-      if (s.off > 1.5) return { lost: true };
-      // Застрял — значит, перестал приближаться к очередной точке (а не просто стоит: по ленте может и возить туда-сюда).
-      if (s.i > i) { i = s.i; best = Infinity; }
+      if (s.off > 3) return { lost: true };
+      // Застрял — значит, остаток пути перестал уменьшаться (а не просто стоит: по ленте может и возить туда-сюда).
+      if (s.i > i) i = s.i;
       if (s.d < best - 0.05) { best = s.d; lastProgress = Date.now(); }
       if (Date.now() - lastProgress > Math.max(1500, gapMs * 4)) return { stuck: true };
       if (Date.now() >= deadline) return { timeout: true };
