@@ -59,6 +59,34 @@
   #live header { display: flex; align-items: center; gap: 8px; padding: 0 2px 5px; }
   #live header span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #live-btn { position: absolute; z-index: 1001; left: 10px; top: 84px; }
+  /* Сессии Claude бота: слева дерево (сессия и её субагенты), справа лог выбранного узла. */
+  #sess { position: absolute; z-index: 1100; inset: 10px; background: #181818; display: flex; flex-direction: column; overflow: hidden; }
+  #sess.hidden { display: none; }
+  #sess > header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #3a3a3a; }
+  #sess > header b { color: #ffcc33; font-size: 16px; white-space: nowrap; }
+  #sess > header select { flex: 1; min-width: 0; background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 6px; font: inherit; }
+  #sess-main { flex: 1; min-height: 0; display: flex; }
+  #sess-tree { width: 300px; flex: none; overflow-y: auto; border-right: 1px solid #3a3a3a; padding: 6px; box-sizing: border-box; }
+  #sess-log { flex: 1; min-width: 0; overflow-y: auto; padding: 8px 14px; }
+  .node { padding: 4px 6px; border-radius: 4px; cursor: pointer; overflow-wrap: anywhere; }
+  .node:hover { background: #2c2c2c; }
+  .node.sel { background: #3d3418; }
+  .node small { display: block; color: #9a968c; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; margin-right: 6px; }
+  .dot.run { background: #5fae4e; box-shadow: 0 0 5px #5fae4e; }
+  .ev { margin: 6px 0; overflow-wrap: anywhere; }
+  .ev time { color: #9a968c; font-size: 11px; margin-right: 6px; }
+  .ev.text { white-space: pre-wrap; }
+  .ev.note, .ev.task, .ev.human { color: #9a968c; white-space: pre-wrap; border-left: 2px solid #555; padding-left: 8px; }
+  .ev.task { color: #c9c5b8; border-left-color: #c79400; }
+  .ev.tool summary { cursor: pointer; font-family: ui-monospace, monospace; font-size: 12px; color: #b9c7d6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev.tool summary b { color: #e8e6e1; }
+  .ev.tool.err summary b { color: #ff8a65; }
+  .ev.tool.wait summary b { color: #5fae4e; }
+  .ev.tool pre { margin: 4px 0 4px 14px; padding: 6px 8px; background: #111; border-radius: 4px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; }
+  .ev.tool .sub { margin-left: 14px; }
+  #sess-older { display: block; margin: 0 auto 8px; }
+  @media (max-width: 700px) { #sess { inset: 0; } #sess-main { flex-direction: column; } #sess-tree { width: auto; max-height: 30%; border-right: 0; border-bottom: 1px solid #3a3a3a; } }
   #bot header { display: flex; align-items: center; gap: 8px; }
   #bot header b { flex: 1; color: #ffcc33; font-size: 16px; }
   button { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
@@ -92,8 +120,12 @@
   <header><span id="live-cap" class="muted">подключение…</span><select id="live-target" title="За кем следит камера"></select><button id="live-size" title="Во всё окно">⤢</button><button id="live-full" title="На весь экран">⛶</button><button id="live-close">✕</button></header>
   <video id="live-video" muted autoplay playsinline></video>
 </div>
+<div id="sess" class="box hidden">
+  <header><b id="sess-bot"></b><select id="sess-list" title="Сессия"></select><button id="sess-close">✕</button></header>
+  <div id="sess-main"><div id="sess-tree"></div><div id="sess-log"></div></div>
+</div>
 <div id="bot" class="box hidden">
-  <header><b id="bot-name"></b><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
+  <header><b id="bot-name"></b><button id="bot-sess">сессии</button><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
   <div id="bot-body"></div>
 </div>
 
@@ -366,6 +398,112 @@ async function loadBot() {
     body.scrollTop = keep;
   } catch { /* следующая попытка через 2 секунды */ }
 }
+
+// ---------- сессии Claude бота ----------
+// Дерево: главная сессия и субагенты (кто кого запустил). Лог: текст виден сразу, шаги-инструменты свёрнуты.
+const SS = { bot: null, id: null, agent: '', end: 0, start: 0, tools: new Map(), nodes: [], timer: null, gen: 0 };
+const tm = (ts) => (ts ? new Date(ts).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
+const dt = (ts) => new Date(ts).toLocaleString('ru', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+const api = async (p) => { const r = await fetch(p); if (!r.ok) throw new Error(r.status); return r.json(); };
+const sq = () => `bot=${encodeURIComponent(SS.bot)}&id=${SS.id}`;
+
+async function openSessions(bot) {
+  SS.bot = bot; SS.id = null;
+  $('sess').classList.remove('hidden');
+  $('sess-bot').textContent = bot;
+  $('sess-tree').innerHTML = ''; $('sess-log').innerHTML = '<div class="muted">загрузка…</div>';
+  try {
+    const list = await api('api/sessions?bot=' + encodeURIComponent(bot));
+    if (!list.length) { $('sess-list').innerHTML = ''; $('sess-log').innerHTML = '<div class="muted">у этого бота нет сессий Claude (он управляется извне или ещё не запускался)</div>'; return; }
+    $('sess-list').innerHTML = list.map((x) => `<option value="${x.id}">${x.active ? '● ' : ''}${esc(dt(x.mtime))}${x.current ? ' · текущая' : ''}${x.title ? ' · ' + esc(x.title) : ''}</option>`).join('');
+    pickSession((list.find((x) => x.current) || list[0]).id);
+  } catch { $('sess-log').innerHTML = '<div class="muted">не удалось загрузить</div>'; }
+}
+function closeSessions() { clearInterval(SS.timer); SS.gen++; $('sess').classList.add('hidden'); }
+function pickSession(id) {
+  SS.id = id; $('sess-list').value = id;
+  clearInterval(SS.timer);
+  pickNode('');
+  SS.timer = setInterval(pollSession, 2000);
+}
+async function loadTree() {
+  const gen = SS.gen;
+  const t = await api(`api/session/tree?${sq()}`);
+  if (gen !== SS.gen) return;
+  SS.nodes = t.nodes;
+  const kids = (parent, depth) => t.nodes.filter((n) => n.parent === parent).map((n) =>
+    `<div class="node${SS.agent === n.agent ? ' sel' : ''}" data-agent="${n.agent}" style="margin-left:${depth * 14}px"><span class="dot${n.running ? ' run' : ''}"></span>${esc(n.description || n.agent)}<small>${n.running ? 'работает' : n.finished ? 'завершён' : 'остановлен'} · ${esc(tm(n.mtime))}${n.model ? ' · ' + esc(n.model) : ''}</small></div>${kids(n.agent, depth + 1)}`).join('');
+  $('sess-tree').innerHTML = `<div class="node${SS.agent === '' ? ' sel' : ''}" data-agent=""><span class="dot${t.nodes.some((n) => n.running) ? ' run' : ''}"></span>главная сессия<small>субагентов: ${t.nodes.length}, работает: ${t.nodes.filter((n) => n.running).length}</small></div>${kids('', 1)}`;
+}
+function evHtml(e) {
+  const t = `<time>${tm(e.ts)}</time>`;
+  if (e.k === 'text' && e.text.trim() === '.') return ''; // точка — условный ответ бота на служебное сообщение
+  if (e.k === 'text') return `<div class="ev text">${t}${esc(e.text)}</div>`;
+  if (e.k === 'human') return `<div class="ev human">${t}🎤 реплика человека (не показывается)</div>`;
+  if (e.k === 'note') return `<div class="ev note">${t}${esc(e.text)}</div>`;
+  if (e.k === 'task') return `<div class="ev task">${t}<b>задание:</b> ${esc(e.text)}</div>`;
+  if (e.k === 'tool') {
+    const brief = e.input.replace(/\s+/g, ' ').slice(0, 160);
+    return `<details class="ev tool wait" id="tool-${e.id}"><summary>${t}<b>${esc(e.name)}</b> ${esc(brief)}</summary>${e.agent ? `<div class="sub"><button data-agent="${e.agent}">открыть субагента →</button></div>` : ''}<pre>${esc(e.input)}</pre><pre class="res muted">выполняется…</pre></details>`;
+  }
+  return '';
+}
+function applyResults(events) {
+  for (const e of events) {
+    if (e.k !== 'result') continue;
+    const el = document.getElementById('tool-' + e.id);
+    if (!el) continue;
+    el.classList.remove('wait'); el.classList.toggle('err', e.error);
+    const res = el.querySelector('.res'); res.classList.remove('muted'); res.textContent = e.text || '(пусто)';
+  }
+}
+async function pickNode(agent) {
+  SS.agent = agent; SS.end = 0; SS.start = 0;
+  const gen = ++SS.gen, box = $('sess-log');
+  box.innerHTML = '<div class="muted">загрузка…</div>';
+  loadTree().catch(() => {});
+  try {
+    const r = await api(`api/session/log?${sq()}&agent=${agent}`);
+    if (gen !== SS.gen) return;
+    SS.end = r.end; SS.start = r.start;
+    box.innerHTML = `${r.start > 0 ? '<button id="sess-older">показать более раннее</button>' : ''}<div id="sess-evs">${r.events.map(evHtml).join('')}</div>`;
+    applyResults(r.events);
+    box.scrollTop = box.scrollHeight;
+  } catch { box.innerHTML = '<div class="muted">лог недоступен</div>'; }
+}
+async function pollSession() {
+  if (!SS.id || !SS.end) return;
+  const gen = SS.gen, box = $('sess-log');
+  try {
+    const r = await api(`api/session/log?${sq()}&agent=${SS.agent}&after=${SS.end}`);
+    if (gen !== SS.gen) return;
+    SS.end = r.end;
+    if (r.events.length) {
+      const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60; // читают конец — держим конец
+      document.getElementById('sess-evs').insertAdjacentHTML('beforeend', r.events.map(evHtml).join(''));
+      applyResults(r.events);
+      if (stick) box.scrollTop = box.scrollHeight;
+    }
+    loadTree().catch(() => {});
+  } catch { /* следующая попытка через 2 секунды */ }
+}
+$('sess-log').onclick = async (e) => {
+  const sub = e.target.closest('button[data-agent]');
+  if (sub) return pickNode(sub.dataset.agent);
+  if (e.target.id !== 'sess-older') return;
+  const gen = SS.gen, box = $('sess-log'), h = box.scrollHeight;
+  const r = await api(`api/session/log?${sq()}&agent=${SS.agent}&before=${SS.start}`);
+  if (gen !== SS.gen) return;
+  SS.start = r.start;
+  document.getElementById('sess-evs').insertAdjacentHTML('afterbegin', r.events.map(evHtml).join(''));
+  applyResults(r.events);
+  if (r.start <= 0) e.target.remove();
+  box.scrollTop += box.scrollHeight - h;
+};
+$('sess-tree').onclick = (e) => { const n = e.target.closest('.node'); if (n) pickNode(n.dataset.agent); };
+$('sess-list').onchange = (e) => pickSession(e.target.value);
+$('sess-close').onclick = closeSessions;
+$('bot-sess').onclick = () => openSessions(selected);
 
 // ---------- сводка ----------
 let summary = null, events = [];

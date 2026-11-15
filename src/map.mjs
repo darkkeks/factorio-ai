@@ -36,6 +36,7 @@ const SHOTS = path.join(CAMERA_DATA, 'script-output', SHOT_DIR);
 const TILES = process.env.MAP_TILES || path.join(CAMERA_DIR, 'tiles');
 const PID_FILE = path.join(CAMERA_DIR, 'camera.pid');
 const WEB = path.join(ROOT, 'src/map-web');
+const SESSIONS = process.env.CLAUDE_SESSIONS || path.join(os.homedir(), 'robot/.claude/projects/-home-robot'); // транскрипты сессий Claude ботов
 
 const TILE = 512;              // размер тайла в пикселях
 const ZMAX = 5;                // самый подробный уровень: масштаб игры 1, 32 пикселя на клетку
@@ -571,6 +572,176 @@ function loadNames() {
 }
 const NAMES = JSON.stringify(loadNames());
 
+// ---------- сессии Claude ботов ----------
+// Транскрипты лежат в SESSIONS: <id>.jsonl — главная сессия, <id>/subagents/agent-<agentId>.jsonl (+ .meta.json) — субагенты.
+// Какая сессия чьего бота — из строк «[agent Имя] сессия <id>» в bot.log. Реплики людей не отдаём (страница публичная).
+
+const botSessions = new Map(); // бот -> Set(id сессии)
+const sessionOwner = new Map(); // id сессии -> бот (null — определить не удалось)
+let botLogPos = 0;
+function scanBotLog() {
+  try {
+    const file = path.join(ROOT, 'bot.log'), size = fs.statSync(file).size;
+    if (size < botLogPos) { botLogPos = 0; }
+    const fd = fs.openSync(file, 'r'), buf = Buffer.alloc(size - botLogPos);
+    fs.readSync(fd, buf, 0, buf.length, botLogPos);
+    fs.closeSync(fd);
+    botLogPos = size;
+    for (const m of buf.toString('utf8').matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) {
+      if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
+      botSessions.get(m[1]).add(m[2]);
+    }
+  } catch { /* лога нет — сессий нет */ }
+  // В bot.log попадают не все сессии, поэтому смотрим и в сами транскрипты: каждый бот начинает с инструмента status,
+  // а тот отвечает {"me":"<имя персонажа>", …}.
+  let files = [];
+  try { files = fs.readdirSync(SESSIONS).filter((f) => f.endsWith('.jsonl')); } catch { return; }
+  for (const f of files) {
+    const id = f.slice(0, -6);
+    if (sessionOwner.has(id)) continue;
+    try {
+      const size = fs.statSync(path.join(SESSIONS, f)).size;
+      const m = readRange(path.join(SESSIONS, f), 0, Math.min(size, 3_000_000)).toString('utf8').match(/\\"me\\":\\"([^"\\]{1,60})\\"/);
+      if (!m) { if (size > 3_000_000) sessionOwner.set(id, null); continue; } // маленький файл проверим ещё раз позже
+      sessionOwner.set(id, m[1]);
+      if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
+      botSessions.get(m[1]).add(id);
+    } catch { /* файл исчез */ }
+  }
+}
+
+let secrets = null;
+function redact(text) {
+  if (!secrets) {
+    secrets = [];
+    try { secrets.push(JSON.parse(fs.readFileSync(path.join(ROOT, 'rcon.json'), 'utf8')).password); } catch { /* нет файла */ }
+    secrets.push(gamePassword());
+    try { secrets.push(...Object.keys(JSON.parse(fs.readFileSync(path.join(ROOT, 'mcp-tokens.json'), 'utf8')))); } catch { /* нет файла */ }
+    secrets = secrets.filter((x) => x && x.length >= 6);
+  }
+  let out = text.replace(/sk-ant-[\w-]{8,}/g, '•••').replace(/(Bearer\s+)[\w.~+/-]{12,}/gi, '$1•••').replace(/("?(?:access|refresh)_?[tT]oken"?\s*[:=]\s*"?)[\w.~+/-]{12,}/g, '$1•••');
+  for (const x of secrets) out = out.split(x).join('•••');
+  return out;
+}
+const clip = (v, n) => { const t = redact(typeof v === 'string' ? v : JSON.stringify(v ?? '')); return t.length > n ? `${t.slice(0, n)}… (ещё ${t.length - n} символов)` : t; };
+
+function sessionFile(id, agent) { return agent ? path.join(SESSIONS, id, 'subagents', `agent-${agent}.jsonl`) : path.join(SESSIONS, `${id}.jsonl`); }
+function readRange(file, from, to) {
+  const fd = fs.openSync(file, 'r');
+  try { const buf = Buffer.alloc(to - from); fs.readSync(fd, buf, 0, buf.length, from); return buf; } finally { fs.closeSync(fd); }
+}
+
+// Субагенты сессии: метаданные и кто кого запустил (по id вызова инструмента Agent).
+const treeCache = new Map(); // id сессии -> { key, nodes, byTool }
+function sessionTree(id) {
+  const dir = path.join(SESSIONS, id, 'subagents');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.meta.json')); } catch { /* субагентов не было */ }
+  const metas = names.map((f) => {
+    const agent = f.slice(6, -10);
+    let meta = {}, st = null;
+    try { meta = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { /* пишется прямо сейчас */ }
+    try { st = fs.statSync(sessionFile(id, agent)); } catch { /* ещё нет */ }
+    return { agent, meta, size: st?.size ?? 0, mtime: st ? Math.floor(st.mtimeMs) : 0 };
+  });
+  const key = metas.map((m) => `${m.agent}:${m.size}:${m.meta.finished ? 1 : 0}`).join(',');
+  const cached = treeCache.get(id);
+  if (cached?.key === key) return cached;
+  const parents = cached?.parents ?? new Map(); // agent -> родитель ('' — главная сессия); раз найденный родитель не меняется
+  const deep = metas.filter((m) => (m.meta.spawnDepth ?? 1) > 1 && !parents.has(m.agent));
+  if (deep.length) {
+    for (const cand of metas) {
+      let text = '';
+      try { text = fs.readFileSync(sessionFile(id, cand.agent), 'utf8'); } catch { continue; }
+      for (const d of deep) if (d !== cand && d.meta.toolUseId && text.includes(`"id":"${d.meta.toolUseId}"`)) parents.set(d.agent, cand.agent);
+    }
+  }
+  const now = Date.now();
+  const nodes = metas.sort((a, b) => a.mtime - b.mtime).map((m) => ({
+    agent: m.agent, parent: (m.meta.spawnDepth ?? 1) > 1 ? parents.get(m.agent) ?? '' : '', description: clip(m.meta.description ?? '', 200),
+    type: m.meta.agentType ?? '', model: m.meta.model ?? '', finished: !!m.meta.finished, mtime: m.mtime,
+    // «Работает» — не отмечен завершённым и писал в лог недавно (после убитой сессии отметка не появляется никогда).
+    running: !m.meta.finished && now - m.mtime < 300_000,
+  }));
+  const byTool = new Map(metas.filter((m) => m.meta.toolUseId).map((m) => [m.meta.toolUseId, m.agent]));
+  const res = { key, nodes, byTool, parents };
+  treeCache.set(id, res);
+  return res;
+}
+
+function recordEvents(r, byTool, isAgent, out) {
+  const ts = r.timestamp ? Date.parse(r.timestamp) : null, c = r.message?.content;
+  if (r.type === 'user') {
+    if (typeof c === 'string') {
+      if (isAgent) out.push({ k: 'task', ts, text: clip(c, 6000) });                       // задание субагенту от родителя
+      else if (/^\[(система|игровой чат)\]/.test(c)) out.push({ k: 'note', ts, text: clip(c, 3000) });
+      else if (/^<[a-z-]+>/.test(c)) out.push({ k: 'note', ts, text: clip(c.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(), 1500) }); // уведомления о субагентах
+      else out.push({ k: 'human', ts });                                                    // реплика человека — без текста
+    } else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (b.type !== 'tool_result') continue;
+        const text = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((x) => (x.type === 'text' ? x.text : `[${x.type}]`)).join('\n') : '';
+        out.push({ k: 'result', id: b.tool_use_id, ts, error: !!b.is_error, text: clip(text, 6000) });
+      }
+    }
+  } else if (r.type === 'assistant' && Array.isArray(c)) {
+    for (const b of c) {
+      if (b.type === 'text' && b.text.trim()) out.push({ k: 'text', ts, text: clip(b.text, 8000) });
+      else if (b.type === 'tool_use') {
+        const ev = { k: 'tool', id: b.id, ts, name: b.name.replace(/^mcp__factorio__/, ''), input: clip(JSON.stringify(b.input ?? {}, null, 1), 4000) };
+        if (byTool.has(b.id)) ev.agent = byTool.get(b.id);
+        out.push(ev);
+      }
+    }
+  }
+}
+
+/** Кусок лога: после смещения after (новое) либо перед смещением before (старое; без параметров — хвост). */
+function sessionLog(id, agent, after, before) {
+  const file = sessionFile(id, agent), size = fs.statSync(file).size, { byTool } = sessionTree(id);
+  const parse = (buf, out) => { for (const line of buf.toString('utf8').split('\n')) { if (line.length < 2 || !/"type":"(user|assistant)"/.test(line)) continue; try { recordEvents(JSON.parse(line), byTool, !!agent, out); } catch { /* обрывок строки */ } } };
+  if (after != null && after <= size) {
+    if (size - after > 4_000_000) return sessionLog(id, agent, null, null); // слишком отстали — отдаём хвост
+    const buf = readRange(file, after, size), cut = buf.lastIndexOf(10) + 1, events = [];
+    parse(buf.subarray(0, cut), events);
+    return { events, end: after + cut };
+  }
+  let end = Math.min(before ?? size, size), events = [];
+  if (before == null && end > 0) {
+    // Хвост: последняя строка может дописываться прямо сейчас — заканчиваем на последнем переводе строки.
+    const from = Math.max(0, end - 1_000_000);
+    end = from + readRange(file, from, end).lastIndexOf(10) + 1;
+  }
+  let start = end;
+  // Читаем назад кусками, пока не наберётся достаточно событий.
+  for (let read = 0; start > 0 && events.length < 60 && read < 16_000_000;) {
+    const from = Math.max(0, start - 1_000_000), buf = readRange(file, from, start);
+    const skip = from === 0 ? 0 : buf.indexOf(10) + 1; // первая строка куска может быть обрезана
+    read += buf.length;
+    if (from > 0 && skip === 0) { start = from; continue; } // одна строка длиннее куска — идём дальше назад
+    const part = [];
+    parse(buf.subarray(skip), part);
+    events = part.concat(events);
+    start = from + skip;
+  }
+  return { events, start, end };
+}
+
+function sessionList(bot) {
+  scanBotLog();
+  let current = new Set();
+  try { current = new Set(Object.values(JSON.parse(fs.readFileSync(path.join(ROOT, 'state-factorio.json'), 'utf8')))); } catch { /* нет файла */ }
+  const out = [];
+  for (const id of botSessions.get(bot) ?? []) {
+    let st;
+    try { st = fs.statSync(sessionFile(id)); } catch { continue; }
+    let title = '';
+    try { const tail = readRange(sessionFile(id), Math.max(0, st.size - 300_000), st.size).toString('utf8'); const m = [...tail.matchAll(/"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"/g)].pop(); if (m) title = JSON.parse(`"${m[1]}"`); } catch { /* без названия */ }
+    out.push({ id, title: clip(title, 120), mtime: Math.floor(st.mtimeMs), created: Math.floor(st.birthtimeMs), current: current.has(id), active: Date.now() - st.mtimeMs < 120_000 });
+  }
+  return out.sort((a, b) => b.mtime - a.mtime);
+}
+
 // ---------- иконки предметов из файлов игры ----------
 // В прототипах игры ищем пары «name = …, icon = …»; чего там нет — по имени файла в graphics/icons.
 
@@ -620,6 +791,19 @@ const server = http.createServer(async (req, res) => {
       try { body = fs.readFileSync(tileFile(+t[1], +t[2], +t[3])); } catch { return reply(404, 'text/plain', ''); }
       // Версия в адресе (?v=), поэтому сам файл можно кешировать навсегда.
       return reply(200, 'image/jpeg', body, url.searchParams.has('v') ? 'public, max-age=31536000, immutable' : 'no-cache');
+    }
+    if (url.pathname.startsWith('/api/session')) {
+      const q = url.searchParams, bot = q.get('bot') ?? '';
+      const json = (v) => reply(200, 'application/json', JSON.stringify(v));
+      if (url.pathname === '/api/sessions') return json(sessionList(bot));
+      const id = q.get('id') ?? '', agent = q.get('agent') ?? '';
+      scanBotLog();
+      if (!botSessions.get(bot)?.has(id) || !/^[a-f0-9]{0,40}$/.test(agent)) return reply(404, 'application/json', '{"error":"нет такой сессии"}');
+      if (url.pathname === '/api/session/tree') return json({ nodes: sessionTree(id).nodes, now: Date.now() });
+      if (url.pathname === '/api/session/log') {
+        const num = (k) => (q.has(k) && /^\d{1,15}$/.test(q.get(k)) ? Number(q.get(k)) : null);
+        try { return json(sessionLog(id, agent, num('after'), num('before'))); } catch { return reply(404, 'application/json', '{"error":"нет такого лога"}'); }
+      }
     }
     if (url.pathname === '/api/bot') {
       const name = url.searchParams.get('name') ?? '';
