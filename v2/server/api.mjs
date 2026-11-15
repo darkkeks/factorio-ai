@@ -137,6 +137,100 @@ export const API = {
     example: { add: ['logistics-2', 'steel-axe'] },
   },
 
+  // ── Планирование: призраки, пометки, чертежи (тело не занимают, досягаемость не нужна) ──
+  ghost_place: {
+    kind: 'action', instant: true,
+    summary: 'Поставить призраки построек и плитки — план на карте, виден людям и ботам; предметы и досягаемость не нужны, область должна быть открыта на карте. ' +
+      'Что ставить: список items с готовыми координатами, либо сохранённый чертёж blueprint, либо строка чертежа string (тогда x, y — клетка северо-западного угла, ' +
+      'можно повернуть и отразить). Поверх совместимых построек чертёж ставит пометку замены на месте. Исполняет план build_ghosts (и mine для помеченного на снос).',
+    params: {
+      plan: 'имя плана — метка на поставленных призраках и пометках (по ней ghosts, build_ghosts, ghost_clear, mine)',
+      items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (filters, control_behavior, items)}',
+      tiles: 'список плитки {name: stone-path | concrete | landfill | …, x, y}',
+      blueprint: 'или имя сохранённого чертежа', string: 'или строка чертежа в формате игры',
+      x: 'клетка северо-западного угла чертежа', y: '',
+      rotation: '0 | 90 | 180 | 270 по часовой (для чертежа)', flip: '"h" — слева направо, "v" — сверху вниз (для чертежа)',
+      mode: 'forced (по умолчанию: ставится всё, что можно; мешающие деревья и камни помечаются на снос), ' +
+        'superforced (на снос помечается всё мешающее, включая постройки), normal (не ставится ничего, если мешает хоть что-то)',
+    },
+    result: '{plan, origin, size, total, placed, placed_tiles, already, already_planned, replace, blocked, blocked_items: [{name, x, y, by, nature?}], ' +
+      'marked_deconstruct, marked_upgrade, cost, have, missing}',
+    example: { plan: 'smelter-1', items: [{ name: 'stone-furnace', x: 10, y: 5 }, { name: 'inserter', x: 10.5, y: 6.5, direction: 'north' }] },
+  },
+  ghost_clear: {
+    kind: 'action', instant: true,
+    summary: 'Убрать призраки: своего плана целиком (вместе с его пометками сноса и замены), в области или по списку. Постройки не трогает. ' +
+      'В области убираются только призраки своих планов; all: true — любые призраки команды.',
+    params: { plan: 'имя плана', area: '{x1, y1, x2, y2}', ghosts: 'список целей {unit} или {x, y}', all: 'true — и чужие призраки в области' },
+    result: '{removed, unmarked, kept}', example: { plan: 'smelter-1' },
+  },
+  mark_deconstruct: {
+    kind: 'action', instant: true,
+    summary: 'Пометить на снос, как планировщиком разборки: постройки своей команды в области или по списку; деревья и камни — с nature: true или по names. ' +
+      'Снимает помеченное mine с marked: true (или роботы). cancel: true — снять пометки.',
+    params: {
+      area: '{x1, y1, x2, y2}', targets: 'или список целей', names: 'только такие объекты: имена построек, "tree", "rock"',
+      nature: 'true — вместе с деревьями и камнями', plan: 'имя плана для пометок', cancel: 'true — снять пометки',
+    },
+    result: '{marked | unmarked, already, by_name, plan}', example: { area: { x1: 0, y1: 0, x2: 12, y2: 8 }, names: ['transport-belt'], plan: 'move-1' },
+  },
+  mark_upgrade: {
+    kind: 'action', instant: true,
+    summary: 'Пометить на замену, как планировщиком улучшений: заменить постройки вида from на вид to в области (ленты, манипуляторы, печи). ' +
+      'Исполняет build_ghosts по области: быстрая замена на месте, старая постройка возвращается в инвентарь, содержимое и настройки сохраняются.',
+    params: { area: '{x1, y1, x2, y2}', targets: 'или список целей', from: 'имя постройки', to: 'на что заменить', plan: 'имя плана', cancel: 'true — снять пометки' },
+    result: '{marked | unmarked, plan}', example: { area: { x1: 0, y1: 0, x2: 30, y2: 2 }, from: 'transport-belt', to: 'fast-transport-belt' },
+  },
+  ghosts: {
+    kind: 'query',
+    summary: 'Планы на карте. Без параметров — список планов (имя, автор, сколько осталось, границы). С plan и/или area — призраки и пометки: ' +
+      'сколько каких, стоимость, что из этого есть в инвентаре и чего не хватает, сам список постранично.',
+    params: { plan: 'имя плана', area: '{x1, y1, x2, y2}', limit: 'сколько элементов списка отдать (по умолчанию 200)', offset: 'с какого элемента' },
+    result: '{plans: [{name, by, left, bounds}]} или {total, ghosts, tiles, deconstruct, upgrade, bounds, cost, have, missing, items: [{kind, name, x, y, unit, plan, direction?}], more?}',
+    example: { plan: 'smelter-1' },
+  },
+  blueprint_save: {
+    kind: 'control', write: true,
+    summary: 'Собрать чертёж из списка построек и сохранить под именем. Координаты — любые согласованные между собой: чертёж приводится к виду ' +
+      '«северо-западный угол в (0, 0)». Свои чертежи видит только их бот; team: true — общий для команды.',
+    params: { name: 'имя чертежа', entities: 'список {name (или item), x, y, direction?, recipe?, …}', tiles: 'список плитки {name, x, y}', team: 'true — общий' },
+    result: '{name, owner, w, h, entities, tiles, cost, origin}', example: { name: 'furnace-pair', entities: [{ name: 'stone-furnace', x: 1, y: 1 }, { name: 'stone-furnace', x: 3, y: 1 }] },
+  },
+  blueprint_capture: {
+    kind: 'control', write: true,
+    summary: 'Снять существующие постройки области в чертёж вместе с настройками (рецепты, фильтры, провода). origin в ответе — где на карте был ' +
+      'северо-западный угол: перенос блока — это capture, mark_deconstruct той же области и ghost_place чертежа в новом месте.',
+    params: { name: 'имя чертежа', area: '{x1, y1, x2, y2}', tiles: 'true — вместе с плиткой', team: 'true — общий' },
+    result: '{name, owner, w, h, entities, tiles, cost, origin: {x, y}}', example: { name: 'block-a', area: { x1: 0, y1: 0, x2: 12, y2: 8 } },
+  },
+  blueprint_import: {
+    kind: 'control', write: true,
+    summary: 'Сохранить чертёж из строки формата игры (такой, какую копируют люди). Книга чертежей сохраняется как набор «имя/метка».',
+    params: { name: 'имя', string: 'строка чертежа или книги', team: 'true — общий' },
+    result: '{saved: [{name, w, h, entities, cost}]}', example: { name: 'from-human', string: '0eNq…' },
+  },
+  blueprint_export: {
+    kind: 'query',
+    summary: 'Строка чертежа в формате игры — её можно отдать человеку или другому боту. С names — несколько чертежей одной книгой.',
+    params: { name: 'имя чертежа', names: 'или список имён — книга', book: 'название книги' },
+    result: '{string, w, h}', example: { name: 'furnace-pair' },
+  },
+  blueprint_list: { kind: 'query', summary: 'Свои и общие чертежи: размер, число построек, стоимость.', params: {}, result: '{blueprints: [{name, owner: me | team, by, w, h, entities, tiles, cost}]}', example: {} },
+  blueprint_get: {
+    kind: 'query',
+    summary: 'Содержимое чертежа списком (с учётом поворота и отражения): чтобы посмотреть, изменить своим кодом и сохранить заново.',
+    params: { name: 'имя', rotation: '0 | 90 | 180 | 270', flip: '"h" | "v"' },
+    result: '{w, h, cost, items: [{name, x, y, direction?, recipe?, …}], tile_items: [{name, x, y}]}', example: { name: 'furnace-pair', rotation: 90 },
+  },
+  blueprint_delete: { kind: 'control', write: true, summary: 'Удалить свой чертёж (общий — только автор). Постройки и призраки на карте не трогает.', params: { name: 'имя' }, result: '{deleted}', example: { name: 'furnace-pair' } },
+  blueprint_check: {
+    kind: 'query',
+    summary: 'Проверка без постановки: что из чертежа или списка встанет в этом месте, что упирается во что, сколько стоит, чего не хватает в инвентаре. Параметры — как у ghost_place.',
+    params: { items: 'список построек', tiles: 'список плитки', blueprint: 'или имя чертежа', string: 'или строка', x: 'клетка северо-западного угла', y: '', rotation: '', flip: '' },
+    result: '{origin, size, total, will_place, already, already_planned, replace, blocked, blocked_items, replace_items, cost, have, missing, charted}',
+    example: { blueprint: 'furnace-pair', x: 20, y: -4, rotation: 90 },
+  },
+
   // ── Управление очередью ──
   act: {
     kind: 'control', write: true,

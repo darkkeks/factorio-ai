@@ -183,9 +183,8 @@ local function build_ghost(A, it)
   if not g.valid then U.fail('not_found', 'призрака уже нет (построен или убран)') end
   local quality = g.quality.name
   if it.upgrade then
-    local target = g.get_upgrade_target()
+    local target, tq = g.get_upgrade_target()
     if not target then U.fail('not_found', 'пометка на замену уже снята') end
-    local tq = g.get_upgrade_quality and g.get_upgrade_quality() or g.quality
     local qn = tq and tq.name or quality
     local item, need = item_for(e, target, qn)
     if not item then U.fail('no_item', 'в инвентаре нет ' .. U.item_key(need or target.name, qn), {item = need or target.name}) end

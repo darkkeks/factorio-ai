@@ -137,13 +137,18 @@ function Q.enqueue(A, list)
     end
     if def.check then def.check(a, A) end
   end
+  -- Действия планирования тело не занимают: запрос только из них исполняется сразу, не дожидаясь очереди.
+  local all_free = true
+  for _, a in ipairs(list) do
+    if not Q.actions[a.type].free then all_free = false end
+  end
   local queued, finished = {}, {}
   for _, a in ipairs(list) do
     local act = {id = A.next_action, type = a.type, p = a, on_fail = a.on_fail or 'stop'}
     A.next_action = A.next_action + 1
     if a.cancel_if_silent_s then act.silent = math.floor(a.cancel_if_silent_s * 60) end
     queued[#queued + 1] = {action_id = act.id, action = act.type}
-    if a.immediate then
+    if a.immediate or all_free then
       -- Мгновенное действие вне очереди: исполняется сейчас, с места, где персонаж стоит.
       act.started = game.tick
       act.st = {}

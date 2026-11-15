@@ -3,6 +3,7 @@ local U = require('agent.util')
 local J = require('agent.journal')
 local Q = require('agent.queue')
 local S = require('agent.state')
+local Fog = require('agent.fog')
 
 local E = {handlers = {}, nth = {}}
 
@@ -107,6 +108,7 @@ E.handlers[defines.events.on_tick] = function(ev)
       end
     end
   end
+  if ev.tick % 60 == 0 then Fog.tick(ev.tick) end
   if ev.tick % 3600 == 0 then J.prune_throttle(DAMAGE_EVERY) end
 end
 

@@ -4,9 +4,11 @@
 local U = require('agent.util')
 local J = require('agent.journal')
 local Plans = require('agent.plans')
+local Fog = require('agent.fog')
+local BP = require('agent.blueprints')
 
 local S = {}
-S.VERSION = 2
+S.VERSION = 3
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -128,6 +130,8 @@ function S.ensure()
   st.path_requests = st.path_requests or {}
   J.init(st)
   Plans.init(st)
+  Fog.init(st)
+  BP.init(st)
   if not st.legacy then
     st.legacy = 1
     adopt_legacy(st)

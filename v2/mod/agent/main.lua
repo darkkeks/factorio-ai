@@ -14,6 +14,8 @@ require('agent.actions.mine')
 require('agent.actions.craft')
 require('agent.actions.configure')
 require('agent.actions.research')
+require('agent.planning')
+local Fog = require('agent.fog')
 
 local M = {events = {}}
 
@@ -66,7 +68,19 @@ local function guarded(fn)
   end
 end
 
-for id, fn in pairs(E.handlers) do M.events[id] = guarded(fn) end
+-- Несколько модулей могут слушать одно событие: обработчики складываются в цепочку.
+local chains = {}
+local function listen(id, fn)
+  chains[id] = chains[id] or {}
+  table.insert(chains[id], fn)
+end
+for id, fn in pairs(E.handlers) do listen(id, fn) end
+for id, fn in pairs(Fog.handlers) do listen(id, fn) end
+for id, list in pairs(chains) do
+  M.events[id] = guarded(#list == 1 and list[1] or function(ev)
+    for _, fn in ipairs(list) do fn(ev) end
+  end)
+end
 M.events[defines.events.on_script_path_request_finished] = guarded(walk.path_finished)
 
 M.add_commands = function()
