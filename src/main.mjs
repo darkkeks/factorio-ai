@@ -31,6 +31,7 @@ setInterval(() => {
 
 // ───────────────────────── Люди: слух + сессия + персонаж ─────────────────────────
 
+const agents = new Map(); // userId -> Agent; не удаляются при выходе человека из канала
 const people = new Map(); // userId -> { name, bot, agent, utt, decoder, stream, lastPacket, silenceFed, gone }
 
 function join(connection, member) {
@@ -43,9 +44,14 @@ function join(connection, member) {
 
   // Здесь экземпляр инструментов нужен только чтобы создать персонажа; сессия ходит за ними в отдельный процесс MCP.
   const fx = createFactorioServer(p.bot, { log: () => {}, aborted: () => false });
-  p.agent = new Agent(member.id, name, p.bot);
-  p.agent.on('text', (text) => log(`🤖 ${p.bot}: ${text}`));
-  p.agent.on('error', (e) => log(`⚠️ ${p.bot}: ${e.message}`));
+  // Сессия живёт дольше присутствия человека в канале: вышел — бот продолжает начатое, вернулся — та же сессия.
+  p.agent = agents.get(member.id);
+  if (!p.agent) {
+    p.agent = new Agent(member.id, name, p.bot);
+    p.agent.on('text', (text) => log(`🤖 ${p.bot}: ${text}`));
+    p.agent.on('error', (e) => log(`⚠️ ${p.bot}: ${e.message}`));
+    agents.set(member.id, p.agent);
+  }
   fx.ensure().then(
     (r) => log(`➕ ${name} в канале: персонаж «${p.bot}» на сервере в точке ${r.pos.x}, ${r.pos.y}`),
     (e) => log(`⚠️ ${p.bot}: сервер Factorio недоступен: ${e.message}`),
@@ -69,8 +75,7 @@ function leave(userId) {
   p.gone = true;
   p.stream.destroy();
   p.decoder.delete?.();
-  p.agent.close();
-  log(`➖ ${p.name} вышел, сессия «${p.bot}» остановлена (персонаж остаётся на карте)`);
+  log(`➖ ${p.name} вышел из канала; «${p.bot}» продолжает начатое и ждёт хозяина`);
 }
 
 function feed(p, samples) {
@@ -92,7 +97,10 @@ setInterval(async () => {
     const r = await readChat(chatSeq ?? Number.MAX_SAFE_INTEGER);
     if (chatSeq !== null) {
       for (const m of r.messages) {
-        for (const p of people.values()) if (p.bot !== m.from) p.agent.send(`[игровой чат] ${m.from}: ${m.text}`);
+        for (const [id, agent] of agents) {
+          // Пока хозяина нет в канале, чат будит только занятого бота: иначе дозорные скрипты всю ночь жгли бы ходы впустую.
+          if (agent.bot !== m.from && (people.has(id) || agent.busy)) agent.send(`[игровой чат] ${m.from}: ${m.text}`);
+        }
       }
     }
     chatSeq = r.seq;

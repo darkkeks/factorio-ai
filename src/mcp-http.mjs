@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ROOT, VOICE_HEARTBEAT } from './config.mjs';
-import { createFactorioServer, stopOrphans } from './factorio.mjs';
+import { createFactorioServer, stopOrphans, busyBots } from './factorio.mjs';
 
 const HOST = process.env.MCP_HOST || '172.25.0.1'; // шлюз docker-сети server-stuff_default: виден nginx, не виден из интернета
 const PORT = Number(process.env.MCP_PORT || 8765);
@@ -60,5 +60,7 @@ http.createServer(async (req, res) => {
 // Страховка: персонаж, который идёт, хотя ни один вызов его не ведёт (оборванная ходьба, перезапуск этого процесса),
 // иначе уходил бы по прямой бесконечно.
 setInterval(() => {
+  // Пока хоть один персонаж занят делом, игра не должна вставать на паузу, даже если людей нет.
+  if (busyBots().length) { try { fs.writeFileSync(VOICE_HEARTBEAT, new Date().toISOString()); } catch { /* не критично */ } }
   stopOrphans().then((names) => { if (Array.isArray(names) && names.length) console.log(stamp(), `остановлена бесхозная ходьба: ${names.join(', ')}`); }, () => {});
 }, 3000);

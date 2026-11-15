@@ -1,7 +1,7 @@
 // Сессия Claude Code одного человека: управляет его персонажем в Factorio через MCP и больше ничего не умеет.
 import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import crypto from 'node:crypto';
 import { CLAUDE_BIN, CLAUDE_MODEL, STATE_FILE, ROBOT_CONTAINER, MCP_URL, MCP_TOKENS_FILE } from './config.mjs';
@@ -143,6 +143,15 @@ export class Agent extends EventEmitter {
     this.stopped = true;
     this.q?.close?.();
     this.finish?.();
+    this.#killInContainer();
+  }
+
+  // Процесс Claude внутри контейнера не умирает вместе с docker exec на хосте: без этого после перезапуска бота
+  // старый процесс продолжал бы работать в той же сессии параллельно с новым.
+  #killInContainer() {
+    const id = loadState()[this.key];
+    if (!ROBOT_CONTAINER || !id) return;
+    try { execFileSync('docker', ['exec', ROBOT_CONTAINER, 'pkill', '-f', '--', `--resume=${id}`], { stdio: 'ignore' }); } catch { /* такого процесса нет */ }
   }
 
   async #run(resume) {
@@ -169,6 +178,7 @@ export class Agent extends EventEmitter {
               // Процесс Claude живёт в контейнере; с хоста к нему идут только stdin/stdout.
               pathToClaudeCodeExecutable: 'claude',
               spawnClaudeCodeProcess: ({ args, env, signal }) => {
+                this.#killInContainer();
                 const pass = ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION'].filter((k) => env[k]).flatMap((k) => ['-e', `${k}=${env[k]}`]);
                 pass.push('-e', 'ENABLE_CLAUDEAI_MCP_SERVERS=false');
                 // Для собственных скриптов бота: команда fx и прямые запросы к MCP от имени его персонажа.
