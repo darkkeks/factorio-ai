@@ -41,6 +41,102 @@ export const API = {
     example: { text: 'Иду чинить стену на севере' },
   },
 
+  mine: {
+    kind: 'action',
+    summary: 'Добывать руками ресурс, дерево, камень или снять постройку в инвентарь (с её содержимым). Время добычи считает игра. ' +
+      'Дальность: ресурс — 2,7 клетки, остальное — 10. Призрак снимается сразу.',
+    params: {
+      target: 'одна цель: {unit} или {x, y, name?}',
+      count: 'целое — для ресурса: сколько единиц добыть (по умолчанию 1); дерево, камень и постройка снимаются целиком',
+      targets: 'или список целей (у цели может быть свой count)',
+      marked: 'или true — всё помеченное на снос в area или в плане plan',
+      area: '{x1, y1, x2, y2} — для marked', plan: 'имя плана — для marked',
+      approach: 'true — самому обходить цели вне досягаемости (ближайшая следующей)',
+    },
+    result: 'одна цель: {name, gained — сколько предметов прибавилось в инвентаре, gone — объект исчез, amount_left}; список: отчёт {done, skipped, left, total, items: [...]}',
+    example: { target: { x: 25.5, y: -19.5 }, count: 10 },
+  },
+  craft: {
+    kind: 'action', instant: true,
+    summary: 'Ручной крафт: поставить рецепт в очередь крафта персонажа. Тело не занимает — можно идти и строить. ' +
+      'Об окончании всей очереди приходит событие craft_done; дождаться в очереди действий — wait с until: "craft_empty".',
+    params: { recipe: 'имя рецепта', item: 'или имя предмета (берётся открытый рецепт ручного крафта)', count: 'целое, по умолчанию 1' },
+    result: '{recipe, queued — сколько поставлено (может быть меньше requested, если не хватило ингредиентов), requested, queue_size}',
+    example: { item: 'iron-gear-wheel', count: 10 },
+  },
+  cancel_craft: {
+    kind: 'action', instant: true,
+    summary: 'Отменить ручной крафт: позицию очереди (index, count) или всю очередь. Ингредиенты возвращаются в инвентарь.',
+    params: { index: 'номер позиции очереди крафта (с 1); без него — вся очередь', count: 'сколько штук отменить' },
+    result: '{cancelled, queue_size}', example: {},
+  },
+  place: {
+    kind: 'action', instant: true,
+    summary: 'Поставить постройки из инвентаря: одну (item, x, y) или список items. Всё в пределах дальности постройки (10 клеток) ставится сразу, в одном тике. ' +
+      'Поверх совместимой постройки — быстрая замена на месте (старая возвращается в инвентарь, содержимое и настройки сохраняются); ' +
+      'поверх своего призрака — призрак оживает с его настройками; такая же постройка с другим направлением — поворот.',
+    params: {
+      item: 'имя предмета', x: 'центр постройки', y: '', direction: 'north | east | south | west (по умолчанию north)',
+      underground: 'input | output — для подземного конвейера (по умолчанию как в игре: выход, если позади по ходу стоит вход)',
+      recipe: 'рецепт сборочного автомата — задать сразу', quality: 'качество предмета',
+      items: 'или список таких же объектов {item, x, y, direction?, …}',
+      approach: 'true — самому обходить цели вне досягаемости',
+    },
+    result: 'одна постройка: {name, x, y, unit, direction, replaced?, already?}; список: {done, skipped, left, total, items: [{item, x, y, ok, …}]}',
+    example: { items: [{ item: 'stone-furnace', x: 10, y: 5 }, { item: 'inserter', x: 10.5, y: 6.5, direction: 'north' }] },
+  },
+  build_ghosts: {
+    kind: 'action', instant: true,
+    summary: 'Построить из инвентаря призраки (постройки и плитку): по списку, в области или по имени плана. В области заодно исполняются пометки на замену ' +
+      '(быстрая замена на месте). Чего нет в инвентаре или куда нельзя поставить — попадает в отчёт с причиной.',
+    params: {
+      ghosts: 'список целей {unit} или {x, y}', area: 'или {x1, y1, x2, y2}', plan: 'и/или имя плана',
+      upgrades: 'false — не исполнять пометки на замену в области', approach: 'true — самому обходить цели вне досягаемости',
+    },
+    result: '{done, skipped, left, total, items: [{name, x, y, ok, code?, message?}]}',
+    example: { plan: 'smelter-1', approach: true },
+  },
+  transfer: {
+    kind: 'action', instant: true,
+    summary: 'Переложить предметы между инвентарём персонажа и объектом в досягаемости (10 клеток): один перенос или список items. ' +
+      'Что, откуда и сколько — задаёшь ты; исполнитель ничего не подбирает сам.',
+    params: {
+      target: 'объект: {unit} или {x, y, name?}', direction: 'put — положить в объект, take — забрать из объекта',
+      item: 'имя предмета (для take можно не указывать — забрать всё)', count: 'сколько (по умолчанию всё)',
+      inventory: 'fuel, input, output, modules, main, ammo, burnt; по умолчанию put — как ctrl-клик (игра сама выбирает слот), take — выход машины или всё содержимое сундука',
+      lane: 'left | right — полоса конвейера по ходу движения', quality: 'качество',
+      items: 'или список таких же объектов', approach: 'true — самому обходить цели вне досягаемости',
+    },
+    result: 'один перенос: {moved, items: {предмет: количество}}; список: {done, skipped, left, total, items: [...]}',
+    example: { items: [{ target: { x: 10, y: 5 }, direction: 'put', item: 'coal', count: 5 }, { target: { x: 10, y: 5 }, direction: 'take', inventory: 'output' }], approach: true },
+  },
+  configure: {
+    kind: 'action', instant: true,
+    summary: 'Настройки постройки в досягаемости — то, что игрок делает в её окне и клавишами: одна цель или список items.',
+    params: {
+      target: 'объект: {unit} или {x, y, name?}',
+      recipe: 'рецепт сборочного автомата (false — снять); лишние ингредиенты возвращаются в инвентарь',
+      direction: 'повернуть в сторону north | east | south | west', rotate: 'true — повернуть по часовой, "reverse" — против',
+      filters: 'список предметов: фильтры манипулятора или фильтр разделителя', filter_mode: 'whitelist | blacklist',
+      input_priority: 'left | right | none — разделитель', output_priority: 'left | right | none — разделитель',
+      stack_size: 'ограничение захвата манипулятора', bar: 'сколько слотов сундука оставить открытыми (false — снять ограничение)',
+      station: 'имя станции', trains_limit: 'предел поездов станции (false — снять)',
+      control: 'настройки логики: объект полей управляющего поведения (circuit_enable_disable, circuit_condition, …)',
+      wire: '{to: цель, type: red | green | copper, disconnect?} — провод между двумя объектами в досягаемости',
+      copy_from: 'цель — скопировать настройки с другой постройки (как shift-клики)',
+      items: 'или список {target, …настройки}', approach: 'true — самому обходить цели вне досягаемости',
+    },
+    result: '{name, x, y, unit, direction, recipe?, …}',
+    example: { target: { x: 4, y: 0 }, recipe: 'iron-gear-wheel' },
+  },
+  research: {
+    kind: 'action', instant: true,
+    summary: 'Очередь исследований команды: добавить в конец, убрать, задать порядок целиком.',
+    params: { add: 'имя или список имён технологий', remove: 'имя или список', set: 'список — новая очередь целиком' },
+    result: '{queue, current, skipped: [{name, reason}]}',
+    example: { add: ['logistics-2', 'steel-axe'] },
+  },
+
   // ── Управление очередью ──
   act: {
     kind: 'control', write: true,

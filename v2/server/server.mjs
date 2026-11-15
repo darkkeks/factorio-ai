@@ -171,7 +171,9 @@ const special = {
     const me = who.agent;
     if (me) touch(me);
     // Без since бот начинает «с этого момента»: получает текущий номер и дальше спрашивает от него.
-    if (body.since == null) await game.pull(); // «с этого момента»: дочитать журнал, чтобы уже случившееся не пришло как новое
+    // Без ожидания — сначала дочитать журнал: только что завершённое действие уже должно быть видно,
+    // а «с этого момента» (без since) не должно потом отдать уже случившееся как новое.
+    if (body.since == null || waitS === 0) await game.pull();
     if (body.since == null && waitS === 0) return { events: [], seq: game.seq ?? 0, first: game.first };
     const since = body.since == null ? (game.seq ?? 0) : Number(body.since);
     const match = (ev) => (me ? mine(me)(ev) : true) && (!types || types.has(ev.type)) && !(ev.type === 'chat' && ev.from === me);

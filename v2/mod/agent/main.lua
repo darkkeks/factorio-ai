@@ -8,6 +8,12 @@ local O = require('agent.ops')
 local E = require('agent.events')
 local walk = require('agent.actions.walk')
 require('agent.actions.basic')
+require('agent.actions.build')
+require('agent.actions.transfer')
+require('agent.actions.mine')
+require('agent.actions.craft')
+require('agent.actions.configure')
+require('agent.actions.research')
 
 local M = {events = {}}
 

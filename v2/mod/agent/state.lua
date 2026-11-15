@@ -3,9 +3,10 @@
 -- поэтому состояние создаётся и обновляется лениво: ensure() стоит в начале каждого обработчика.
 local U = require('agent.util')
 local J = require('agent.journal')
+local Plans = require('agent.plans')
 
 local S = {}
-S.VERSION = 1
+S.VERSION = 2
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -126,6 +127,7 @@ function S.ensure()
   st.crafting = st.crafting or {}      -- имена ботов с непустой очередью ручного крафта
   st.path_requests = st.path_requests or {}
   J.init(st)
+  Plans.init(st)
   if not st.legacy then
     st.legacy = 1
     adopt_legacy(st)

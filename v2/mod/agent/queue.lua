@@ -23,6 +23,20 @@ local function done_event(A, act, ok, res)
   return {action_id = act.id, action = act.type, ok = ok, result = ok and res or nil, error = (not ok) and res or nil}
 end
 
+-- Ошибка отмены; для пакетов к ней прикладывается отчёт о сделанном.
+local function cancelled(A, act, message, data)
+  local def = Q.actions[act.type]
+  local err = {code = 'cancelled', message = message, data = data}
+  if act.started and def.partial then
+    local ok, rep = pcall(def.partial, A, act)
+    if ok and rep then
+      err.data = err.data or {}
+      err.data.report = rep
+    end
+  end
+  return err
+end
+
 local function cleanup(A, act)
   local def = Q.actions[act.type]
   if act.started and def.stop and A.entity and A.entity.valid then
@@ -36,8 +50,9 @@ local function drop_rest(A, reason, because)
   local q = A.queue
   A.queue = {}
   for _, a in ipairs(q) do
+    local err = cancelled(A, a, reason, because and {because = because} or nil)
     cleanup(A, a)
-    done_event(A, a, false, {code = 'cancelled', message = reason, data = because and {because = because} or nil})
+    done_event(A, a, false, err)
   end
 end
 
@@ -62,7 +77,7 @@ function Q.pump(A, finished)
     if not (A.entity and A.entity.valid) then
       ok, res = false, {code = 'dead', message = 'персонаж погиб'}
     elseif act.silent and game.tick - A.seen > act.silent then
-      ok, res = false, {code = 'cancelled', message = 'от бота нет запросов дольше cancel_if_silent_s', data = {silent = true}}
+      ok, res = false, cancelled(A, act, 'от бота нет запросов дольше cancel_if_silent_s', {silent = true})
     elseif not act.started then
       act.started = game.tick
       act.st = {}
@@ -87,7 +102,7 @@ function Q.cancel(A, id)
   for i, act in ipairs(A.queue) do
     if (id == nil and i == 1) or act.id == id then
       if i == 1 then
-        finish(A, act, false, {code = 'cancelled', message = 'отменено ботом'}, true)
+        finish(A, act, false, cancelled(A, act, 'отменено ботом'), true)
       else
         table.remove(A.queue, i)
         done_event(A, act, false, {code = 'cancelled', message = 'отменено ботом'})

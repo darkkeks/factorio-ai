@@ -67,4 +67,29 @@ function U.contents(inv)
   return r
 end
 
+-- Направления: в запросах и ответах — имена (north, east, south, west и промежуточные), можно и числом 0…15.
+local DIRS = {}
+for name, v in pairs(defines.direction) do DIRS[v] = name end
+
+function U.dir(v, name)
+  if v == nil then return nil end
+  if type(v) == 'number' and v % 1 == 0 and v >= 0 and v < 16 then return v end
+  local d = type(v) == 'string' and defines.direction[v]
+  if d == nil then U.fail('bad_request', (name or 'direction') .. ': north, east, south, west (или число 0…15)') end
+  return d
+end
+
+function U.dirname(d) return DIRS[d] or d end
+
+--- Ключ предмета для ответов: имя, а для качества выше обычного — "имя@качество".
+function U.item_key(name, quality)
+  if quality and quality ~= 'normal' then return name .. '@' .. quality end
+  return name
+end
+
+--- Сколько предметов (с учётом качества) у сущности или в инвентаре.
+function U.count(holder, name, quality)
+  return holder.get_item_count{name = name, quality = quality or 'normal'}
+end
+
 return U
