@@ -408,27 +408,40 @@ const BODY = {
     return place_one(bot(), A)`,
 
   // Группа разных построек. За один вызов ставится только то, до чего персонаж дотягивается, и не больше, чем успел бы
-  // игрок, быстро кликающий мышью: одна постройка на 12 тиков (пять в секунду) с прошлой постройки этой группы,
-  // не больше пяти за вызов; после паузы дольше секунды — одна. Счёт идёт по тикам игры, а не по часам клиента.
+  // опытный игрок: тот же предмет, что и прошлая постройка, — 2 тика (протяжка мышью с зажатой кнопкой, 30 в секунду),
+  // другой предмет — 12 тиков (сменить предмет в руке и кликнуть, пять в секунду). В запасе — тики, прошедшие с прошлой
+  // постройки этой группы (не больше 60); после паузы дольше секунды — одна постройка. Счёт по тикам игры, а не по часам клиента.
   place_many: PLACE_FN + `
     local e = bot()
     storage.vb_pm = storage.vb_pm or {}
     local last = storage.vb_pm[A.bot]
-    local budget = 1
-    if last and game.tick - last <= 60 then budget = math.min(5, math.floor((game.tick - last)/12)) end
-    local out, waiting, far, used = {}, 0, 0, 0
-    for _, it in ipairs(A.items) do
+    if type(last) == 'number' then last = {tick=last} end
+    local avail, prev = 12, nil
+    if last and game.tick - last.tick <= 60 then avail, prev = game.tick - last.tick, last.item end
+    local out, far, used, near, left = {}, 0, 0, {}, 0
+    for k, it in ipairs(A.items) do
       local d = dist(e.position, it)
-      if d > 10 then far = far + 1
-      elseif used >= budget then waiting = waiting + 1
-      else
-        local ok, r = pcall(place_one, e, it)
-        if ok then used = used + 1 out[#out+1] = {i=it.i, ok=true, r=r}
-        else out[#out+1] = {i=it.i, ok=false, why=tostring(r), near=d < 2.5} end
-      end
+      if d > 10 then far = far + 1 else near[k] = d left = left + 1 end
     end
-    if used > 0 then storage.vb_pm[A.bot] = game.tick end
-    return {results=out, waiting=waiting, far=far}`,
+    while left > 0 do
+      -- Сначала всё в досягаемости с тем же предметом, что в руке (по порядку списка), потом смена предмета.
+      local pick
+      for k, it in ipairs(A.items) do
+        if near[k] then
+          if it.item == prev then pick = k break end
+          pick = pick or k
+        end
+      end
+      local it = A.items[pick]
+      local cost = it.item == prev and 2 or 12
+      if cost > avail then break end
+      local ok, r = pcall(place_one, e, it)
+      if ok then avail = avail - cost prev = it.item used = used + 1 out[#out+1] = {i=it.i, ok=true, r=r}
+      else out[#out+1] = {i=it.i, ok=false, why=tostring(r), near=near[pick] < 2.5} end
+      near[pick] = nil left = left - 1
+    end
+    if used > 0 then storage.vb_pm[A.bot] = {tick=game.tick, item=prev} end
+    return {results=out, waiting=left, far=far}`,
 
   // Шаблоны построек: запомненная расстановка, которую персонаж потом ставит сам из инвентаря (как игрок по чертежу,
   // только руками). Хранятся в storage.vb_tpl, общие для всех ботов; менять и удалять шаблон может только тот, кто сохранил.
@@ -1385,7 +1398,7 @@ export function createFactorioServer(botName, hooks) {
         return { placed, asked: n, direction, turn_at, then_direction: turn_at ? points[n - 1].direction : undefined, last, left, skipped: skipped.slice(0, 10), skipped_count: skipped.length, stopped: stopped || undefined };
       }),
 
-    def('place_many', 'Поставить группу разных построек из инвентаря одним вызовом: items — список {item, x, y, direction} (до 50), например сборщики, манипуляторы, ленты и столбы одного блока. Персонаж подходит к первой непоставленной постройке и ставит подряд всё, до чего дотягивается с этого места, в порядке списка, с частотой быстро кликающего игрока (около пяти в секунду); за дальними подходит. Порядок важен там, где он важен в игре (вход подземного конвейера раньше выхода). Что не встало — в skipped с причиной, остальное ставится дальше. Если действие прервалось, повтори вызов с тем, что в not_done.',
+    def('place_many', 'Поставить группу разных построек из инвентаря одним вызовом: items — список {item, x, y, direction} (до 50), например сборщики, манипуляторы, ленты и столбы одного блока. Персонаж подходит к первой непоставленной постройке и ставит подряд всё, до чего дотягивается с этого места, в темпе опытного игрока: одинаковые предметы подряд — протяжкой, до 30 в секунду, смена предмета в руке — около пяти в секунду; поэтому с одного места сначала ставятся все постройки того же предмета (в порядке списка), потом следующего. За дальними подходит. Порядок важен там, где он важен в игре (вход подземного конвейера раньше выхода) — для одного предмета он сохраняется. Что не встало — в skipped с причиной, остальное ставится дальше. Если действие прервалось, повтори вызов с тем, что в not_done.',
       { items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
           direction: z.enum(DIRECTIONS).default('north').describe('как в place: конвейер везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
           underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place') })).min(1).max(50) },
@@ -1399,7 +1412,7 @@ export function createFactorioServer(botName, hooks) {
       { name: z.string().min(1).max(40).describe('имя шаблона'), ...coords, x2: z.number().describe('x противоположного угла'), y2: z.number().describe('y противоположного угла') },
       (a) => run('tpl_save', { name: a.name.trim(), x1: Math.floor(Math.min(a.x, a.x2)), y1: Math.floor(Math.min(a.y, a.y2)), x2: Math.floor(Math.max(a.x, a.x2)) + 1, y2: Math.floor(Math.max(a.y, a.y2)) + 1 })),
 
-    def('template_place', 'Поставить шаблон (template_save) из инвентаря: (x, y) — клетка, куда встанет северо-западный угол шаблона (уже после поворота), rotation — поворот по часовой стрелке. Персонаж сам подходит и ставит всё, до чего дотягивается, как place_many: с частотой быстро кликающего игрока, за дальними подходит. Постройки, которые уже стоят на своих местах, пропускаются (already_there), так что прерванный вызов можно просто повторить. Занятые клетки пропускаются (skipped с причиной). Если предметов не хватает, ставит, на что хватило, а недостающее — в missing. turned — стоит такая же постройка, но повёрнута иначе (поправь через rotate). С dry_run=true ничего не ставит: показывает, сколько чего нужно, чего не хватает и какие клетки заняты (blocked; виден только участок в 60 клетках от персонажа).',
+    def('template_place', 'Поставить шаблон (template_save) из инвентаря: (x, y) — клетка, куда встанет северо-западный угол шаблона (уже после поворота), rotation — поворот по часовой стрелке. Персонаж сам подходит и ставит всё, до чего дотягивается, как place_many: в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду), за дальними подходит. Постройки, которые уже стоят на своих местах, пропускаются (already_there), так что прерванный вызов можно просто повторить. Занятые клетки пропускаются (skipped с причиной). Если предметов не хватает, ставит, на что хватило, а недостающее — в missing. turned — стоит такая же постройка, но повёрнута иначе (поправь через rotate). С dry_run=true ничего не ставит: показывает, сколько чего нужно, чего не хватает и какие клетки заняты (blocked; виден только участок в 60 клетках от персонажа).',
       { name: z.string().describe('имя шаблона'), ...coords,
         rotation: z.number().default(0).describe('поворот по часовой стрелке в градусах: 0, 90, 180 или 270'),
         dry_run: z.boolean().default(false).describe('только проверить: ничего не ставить') },
