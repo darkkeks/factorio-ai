@@ -644,11 +644,14 @@ async function finishShot(t, src, updates) {
   finally { fs.rmSync(src, { force: true }); }
 }
 
+// Имена снимков не повторяются между запусками сервиса: иначе файл, оставшийся от прошлого запуска или опоздавший
+// после тайм-аута, однажды совпадает по имени с новым заказом и попадает не в свой тайл.
+const SHOT_RUN = Date.now().toString(36);
 let shotId = 0, failures = 0;
 async function renderBatch(batch) {
   const shots = batch.map((t) => {
     const s = span(t.z);
-    return { t, name: `${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZMAX)] };
+    return { t, name: `${SHOT_RUN}-${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZMAX)] };
   });
   await lua(LUA.shots, { camera: CAMERA, surface: SURFACE, dir: SHOT_DIR, size: TILE, quality: JPEG_QUALITY, shots: shots.map((s) => [...s.args, s.name]) });
   const deadline = Date.now() + SHOT_TIMEOUT_MS, updates = [], work = [];
@@ -669,6 +672,10 @@ async function renderBatch(batch) {
     log(`снимки не пришли: ${left.length} из ${shots.length} (подряд неудач: ${failures})`);
     for (const s of left) fs.rmSync(path.join(SHOTS, s.name), { force: true });
   } else failures = 0;
+  // Опоздавшие и чужие снимки: всё, что лежит в папке дольше минуты, уже никому не нужно.
+  if (shotId % 400 < BATCH) {
+    try { for (const f of fs.readdirSync(SHOTS)) { const full = path.join(SHOTS, f); if (Date.now() - fs.statSync(full).mtimeMs > 60_000) fs.rmSync(full, { force: true }); } } catch { /* папки ещё нет */ }
+  }
 }
 
 async function renderLoop() {
@@ -708,7 +715,8 @@ function loadState() {
     idx.forEach(([x, y, v], i) => chunks.set(ckey(x, y), { x, y, vis: null, snap: Buffer.from(bin.subarray(i * 3072, i * 3072 + 3072)), snapV: v, snapTs: 0, tiles: null, tnames: null, tilesTs: 0 }));
     for (const [k, [ts, sig, fog]] of Object.entries(JSON.parse(fs.readFileSync(TILE_IDX, 'utf8')))) {
       const [z, x, y] = k.split('/').map(Number);
-      if (fs.existsSync(tileFile(z, x, y))) tiles.set(k, { z, x, y, ts, sig, fog: !!fog, vis: 0, dirty: false });
+      // Тайлы из снимков после запуска переснимаем (dirty): так случайно испорченный тайл не живёт дольше одного запуска.
+      if (fs.existsSync(tileFile(z, x, y))) tiles.set(k, { z, x, y, ts, sig, fog: !!fog, vis: 0, dirty: !fog });
     }
     log(`загружено: схем чанков ${chunks.size}, тайлов ${tiles.size}`);
   } catch { /* первый запуск: всё соберётся заново */ }
