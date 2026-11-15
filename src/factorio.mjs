@@ -235,7 +235,8 @@ const BODY = {
       return bs, bj, bo
     end
     local cur, curj, off = score(p.x, p.y, false)
-    if not cur then return {i=A.i, d=rem[1], off=99, tick=game.tick} end
+    local en = A.w and s.count_entities_filtered{position=p, radius=20, force='enemy', type='unit', limit=1} or 0
+    if not cur then return {i=A.i, d=rem[1], off=99, tick=game.tick, x=p.x, y=p.y, en=en} end
     -- На конвейере шаг сбавляем меньше: слишком медленного персонажа лента унесёт.
     local on_belt = s.count_entities_filtered{area={{p.x-0.2, p.y-0.2}, {p.x+0.2, p.y+0.2}}, type={'transport-belt', 'underground-belt', 'splitter'}} > 0
     local minf = on_belt and 0.4 or 0.05
@@ -268,7 +269,7 @@ const BODY = {
     end
     e.character_running_speed_modifier = math.max(on_belt and -0.6 or -0.95, math.min(0, bf - 1))
     e.walking_state = {walking=true, direction=bdir*2}
-    return {i=math.max(A.i, bseg+1), d=cur, off=off, tick=game.tick}`,
+    return {i=math.max(A.i, bseg+1), d=cur, off=off, tick=game.tick, x=p.x, y=p.y, en=en}`,
 
   stop: `local e = bot() e.walking_state = {walking=false, direction=e.walking_state.direction} e.character_running_speed_modifier = 0 return {x=e.position.x, y=e.position.y}`,
 
@@ -433,7 +434,189 @@ const BODY = {
     -- Путь запоминается на сервере: команда шага (follow) должна быть короткой, см. FOLLOW.
     storage.vb_path = storage.vb_path or {}
     storage.vb_path[A.bot] = out
-    return {found=goal ~= nil, near=near, unreachable=goal == nil and n == 0, cells=#C-1, points=out}`,
+    -- A.en — заодно гнёзда и черви, которых персонаж сейчас видит (в 60 клетках): по ним проверяется остаток дальнего маршрута.
+    local nests
+    if A.en then
+      nests = {}
+      for _, c in pairs(s.find_entities_filtered{force='enemy', type={'unit-spawner', 'turret'}, position=p0, radius=60, limit=60}) do nests[#nests+1] = {x=r1(c.position.x), y=r1(c.position.y)} end
+    end
+    return {found=goal ~= nil, near=near, unreachable=goal == nil and n == 0, cells=#C-1, points=out, nests=nests}`,
+
+  // Дальний маршрут (fb-044, fb-046): тот же поиск по узлам в полклетки, что и path, но на весь переход сразу и с большим
+  // запасом перебора; без штрафов и сглаживания — по нему path потом ведёт персонажа кусками. Смотрит только то, что видит
+  // игрок: открытую карту (и 60 клеток вокруг персонажа) в полосе A.margin клеток вокруг прямой. С A.avoid маршрут держится
+  // в 30 клетках от гнёзд и червей, которых сейчас видно (60 клеток от персонажа, радар); к тем, что уже ближе, — не приближается.
+  // exhausted — перебрано всё, куда можно дойти, цели там нет; cut_* — во что при этом упирались (край полосы, неоткрытая
+  // карта, враги); closest и blocker — докуда дойти можно и что мешает дальше.
+  far: `
+    local e = bot()
+    local s, f = e.surface, e.force
+    local p0 = e.position
+    local sx, sy = math.floor(p0.x*2+0.5), math.floor(p0.y*2+0.5)
+    local gx, gy = math.floor(A.x*2+0.5), math.floor(A.y*2+0.5)
+    local function key(x, y) return (x+1000000)*4000000 + (y+1000000) end
+    local fc = {}
+    local function free(x, y)
+      local k = key(x, y)
+      local v = fc[k]
+      if v == nil then v = s.can_place_entity{name='character', position={x/2, y/2}} fc[k] = v end
+      return v
+    end
+    local M = A.margin*2
+    local x0, x1, y0, y1 = math.min(sx, gx)-M, math.max(sx, gx)+M, math.min(sy, gy)-M, math.max(sy, gy)+M
+    local chart = {}
+    local function known(x, y)
+      if math.abs(x-sx) <= 120 and math.abs(y-sy) <= 120 then return true end
+      local cx, cy = math.floor(x/64), math.floor(y/64)
+      local k = key(cx, cy)
+      local v = chart[k]
+      if v == nil then v = f.is_chunk_charted(s, {cx, cy}) chart[k] = v end
+      return v
+    end
+    -- Зоны врагов: ячейки 4×4 клетки, центр которых ближе R к гнезду или червю.
+    local zone, nests = {}, 0
+    if A.avoid then
+      local vis = {}
+      for _, c in pairs(s.find_entities_filtered{force='enemy', type={'unit-spawner', 'turret'}, area={{x0/2-32, y0/2-32}, {x1/2+32, y1/2+32}}}) do
+        local q = c.position
+        local d = dist(q, p0)
+        local see = d <= 60
+        if not see then
+          local k = key(math.floor(q.x/32), math.floor(q.y/32))
+          if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {math.floor(q.x/32), math.floor(q.y/32)}) end
+          see = vis[k]
+        end
+        if see then
+          nests = nests + 1
+          local R = math.min(30, d - 4)
+          if R > 0 then
+            local ax, ay, m = math.floor(q.x/4), math.floor(q.y/4), math.ceil(R/4)
+            for i = ax-m, ax+m do for j = ay-m, ay+m do
+              if ((i*4+2-q.x)^2 + (j*4+2-q.y)^2)^0.5 <= R then local k = key(i, j) if not zone[k] then zone[k] = {x=r1(q.x), y=r1(q.y)} end end
+            end end
+          end
+        end
+      end
+    end
+    local gz = zone[key(math.floor(A.x/4), math.floor(A.y/4))]
+    if gz then return {found=false, enemy_goal={x=gz.x, y=gz.y, dist=r1(dist(gz, A))}, nests=nests} end
+    local tol = A.tol
+    local md
+    for pass = 1, 2 do
+      local r = pass == 1 and math.ceil(tol*2) or 12
+      if not md then
+        for x = gx-r, gx+r do for y = gy-r, gy+r do
+          local d = dist({x=x/2, y=y/2}, A)
+          if (not md or d < md) and (pass == 2 or d <= tol) and ((x == sx and y == sy) or free(x, y)) then md = d end
+        end end
+      end
+    end
+    if md and md > tol then tol = md + 0.01 end
+    local cut_box, cut_map, cut_enemy
+    local okc = {}
+    local function ok(x, y)
+      local k = key(x, y)
+      local v = okc[k]
+      if v ~= nil then return v end
+      v = false
+      if x < x0 or x > x1 or y < y0 or y > y1 then cut_box = true
+      elseif free(x, y) then
+        local z = zone[key(math.floor(x/8), math.floor(y/8))]
+        if z then cut_enemy = cut_enemy or z
+        elseif not known(x, y) then cut_map = true
+        else v = true end
+      end
+      okc[k] = v
+      return v
+    end
+    local function h(x, y) local dx, dy = math.abs(x/2-A.x), math.abs(y/2-A.y) return math.max(dx, dy) + 0.41*math.min(dx, dy) end
+    local heap, n = {}, 0
+    local function push(fv, x, y)
+      n = n + 1
+      local i = n
+      heap[i] = {fv, x, y}
+      while i > 1 do
+        local p = math.floor(i/2)
+        if heap[p][1] <= heap[i][1] then break end
+        heap[p], heap[i] = heap[i], heap[p]
+        i = p
+      end
+    end
+    local function pop()
+      local top = heap[1]
+      heap[1] = heap[n] heap[n] = nil n = n - 1
+      local i = 1
+      while true do
+        local l, r, m = i*2, i*2+1, i
+        if l <= n and heap[l][1] < heap[m][1] then m = l end
+        if r <= n and heap[r][1] < heap[m][1] then m = r end
+        if m == i then break end
+        heap[m], heap[i] = heap[i], heap[m]
+        i = m
+      end
+      return top
+    end
+    local g, from, closed = {[key(sx, sy)]=0}, {}, {}
+    push(1.5*h(sx, sy), sx, sy)
+    local goal, best, bh, expanded = nil, nil, h(sx, sy), 0
+    while n > 0 and expanded < A.budget do
+      local c = pop()
+      local x, y = c[2], c[3]
+      local k = key(x, y)
+      if not closed[k] then
+        closed[k] = true
+        expanded = expanded + 1
+        if dist({x=x/2, y=y/2}, A) <= tol then goal = {x, y} break end
+        if h(x, y) < bh - 0.01 then bh = h(x, y) best = {x, y} end
+        for dx = -1, 1 do for dy = -1, 1 do
+          local nx, ny = x+dx, y+dy
+          local nk = key(nx, ny)
+          if (dx ~= 0 or dy ~= 0) and not closed[nk] and ok(nx, ny) and (dx == 0 or dy == 0 or (ok(nx, y) and ok(x, ny))) then
+            local ng = g[k] + ((dx ~= 0 and dy ~= 0) and 0.705 or 0.5)
+            if not g[nk] or ng < g[nk] then g[nk] = ng from[nk] = {x, y} push(ng + 1.5*h(nx, ny), nx, ny) end
+          end
+        end end
+      end
+    end
+    if not goal then
+      local b = best or {sx, sy}
+      local bx, by = b[1]/2, b[2]/2
+      local d = dist({x=bx, y=by}, A)
+      local blocker
+      for t = 1, math.min(24, math.ceil(d*2)) do
+        local qx, qy = bx + (A.x-bx)*t/(d*2), by + (A.y-by)*t/(d*2)
+        if not s.can_place_entity{name='character', position={qx, qy}} then
+          local what = thing(s, {qx, qy})
+          if what == 'земля' then what = s.get_tile(qx, qy).name end
+          blocker = {x=r1(qx), y=r1(qy), what=what}
+          break
+        end
+      end
+      return {found=false, exhausted=n == 0, cut_box=cut_box, cut_map=cut_map, cut_enemy=cut_enemy, closest={x=bx, y=by, dist=r1(d)}, blocker=blocker, expanded=expanded, nests=nests}
+    end
+    local rev = {}
+    local c = goal
+    while c and not (c[1] == sx and c[2] == sy) do rev[#rev+1] = c c = from[key(c[1], c[2])] end
+    local pts = {{x=sx/2, y=sy/2}}
+    for i = #rev, 1, -1 do pts[#pts+1] = {x=rev[i][1]/2, y=rev[i][2]/2} end
+    local out, len = {pts[1]}, 0
+    for i = 2, #pts do
+      local a, b, c = pts[i-1], pts[i], pts[i+1]
+      len = len + dist(a, b)
+      if not c or math.abs((b.x-a.x)*(c.y-b.y) - (b.y-a.y)*(c.x-b.x)) > 0.001 then out[#out+1] = b end
+    end
+    return {found=true, len=r1(len), points=out, expanded=expanded, nests=nests}`,
+
+  // Кусаки рядом с персонажем (то, что он видит на экране): сколько и где ближайший.
+  foes: `
+    local e = bot()
+    local best, bd, n = nil, nil, 0
+    for _, c in pairs(e.surface.find_entities_filtered{position=e.position, radius=25, force='enemy', type='unit'}) do
+      n = n + 1
+      local d = dist(c.position, e.position)
+      if not bd or d < bd then best, bd = c, d end
+    end
+    return {count=n, name=best and best.name or nil, nearest=best and P(best.position) or nil, dist=bd and r1(bd) or nil}`,
 
   look: `
     local e = bot()
@@ -1994,7 +2177,9 @@ export function createFactorioServer(botName, hooks) {
   let walkSeq = 0; // новый поход отменяет прежний: двое не могут вести одного персонажа
 
   /** Идти по пути, который только что нашёл и запомнил на сервере path (FOLLOW). Итог: done | stuck (перестал продвигаться) | lost (снесло с пути) | timeout | interrupted | superseded. */
-  async function follow(points, my, deadline) {
+  // handoff — вернуться, не останавливая персонажа, когда до конца этого куска осталось меньше стольких клеток (дальше
+  // поведёт следующий кусок). watch — следить за кусаками: появились в 20 клетках, хотя в начале их не было, — enemies.
+  async function follow(points, my, deadline, handoff = 0, watch = null, odo = null) {
     let i = 2;
     let best = Infinity;
     let lastProgress = Date.now();
@@ -2002,11 +2187,18 @@ export function createFactorioServer(botName, hooks) {
     // Берём худший из двух последних промежутков; первая команда — с запасом.
     let n = 30, lastTick = null, lastGap = 0, sent = Date.now(), gapMs = 0;
     for (;;) {
-      const s = await run('follow', { i, n });
+      const s = await run('follow', { i, n, w: watch ? 1 : undefined });
       gapMs = Date.now() - sent;
+      // Пройденный путь — по настоящим позициям персонажа от команды к команде.
+      if (odo && s.x !== undefined) { if (odo.x !== undefined) odo.moved += Math.hypot(s.x - odo.x, s.y - odo.y); odo.x = s.x; odo.y = s.y; }
       if (s.done) return { done: true, left: 0 };
       if (my !== walkSeq) return { superseded: true };
       if (hooks.aborted()) return { interrupted: true };
+      if (watch) {
+        if (!s.en) watch.calm = true;
+        else if (watch.calm) return { enemies: true, left: Math.min(best, s.d) };
+        else watch.calm = false;
+      }
       if (lastTick !== null) { const gap = s.tick - lastTick; n = Math.max(gap, lastGap) + 1; lastGap = gap; }
       lastTick = s.tick;
       // Снесло далеко от пути (например, задержка скакнула) — путь надо искать заново.
@@ -2015,7 +2207,8 @@ export function createFactorioServer(botName, hooks) {
       if (s.i > i) i = s.i;
       if (s.d < best - 0.05) { best = s.d; lastProgress = Date.now(); }
       if (Date.now() - lastProgress > Math.max(1500, gapMs * 4)) return { stuck: true, left: best };
-      if (Date.now() >= deadline) return { timeout: true };
+      if (Date.now() >= deadline) return { timeout: true, left: best };
+      if (handoff && s.d < handoff) return { handoff: true, left: s.d, x: s.x, y: s.y };
       await sleep(30);
       sent = Date.now();
     }
@@ -2026,49 +2219,134 @@ export function createFactorioServer(botName, hooks) {
   // остановились: переносить персонажа нельзя. pos в ответе — настоящая позиция после остановки.
   // Обход ограничен (fb-040): если идти пришлось бы втрое дальше, чем по прямой (и больше 30 клеток), персонаж не идёт
   // или останавливается — иначе короткий переход по базе превращается в петлю на сотни клеток. longWay снимает предел.
-  async function walk(x, y, tol = 1.5, longWay = false) {
+  //
+  // Дальний переход (fb-044, fb-046): если до цели больше 10 клеток, сначала ищется маршрут на весь путь (BODY.far), и
+  // персонаж идёт по нему кусками примерно по 30 клеток, не останавливаясь на стыках. Тогда длина обхода известна заранее:
+  // без longWay персонаж идёт, если она не больше четырёх прямых (или 60 клеток); если пути нет — говорит, что мешает,
+  // и остаётся на месте. Не хватило перебора на дальний маршрут — идёт по-старому, кусками к цели, с прежним пределом обхода.
+  // avoid — обходить гнёзда и червей, которых видно, в 30 клетках, и остановиться, если рядом появились кусаки.
+  async function walk(x, y, tol = 1.5, longWay = false, avoid = true) {
     const my = ++walkSeq;
-    const deadline = Date.now() + 90_000;
+    const deadline = Date.now() + 180_000;
     const r1 = (v) => Math.round(v * 10) / 10;
+    const at = (q) => `(${Math.round(q.x)}, ${Math.round(q.y)})`;
+    const watch = avoid ? { calm: null } : null;
     let out = {};
+    let walked = 0, straight0 = null;
+    const odo = { moved: 0 };
+    let hint = '';
     try {
-      let bestEnd = Infinity;
+      let bestEnd = Infinity, lastT = '';
       let stuckAt = null;
-      let walked = 0, straight0 = null;
+      let me = null; // где персонаж сейчас (если известно без лишней команды)
+      let dense = null, di = 0, useFar = true, planAt = null, maxPlans = 20;
+      // Запас до гнезда n при маршруте, найденном из точки from (как в BODY.far, минус погрешность ячеек).
+      const margin = (n, from) => Math.min(30, Math.hypot(n.x - from.x, n.y - from.y) - 4) - 3;
       for (let plans = 0; ; plans++) {
-        if (plans >= 20) { out = { fail: 'не дошёл: слишком много обходов' }; break; }
-        const p = await run('path', { x, y, tol });
+        if (plans >= maxPlans) { out = { fail: 'не дошёл: слишком много обходов' }; break; }
+        if (!me) me = await run('pos');
+        if (straight0 === null) { straight0 = Math.hypot(me.x - x, me.y - y); odo.x = me.x; odo.y = me.y; }
+        if (useFar && !dense && Math.hypot(me.x - x, me.y - y) > 10) {
+          if (plans > 0) { const h = await run('stop'); me = { x: h.x, y: h.y }; }
+          const c = await run('far', { x, y, tol, avoid, margin: longWay ? 150 : 60, budget: longWay ? 25000 : 10000 });
+          const wide = longWay ? '' : ' (искал в 60 клетках в сторону от прямой; long_way=true ищет шире)';
+          if (c.enemy_goal) {
+            out = { fail: `на пути враги: цель в ${Math.round(c.enemy_goal.dist)} клетках от гнезда или червя у ${at(c.enemy_goal)} — не иду. Если идёшь туда нарочно, повтори с avoid_enemies=false`, enemies: { nest: c.enemy_goal } };
+            break;
+          }
+          if (c.found && Array.isArray(c.points) && c.points.length > 1) {
+            const need = walked + c.len;
+            if (!longWay && need > Math.max(60, straight0 * 4)) {
+              out = { fail: `обход слишком длинный: путь есть, но идти ${Math.round(need)} клеток${walked > 1 ? ` (из них ${Math.round(walked)} уже пройдено)` : ''}, а по прямой было ${Math.round(straight0)} — дорогу перегораживают постройки (трубы, стены, плотные ряды машин), вода или скалы. Если такой обход устраивает, повтори с long_way=true; иначе сделай проход (подземная труба)`, route_len: Math.round(need) };
+              break;
+            }
+            dense = [];
+            for (let k = 0; k < c.points.length - 1; k++) {
+              const a = c.points[k], b = c.points[k + 1];
+              const m = Math.max(1, Math.round(Math.hypot(b.x - a.x, b.y - a.y)));
+              for (let t = 0; t < m; t++) dense.push({ x: a.x + (b.x - a.x) * t / m, y: a.y + (b.y - a.y) * t / m });
+            }
+            dense.push(c.points[c.points.length - 1]);
+            di = 0; planAt = me; maxPlans = plans + 20 + Math.ceil(c.len / 5);
+          } else if (c.exhausted && c.cut_enemy) {
+            out = { fail: `на пути враги: дорогу перекрывают гнёзда или черви у ${at(c.cut_enemy)}, обойти их с запасом 30 клеток нельзя${c.cut_box ? wide : ''}. Стою на месте. Идти несмотря на врагов — avoid_enemies=false`, enemies: { nest: c.cut_enemy } };
+            break;
+          } else if (c.exhausted && c.cut_box && !longWay) {
+            out = { fail: `прохода не нашёл${wide}. Ближе всего можно подойти к ${at(c.closest)} — оттуда до цели ${c.closest.dist}${c.blocker ? `, дальше мешает ${c.blocker.what} у ${at(c.blocker)}` : ''}. Стою на месте: повтори с long_way=true или сделай проход` };
+            break;
+          } else if (c.exhausted && !c.cut_box && !c.cut_map) {
+            out = { fail: `пешком туда не дойти: цель отрезана препятствиями. Ближе всего можно подойти к ${at(c.closest)} — оттуда до цели ${c.closest.dist}${c.blocker ? `, дальше мешает ${c.blocker.what} у ${at(c.blocker)}` : ''}. Стою на месте`, soft: true };
+            break;
+          } else {
+            // Перебора на дальний маршрут не хватило: идём по-старому, а что мешало — пригодится в ответе.
+            useFar = false;
+            if (c.closest && c.blocker) hint = ` Дальний поиск пути не нашёл: ближе всего подошёл бы к ${at(c.closest)}, дальше мешает ${c.blocker.what} у ${at(c.blocker)}.`;
+          }
+        }
+        // Куда ведёт этот кусок: точка дальнего маршрута на ~30 клеток вперёд либо сама цель.
+        let tx = x, ty = y, ttol = tol, final = true;
+        if (dense) {
+          let bd = Infinity, bi = di;
+          for (let k = di; k < Math.min(dense.length, di + 100); k++) {
+            const d = Math.hypot(dense[k].x - me.x, dense[k].y - me.y);
+            if (d < bd) { bd = d; bi = k; }
+          }
+          di = bi;
+          if (di + 36 < dense.length) { tx = dense[di + 32].x; ty = dense[di + 32].y; ttol = 1; final = false; }
+        }
+        const tk = `${tx},${ty}`;
+        if (tk !== lastT) { lastT = tk; bestEnd = Infinity; }
+        const p = await run('path', { x: tx, y: ty, tol: ttol, en: avoid || undefined });
+        me = null;
         const points = Array.isArray(p.points) ? p.points : [];
         const near = p.near ? 'в самой точке стоять нельзя (занято), встал как можно ближе' : undefined;
         const end = points[points.length - 1];
-        const endDist = end ? Math.hypot(end.x - x, end.y - y) : Infinity;
+        const endDist = end ? Math.hypot(end.x - tx, end.y - ty) : Infinity;
+        // По дороге стало видно гнездо, к которому ведёт остаток маршрута: дальний маршрут ищется заново, уже в обход.
+        if (avoid && Array.isArray(p.nests) && p.nests.length && points.length) {
+          if (dense) {
+            const bad = p.nests.find((n) => { const m = margin(n, planAt); return m > 0 && dense.some((q, k) => k >= di && Math.hypot(q.x - n.x, q.y - n.y) < m); });
+            if (bad) { dense = null; lastT = ''; continue; }
+          } else if (end) {
+            const bad = p.nests.find((n) => { const m = margin(n, points[0]); return m > 0 && Math.hypot(end.x - n.x, end.y - n.y) < m; });
+            if (bad) { out = { fail: `на пути враги: дорога ведёт к гнезду или червю у ${at(bad)} — дальше не иду. Идти несмотря на врагов — avoid_enemies=false`, enemies: { nest: bad } }; break; }
+          }
+        }
         // Неполный путь имеет смысл, только пока он приближает к цели, иначе будем ходить кругами.
         if (points.length < 2 || (!p.found && endDist > bestEnd - 1)) {
+          // Кусок дальнего маршрута не дался (тесный проход): дальше по-старому, прямо к цели.
+          if (!final) { dense = null; useFar = false; lastT = ''; continue; }
           if (p.found) out = { note: near };
-          else if (p.unreachable) out = { fail: 'пешком туда не дойти: цель отрезана препятствиями (вода, скалы, постройки). Стою в ближайшей к ней достижимой точке' };
-          else out = { fail: 'не нашёл обход препятствия. Стою в ближайшей к цели точке, до которой нашёл путь; осмотрись (look_around) и иди через промежуточные точки' };
+          else if (p.unreachable) out = { fail: 'пешком туда не дойти: цель отрезана препятствиями (вода, скалы, постройки). Стою в ближайшей к ней достижимой точке', soft: true };
+          else out = { fail: 'не нашёл обход препятствия. Стою в ближайшей к цели точке, до которой нашёл путь; посмотри area_map и иди через промежуточные точки', soft: true };
           break;
         }
         bestEnd = Math.min(bestEnd, endDist);
         let len = 0;
         for (let k = 1; k < points.length; k++) len += Math.hypot(points[k].x - points[k - 1].x, points[k].y - points[k - 1].y);
-        if (straight0 === null) straight0 = Math.hypot(points[0].x - x, points[0].y - y);
         // Сколько идти самое меньшее: уже пройденное, этот кусок пути и по прямой от его конца до цели.
         const need = walked + len + (p.found ? 0 : Math.max(0, endDist - tol));
-        if (!longWay && need > Math.max(30, straight0 * 3)) {
+        if (!dense && !longWay && need > Math.max(30, straight0 * 3)) {
           out = { fail: `обход слишком длинный: идти не меньше ${Math.round(need)} клеток${walked > 1 ? ` (из них ${Math.round(walked)} уже пройдено)` : ''}, а по прямой было ${Math.round(straight0)} — дорогу перегораживают постройки (трубы, стены, плотные ряды машин; трубы не перешагивает и игрок). Посмотри area_map и иди через промежуточные точки, сделай проход (подземная труба) или, если длинный обход устраивает, повтори move_to с long_way=true` };
           break;
         }
-        const s = await follow(points, my, deadline);
-        if (s.left !== undefined) walked += Math.max(0, len - (Number.isFinite(s.left) ? s.left : len));
+        const s = await follow(points, my, deadline, final ? 0 : 10, watch, odo);
+        walked = odo.moved;
+        if (s.handoff) { me = { x: s.x, y: s.y }; continue; }
         if (s.superseded) { out = { interrupted: 'прервано другим действием с ходьбой' }; break; }
         if (s.interrupted) { out = { interrupted: 'прервано новой репликой' }; break; }
+        if (s.enemies) {
+          await run('stop').catch(() => null);
+          const fo = await run('foes').catch(() => ({}));
+          out = { fail: `рядом появились враги${fo.nearest ? `: ${fo.count} шт., ближайший (${fo.name}) у ${at(fo.nearest)}, в ${fo.dist} клетках` : ''} — остановился. Следующий move_to пойдёт, даже если они рядом: уходи или защищайся`, enemies: fo };
+          break;
+        }
         if (s.timeout) { out = { fail: 'ещё не дошёл: вызови ещё раз' }; break; }
-        if (s.done && p.found) { out = { note: near }; break; }
+        if (s.done && p.found && final) { out = { note: near }; break; }
         if (s.stuck) {
           // Дважды упёрся на одном месте — путь есть только на бумаге (или игра стоит на паузе).
-          const me = await run('pos');
-          if (stuckAt && Math.hypot(me.x - stuckAt.x, me.y - stuckAt.y) < 0.5) { out = { fail: 'упёрся в препятствие и не могу его обойти. Осмотрись (look_around) и иди через промежуточные точки' }; break; }
+          me = await run('pos');
+          if (stuckAt && Math.hypot(me.x - stuckAt.x, me.y - stuckAt.y) < 0.5) { out = { fail: 'упёрся в препятствие и не могу его обойти. Посмотри area_map и иди через промежуточные точки', soft: true }; break; }
           stuckAt = me;
           bestEnd = Infinity;
         }
@@ -2083,14 +2361,23 @@ export function createFactorioServer(botName, hooks) {
     const res = { pos: out.pos };
     if (out.note) res.note = out.note;
     if (out.interrupted) res.interrupted = out.interrupted;
-    if (out.fail) { res.not_reached = out.fail; res.distance_left = r1(Math.hypot(out.pos.x - x, out.pos.y - y)); }
+    const left = r1(Math.hypot(out.pos.x - x, out.pos.y - y));
+    // Не дошёл до самой точки, но стоит вплотную (до 4 клеток — всё в досягаемости): это не сбой, а пометка.
+    if (out.fail && out.soft && hint) out.fail += hint;
+    if (out.fail && out.soft && left <= Math.max(4, tol)) { res.note = `ближе подойти нельзя, до точки ${left}: ${out.fail}`; res.distance_left = left; }
+    else if (out.fail) { res.not_reached = out.fail; res.distance_left = left; }
+    if (out.enemies) res.enemies = out.enemies;
+    if (out.route_len) res.route_len = out.route_len;
+    if (straight0 > 0.5 || walked > 0.5) { res.walked = r1(walked); res.straight = r1(straight0 ?? 0); }
     return res;
   }
 
-  /** Подойти, если цель дальше reach. */
+  /** Подойти, если цель дальше reach. Не дошёл и не дотягивается — ошибка с причиной (враги на пути, нет прохода). */
   async function approach(x, y, reach) {
     const me = await run('pos');
-    if (Math.hypot(me.x - x, me.y - y) > reach) await walk(x, y, Math.max(1.5, reach - 2));
+    if (Math.hypot(me.x - x, me.y - y) <= reach) return;
+    const w = await walk(x, y, Math.max(1.5, reach - 2));
+    if (w.not_reached && Math.hypot(w.pos.x - x, w.pos.y - y) > reach + 1.5) throw new Error(`не дошёл до (${x}, ${y}), стою в (${w.pos.x}, ${w.pos.y}), осталось ${w.distance_left}: ${w.not_reached}`);
   }
 
   // Ожидание ручного крафта (fb-043): если предмета нет в инвентаре, но он стоит в очереди крафта персонажа, действие
@@ -2167,7 +2454,8 @@ export function createFactorioServer(botName, hooks) {
       const t = pending[0];
       if (walkedFor === t.i) { skipped.push({ n: t.i, item: t.item, x: t.x, y: t.y, why: 'не смог подойти на расстояние постройки' }); pending.shift(); continue; }
       walkedFor = t.i;
-      await approach(t.x, t.y, 8);
+      // Не дошёл — постройка пропустится на следующем круге; враги на пути — дальше не идём вовсе.
+      try { await approach(t.x, t.y, 8); } catch (e) { if (/враг/.test(e.message)) { stopped = e.message; break; } }
     }
     return { built, skipped, left, pending: pending.map(({ i, ...it }) => it), stopped: stopped || undefined };
   }
@@ -2242,14 +2530,15 @@ export function createFactorioServer(botName, hooks) {
 
     def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with). Труп персонажа (character-corpse, координаты даёт find) — что в нём лежит (items).', coords, (a) => run('inspect', a)),
 
-    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Если дойти не удалось — not_reached с причиной и distance_left: персонаж остановился в ближайшей к цели точке, до которой нашёл путь. Обход ограничен: если идти пришлось бы больше чем втрое дальше прямой (и больше 30 клеток), персонаж не идёт (или останавливается, как только это выяснилось) и отвечает not_reached «обход слишком длинный» — тогда иди через промежуточные точки или повтори с long_way=true. Трубы, как и для игрока, непроходимы (конвейеры проходимы): проход через линию труб — подземная труба.',
+    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Дальний переход (через всю базу) планируется целиком до первого шага, по открытой карте: промежуточные точки вручную не нужны. Если дойти не удалось — not_reached с причиной и distance_left; когда пути нет вовсе, персонаж остаётся на месте и говорит, докуда дойти можно и что мешает дальше (постройка или вода и её координаты). Если встал вплотную (до 4 клеток), а в саму точку прохода нет — это note, а не not_reached. Обход ограничен: если идти больше чем вчетверо дальше прямой (и больше 60 клеток), персонаж не идёт и отвечает not_reached «обход слишком длинный» с длиной пути (route_len) — тогда повтори с long_way=true или сделай проход. walked — сколько клеток пройдено, straight — сколько было по прямой. Враги: маршрут обходит в 30 клетках гнёзда и червей, которых видно (60 клеток от персонажа, радар), а если обойти нельзя или цель рядом с ними — not_reached «на пути враги»; если по дороге в 20 клетках появились кусаки — персонаж останавливается (not_reached «рядом появились враги», в enemies — сколько и где), следующий вызов уже идёт, чтобы можно было уйти. Так же ходят все инструменты, которые подходят сами (take_items, gather, place и другие). Трубы, как и для игрока, непроходимы (конвейеры проходимы): проход через линию труб — подземная труба. До трёх минут ходьбы на вызов.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio'),
-        long_way: z.boolean().default(false).describe('true — идти, даже если обход намного длиннее прямой (вокруг озера, длинной стены)') },
+        long_way: z.boolean().default(false).describe('true — идти, даже если обход намного длиннее прямой (вокруг озера, длинной стены); путь ищется шире'),
+        avoid_enemies: z.boolean().default(true).describe('false — не обходить гнёзда и не останавливаться из-за кусак (идёшь к ним нарочно)') },
       async (a) => {
         let target = a;
         if (a.player) target = await run('player_pos', { player: a.player });
         else if (a.x === undefined || a.y === undefined) throw new Error('нужны x и y либо player');
-        return walk(target.x, target.y, a.player ? 2.5 : 1.5, a.long_way);
+        return walk(target.x, target.y, a.player ? 2.5 : 1.5, a.long_way, a.avoid_enemies);
       }),
 
     def('mine', 'Добывать руками ресурс, дерево или камень в точке. Сам подходит. Примерно одна единица в секунду.',
@@ -2332,7 +2621,7 @@ export function createFactorioServer(botName, hooks) {
             if (r.already) already++; else placed++;
             left = r.left; last = r.pos;
           } catch (e) {
-            if (/в инвентаре нет|нет предмета|нельзя поставить на землю/.test(e.message)) { stopped = e.message.replace(/^Lua: /, ''); break; }
+            if (/в инвентаре нет|нет предмета|нельзя поставить на землю|враг/.test(e.message)) { stopped = e.message.replace(/^Lua: /, ''); break; }
             skipped.push({ x, y, why: e.message.replace(/^Lua: /, '') });
           }
           if (i === n - 1) break;
@@ -2767,9 +3056,9 @@ export function createFactorioServer(botName, hooks) {
   // План: те же инструменты подряд одним вызовом. Каждый шаг — обычный вызов со всеми его проверками и скоростью;
   // выигрыш только в том, что между шагами нет круга «ответ → следующий вызов».
   const NOT_IN_PLAN = new Set(['plan', 'feedback', 'feedback_status', 'read_chat']);
-  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом — главный способ работать быстро: каждый отдельный вызов стоит многих секунд раздумий, а шаги плана идут без пауз, поэтому всё, что известно заранее, собирай в один план (например gather с выбранными источниками → craft → insert_all). steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), вышло время шага; остальные шаги не выполняются (not_done). Шаг с on_fail=continue план не останавливает: он помечается ok=false, его номер попадает в failed_steps, план идёт дальше — ставь так шагам, от которых остальные не зависят (мир мог измениться: постройку снесли, забирать нечего). Шаг, сделавший часть работы (кончился предмет в insert_all, gather взял не всё, ghost_build не хватило предметов), — не сбой: ok=true, partial=true, номер в partial_steps, план идёт дальше; что сделано и чего не хватило — в result шага. Всегда останавливают план новая реплика, stop и сообщение в чате, обращённое к тебе (в нём твоё имя) либо со словом «стоп». Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
+  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом — главный способ работать быстро: каждый отдельный вызов стоит многих секунд раздумий, а шаги плана идут без пауз, поэтому всё, что известно заранее, собирай в один план (например gather с выбранными источниками → craft → insert_all). steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), вышло время шага; остальные шаги не выполняются (not_done). Шаг с on_fail=continue план не останавливает: он помечается ok=false, его номер попадает в failed_steps, план идёт дальше — ставь так шагам, от которых остальные не зависят (мир мог измениться: постройку снесли, забирать нечего). Шаг, сделавший часть работы (кончился предмет в insert_all, gather взял не всё, ghost_build не хватило предметов), — не сбой: ok=true, partial=true, номер в partial_steps, план идёт дальше; что сделано и чего не хватило — в result шага. Всегда останавливают план новая реплика, stop и сообщение в чате, обращённое к тебе (в нём твоё имя) либо со словом «стоп». Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 50 шагов и примерно пятнадцать минут на план: что не успело — в not_done, вызови план с оставшимися шагами.',
     { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы'),
-        on_fail: z.enum(['stop', 'continue']).default('stop').describe('что делать, если шаг не удался: stop — остановить план; continue — пометить шаг ok=false и идти дальше (для шагов, от которых остальные не зависят: осмотр, заправка, сбор по списку мест)') })).min(1).max(20),
+        on_fail: z.enum(['stop', 'continue']).default('stop').describe('что делать, если шаг не удался: stop — остановить план; continue — пометить шаг ok=false и идти дальше (для шагов, от которых остальные не зависят: осмотр, заправка, сбор по списку мест)') })).min(1).max(50),
       stop_on_chat: z.enum(['addressed', 'any', 'never']).default('addressed').describe('какие сообщения игрового чата останавливают план: addressed — только с твоим именем или словом «стоп»; any — любое новое; never — никакие') },
     async (a) => {
       const prepared = a.steps.map((s, i) => {
@@ -2789,7 +3078,7 @@ export function createFactorioServer(botName, hooks) {
       for (let i = 0; i < prepared.length; i++) {
         if (i > 0) {
           if (hooks.aborted()) why = 'прервано новой репликой';
-          else if (Date.now() - start > 240_000) why = 'вышло время на один план (около четырёх минут)';
+          else if (Date.now() - start > 900_000) why = 'вышло время на один план (около пятнадцати минут)';
           if (why) { stopped_at = i + 1; break; }
         }
         const { t, args } = prepared[i];
