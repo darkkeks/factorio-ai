@@ -259,7 +259,9 @@ export const API = {
   inspect: {
     kind: 'query',
     summary: 'Окно объекта: рецепт, состояние, содержимое по слотам, топливо, направление, жидкости, провода. Одна цель или список targets (до 200). ' +
-      'Объекта нет — обычный ответ {found: false}. Вне обзора — только вид и место по памяти карты (memory: true).',
+      'Объекта нет — обычный ответ {found: false}. Вне обзора — только вид и место по памяти карты (memory: true). ' +
+      'fluids — ёмкости жидкости по порядку окна: [{name, amount, capacity, temperature, segment?}]; пустая ёмкость видна, только если жидкость задана рецептом ' +
+      'или фильтром (amount: 0); у труб segment {name, amount, capacity} — вся связанная труба целиком.',
     params: { target: '{x, y, name?}', targets: 'или список целей' },
     result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo}, fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
     example: { target: { x: 10, y: 5 } },

@@ -36,6 +36,39 @@ test('inspect: окно объекта со слотами; пустое мес�
   ok(many.objects[0].found && many.objects[1].found === false, JSON.stringify(many));
 });
 
+test('inspect: жидкости у бака, трубы и НПЗ (fb-063)', async () => {
+  const p = await lua(`
+    local a = storage.agent.agents[A.n].entity
+    local s = a.surface
+    local o = s.find_non_colliding_position('oil-refinery', a.position, 40, 1, true)
+    local made = {}
+    local tank = s.create_entity{name = 'storage-tank', position = {o.x, o.y}, force = 'player'}
+    tank.insert_fluid{name = 'water', amount = 5000}
+    made[#made + 1] = tank
+    local pp = s.find_non_colliding_position('pipe', {o.x + 6, o.y}, 20, 1, true)
+    local pipe = s.create_entity{name = 'pipe', position = pp, force = 'player'}
+    pipe.insert_fluid{name = 'crude-oil', amount = 40}
+    made[#made + 1] = pipe
+    local rp = s.find_non_colliding_position('oil-refinery', {o.x, o.y + 10}, 40, 1, true)
+    local ref = s.create_entity{name = 'oil-refinery', position = rp, force = 'player'}
+    ref.set_recipe('basic-oil-processing')
+    ref.insert_fluid{name = 'crude-oil', amount = 70}
+    made[#made + 1] = ref
+    storage.test_fluids = made
+    return {tank = tank.position, pipe = pipe.position, ref = ref.position}`, { n: NAME });
+  try {
+    const r = await call(A, 'inspect', { targets: [p.tank, p.pipe, p.ref] });
+    const [tank, pipe, ref] = r.objects;
+    ok(tank.fluids && tank.fluids[0].name === 'water' && tank.fluids[0].amount === 5000 && tank.fluids[0].capacity === 25000, JSON.stringify(tank));
+    const pf = pipe.fluids && pipe.fluids[0];
+    ok(pf && pf.name === 'crude-oil' && (pf.amount === 40 || (pf.segment && pf.segment.amount === 40)), JSON.stringify(pipe));
+    const crude = ref.fluids && ref.fluids.find((f) => f.name === 'crude-oil');
+    ok(crude && crude.amount === 70 && crude.capacity > 0, JSON.stringify(ref));
+  } finally {
+    await lua(`for _, e in pairs(storage.test_fluids or {}) do if e.valid then e.destroy() end end storage.test_fluids = nil return true`);
+  }
+});
+
 test('туман войны: объект вне обзора — по памяти карты, без содержимого; построенное после снимка не видно; враги не показываются', async () => {
   // Сундук появляется, потом карта чанка обновляется (как после прохода радара) — он попадает «на карту».
   await lua(`

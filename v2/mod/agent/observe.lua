@@ -106,9 +106,27 @@ local function full(e, force)
   end
   local fluids = try(function()
     local out = {}
-    for i = 1, #e.fluidbox do
-      local f = e.fluidbox[i]
-      if f then out[#out + 1] = {name = f.name, amount = U.r2(f.amount), temperature = f.temperature and U.r2(f.temperature) or nil} end
+    -- Ёмкости жидкости по порядку окна объекта. Пустая ёмкость показывается, только если у неё задана жидкость
+    -- (рецепт, фильтр): name и amount = 0. У труб и баков segment — вся связанная труба, как в окне трубы.
+    for i = 1, math.min(e.fluids_count, 12) do
+      local f = e.get_fluid(i)
+      local cap = try(function() return U.r2(e.get_fluid_capacity(i)) end)
+      local row
+      if f then
+        row = {name = f.name, amount = U.r2(f.amount), temperature = f.temperature and U.r2(f.temperature) or nil, capacity = cap}
+      else
+        local flt = try(function() local p = e.get_fluid_filter(i) return p and p.name end)
+        if flt then row = {name = flt, amount = 0, capacity = cap} end
+      end
+      local seg = try(function() return e.get_fluid_segment_fluid(i) end)
+      if seg then
+        local scap = try(function() return U.r2(e.get_fluid_segment_capacity(i)) end)
+        if not row or scap ~= cap or U.r2(seg.amount) ~= row.amount then
+          row = row or {name = seg.name, amount = 0, capacity = cap}
+          row.segment = {name = seg.name, amount = U.r2(seg.amount), capacity = scap}
+        end
+      end
+      if row then out[#out + 1] = row end
     end
     return out
   end)
