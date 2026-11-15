@@ -1838,6 +1838,12 @@ const inBodyAction = new AsyncLocalStorage(); // шаги plan и вложенн
 /** Какие персонажи сейчас выполняют действие в этом процессе. */
 export const busyBots = () => [...busy.keys()];
 
+// Вызовы, которым нужно, чтобы игра шла, хотя тело они не занимают (ожидание, крафт).
+const NEEDS_TIME = new Set(['wait', 'craft']);
+let ticking = 0;
+/** Идёт ли сейчас хоть одно действие, ради которого игра не должна стоять на паузе. */
+export const gameNeeded = () => busy.size > 0 || ticking > 0;
+
 /** Остановить персонажей, которые идут, хотя их никто не ведёт (вызов оборвался, процесс перезапустили). */
 export async function stopOrphans() {
   return lua(`
@@ -2068,7 +2074,9 @@ export function createFactorioServer(botName, hooks) {
       await chatWaiting();
       let value;
       if (READ_ONLY.has(name) || inBodyAction.getStore()) {
-        value = await handler(args);
+        const timed = NEEDS_TIME.has(name);
+        if (timed) ticking++;
+        try { value = await handler(args); } finally { if (timed) ticking--; }
       } else {
         const cur = busy.get(botName);
         if (cur) {
