@@ -878,6 +878,68 @@ const BODY = {
     if not next(taken) then fail('забирать нечего') end
     return {taken=taken, from=t.name}`,
 
+  // Сбор материалов (gather). Источники — то, откуда игрок забирает готовое: сундуки, выходные слоты печей и сборочных
+  // автоматов, по желанию (A.belts) — клетки конвейеров. Входные слоты и топливо машин не трогаются. Видно в радиусе
+  // обзора (до 60 клеток). A.want — {предмет = сколько должно стать в инвентаре}.
+  gather_scan: `
+    local e = bot()
+    local have, need = {}, {}
+    for k, v in pairs(A.want) do
+      if not prototypes.item[k] then fail('нет предмета '..k..' (нужно внутреннее имя, например iron-plate)') end
+      have[k] = e.get_item_count(k)
+      if have[k] < v then need[k] = v - have[k] end
+    end
+    local types = {'container', 'logistic-container', 'furnace', 'assembling-machine'}
+    if A.belts then for k in pairs(BELT) do types[#types+1] = k end end
+    local out = {}
+    for _, c in pairs(e.surface.find_entities_filtered{position=e.position, radius=A.radius, force=e.force, type=types}) do
+      local has
+      if BELT[c.type] then has = belt_items(c)
+      elseif c.type == 'container' or c.type == 'logistic-container' then has = contents(c.get_inventory(defines.inventory.chest))
+      else pcall(function() has = contents(c.get_output_inventory()) end) end
+      local h, any = {}, false
+      for k in pairs(need) do if has and (has[k] or 0) > 0 then h[k] = has[k] any = true end end
+      if any then out[#out+1] = {x=c.position.x, y=c.position.y, name=c.name, d=dist(c.position, e.position), has=h} end
+    end
+    table.sort(out, function(a, b) return a.d < b.d end)
+    local list = {}
+    for i = 1, math.min(#out, 300) do out[i].d = nil list[i] = out[i] end
+    return {have=have, need=need, list=list, more=#out > 300}`,
+
+  // Забрать из одного источника в точке то, чего ещё не хватает (A.need — {предмет = сколько}).
+  gather_take: `
+    local e = bot()
+    local t = at(e, A.x, A.y)
+    reach(e, t, 10)
+    if t.force ~= e.force then fail('это не постройка твоей команды') end
+    local taken, full = {}, false
+    local function move(s, remove)
+      local left = A.need[s.name] or 0
+      if left < 1 then return end
+      local n = math.min(s.count, left)
+      if not e.can_insert{name=s.name, count=1, quality=s.quality} then full = true return end
+      n = e.insert{name=s.name, count=n, quality=s.quality}
+      if n < 1 then full = true return end
+      local got = remove{name=s.name, count=n, quality=s.quality}
+      if got < n then e.remove_item{name=s.name, count=n-got, quality=s.quality} end
+      if got > 0 then taken[s.name] = (taken[s.name] or 0) + got A.need[s.name] = left - got end
+    end
+    if BELT[t.type] then
+      for i = 1, t.get_max_transport_line_index() do
+        local line = t.get_transport_line(i)
+        for _, s in pairs(line.get_contents()) do move(s, line.remove_item) end
+      end
+    else
+      local v
+      if t.type == 'container' or t.type == 'logistic-container' then v = t.get_inventory(defines.inventory.chest)
+      elseif t.type == 'furnace' or t.type == 'assembling-machine' then v = t.get_output_inventory()
+      else fail('из '..t.name..' gather не берёт') end
+      if v then for _, s in pairs(v.get_contents()) do move(s, v.remove) end end
+    end
+    local have = {}
+    for k in pairs(A.need) do have[k] = e.get_item_count(k) end
+    return {taken=taken, full=full, have=have, from=t.name}`,
+
   set_recipe: `
     local e = bot()
     local t = at(e, A.x, A.y)
@@ -1547,6 +1609,8 @@ export function createFactorioServer(botName, hooks) {
   const def = (name, description, shape, handler) => tool(name, description, shape, async (args) => {
     const shown = JSON.stringify(args);
     hooks.activity?.();
+    const began = Date.now();
+    const took = () => Math.round((Date.now() - began) / 100) / 10;
     try {
       chatBase = null; chatNew = false; chatChecked = 0;
       await chatWaiting();
@@ -1555,11 +1619,13 @@ export function createFactorioServer(botName, hooks) {
         const messages = await takeChat().catch(() => []);
         if (messages.length) value.chat = messages;
       }
+      // Сколько секунд занял сам инструмент (ходьба, ожидание, сервер): остальное время между вызовами — раздумья модели.
+      if (value && typeof value === 'object' && !Array.isArray(value)) value.took_s = took();
       const result = JSON.stringify(value);
-      hooks.log(`🔧 ${botName} ${name}${shown === '{}' ? '' : ' ' + shown} → ${result.slice(0, 300)}`);
+      hooks.log(`🔧 ${botName} ${name}${shown === '{}' ? '' : ' ' + shown} [${took()} с] → ${result.slice(0, 300)}`);
       return { content: [{ type: 'text', text: result }] };
     } catch (e) {
-      hooks.log(`🔧 ${botName} ${name} ${shown} → ❌ ${e.message}`);
+      hooks.log(`🔧 ${botName} ${name} ${shown} [${took()} с] → ❌ ${e.message}`);
       return { content: [{ type: 'text', text: `Ошибка: ${e.message}` }], isError: true };
     }
   });
@@ -1621,7 +1687,7 @@ export function createFactorioServer(botName, hooks) {
         return { ...r, note: 'крафт ещё идёт' };
       }),
 
-    def('place', 'Поставить постройку из инвентаря в точку. Сам подходит. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to). Подземный конвейер: direction у входа и у выхода одинаковый — куда едут предметы; вход это или выход, задаёт underground, а в ответе видно, чем он встал (underground) и с каким концом соединился (paired_with).',
+    def('place', 'Поставить одну постройку из инвентаря в точку. Сам подходит (move_to перед этим не нужен). Несколько построек ставь не по одной, а пачкой: place_many, place_line, template_place. Для манипулятора в ответе видно, откуда он берёт (takes_from) и куда кладёт (puts_to). Подземный конвейер: direction у входа и у выхода одинаковый — куда едут предметы; вход это или выход, задаёт underground, а в ответе видно, чем он встал (underground) и с каким концом соединился (paired_with).',
       { item: z.string().describe('внутреннее имя предмета'), ...coords, direction: z.enum(DIRECTIONS).default('north').describe('куда смотрит постройка: конвейер (и подземный тоже) везёт в эту сторону; манипулятор с этой стороны берёт, а кладёт на противоположную'),
         underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера: input — вход под землю, output — выход из-под земли. По умолчанию как в игре: выход, если позади по ходу в пределах дальности стоит вход без пары, иначе вход') },
       async (a) => { await approach(a.x, a.y, 8); return run('place', a); }),
@@ -1885,9 +1951,57 @@ export function createFactorioServer(botName, hooks) {
       { ...coords, item: z.string(), count: z.number().int().min(1).default(5) },
       async (a) => { await approach(a.x, a.y, 8); return run('insert', a); }),
 
-    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Сам подходит.',
+    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Сам подходит. Набрать материалы из нескольких сундуков и машин одним вызовом — gather.',
       { ...coords, item: z.string().optional(), count: z.number().int().min(1).default(1000) },
       async (a) => { await approach(a.x, a.y, 8); return run('take', a); }),
+
+    def('gather', 'Собрать материалы одним вызовом вместо серии move_to + take_items: items — {предмет: сколько должно стать в инвентаре} (то, что уже есть, засчитывается). Персонаж сам обходит пешком источники своей команды в радиусе, каждый раз идёт к ближайшему из оставшихся и забирает только недостающее: из сундуков и из выходных слотов печей и сборочных автоматов (сырьё и топливо в машинах не трогает); с belts=true — ещё и с клеток конвейеров (помни, что лента кого-то кормит). В ответе got — что взял, from — откуда (первые восемь источников), have — сколько теперь в инвентаре, missing — чего в радиусе не нашлось, complete — набрано всё. Около трёх минут на вызов; прервалось — повтори тот же вызов.',
+      { items: z.record(z.string(), z.number().int().min(1).max(100000)).describe('внутреннее имя предмета → сколько должно стать в инвентаре, например {"iron-plate": 640, "coal": 50}'),
+        radius: z.number().min(1).max(60).default(30).describe('радиус поиска источников от персонажа'),
+        belts: z.boolean().default(false).describe('брать ли ещё и с конвейеров') },
+      async (a) => {
+        if (!Object.keys(a.items).length) throw new Error('items пуст: укажи хотя бы один предмет');
+        const scan = await run('gather_scan', { want: a.items, radius: a.radius, belts: a.belts });
+        const need = scan.need && !Array.isArray(scan.need) ? { ...scan.need } : {};
+        let have = scan.have && !Array.isArray(scan.have) ? scan.have : {};
+        let rest = Array.isArray(scan.list) ? scan.list : [];
+        const found = rest.length;
+        const open = () => Object.keys(need).filter((k) => need[k] > 0);
+        const got = {}, skipped = [], from = [];
+        let me = await run('pos');
+        let sources = 0, stopped;
+        const deadline = Date.now() + 180_000;
+        while (open().length) {
+          // Каждый раз идём к ближайшему источнику, где есть что-то из недостающего.
+          const want = open();
+          rest = rest.filter((s) => want.some((k) => s.has[k] > 0));
+          if (!rest.length) break;
+          rest.sort((p, q) => Math.hypot(p.x - me.x, p.y - me.y) - Math.hypot(q.x - me.x, q.y - me.y));
+          const c = rest.shift();
+          try {
+            await approach(c.x, c.y, 8);
+            const r = await run('gather_take', { x: c.x, y: c.y, need });
+            const taken = r.taken && !Array.isArray(r.taken) ? r.taken : {};
+            for (const [k, v] of Object.entries(taken)) { got[k] = (got[k] || 0) + v; need[k] -= v; }
+            if (r.have && !Array.isArray(r.have)) have = { ...have, ...r.have };
+            if (Object.keys(taken).length) { sources++; if (from.length < 8) from.push({ name: c.name, x: c.x, y: c.y, taken }); }
+            if (r.full) { stopped = 'в инвентаре нет места'; break; }
+          } catch (e) {
+            skipped.push({ x: c.x, y: c.y, name: c.name, why: e.message.replace(/^Lua: /, '') });
+          }
+          me = c;
+          if (!open().length) break;
+          stopped = await interrupted();
+          if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов: повтори его';
+          if (stopped) break;
+          await sleep(150);
+        }
+        const missing = Object.fromEntries(open().map((k) => [k, need[k]]));
+        const complete = !open().length;
+        return { got, have, missing: complete ? undefined : missing, complete, sources_found: found, sources_visited: sources, from: from.length ? from : undefined,
+          skipped: skipped.length ? skipped.slice(0, 10) : undefined, skipped_count: skipped.length || undefined, stopped: stopped || undefined,
+          note: !complete && !stopped ? (scan.more ? 'обошёл не всё: повтори вызов' : `в радиусе ${a.radius} больше нет: увеличь radius, подойди к другому складу${a.belts ? '' : ', разреши ленты (belts=true)'} или подожди, пока произведётся`) : undefined };
+      }),
 
     def('set_recipe', 'Задать рецепт сборочному автомату в точке.', { ...coords, recipe: z.string() },
       async (a) => { await approach(a.x, a.y, 8); return run('set_recipe', a); }),
@@ -1965,7 +2079,7 @@ export function createFactorioServer(botName, hooks) {
   // План: те же инструменты подряд одним вызовом. Каждый шаг — обычный вызов со всеми его проверками и скоростью;
   // выигрыш только в том, что между шагами нет круга «ответ → следующий вызов».
   const NOT_IN_PLAN = new Set(['plan', 'feedback', 'feedback_status', 'read_chat']);
-  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом: steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана в чат пришло сообщение, обращённое к тебе (в нём твоё имя) либо со словом «стоп»; остальные шаги не выполняются (not_done). Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
+  tools.push(def('plan', 'Выполнить подряд несколько обычных действий одним вызовом — главный способ работать быстро: каждый отдельный вызов стоит многих секунд раздумий, а шаги плана идут без пауз, поэтому всё, что известно заранее, собирай в один план (например gather → craft → insert_all). steps — список шагов {tool, args}, как отдельные вызовы этих инструментов (например move_to → take_items → craft → move_to → place). Останавливается на первом шаге, который не удался: ошибка, не дошёл (not_reached), действие свернулось раньше времени (stopped, interrupted) или во время плана в чат пришло сообщение, обращённое к тебе (в нём твоё имя) либо со словом «стоп»; остальные шаги не выполняются (not_done). Прочие сообщения чата план не останавливают и долгие шаги (mine, wait, craft) не сворачивают — они приходят в поле chat шагов; это настраивает stop_on_chat. В ответе отчёт по каждому шагу. Аргументы всех шагов проверяются до начала. До 20 шагов и примерно четыре минуты на план: что не успело — в not_done, вызови план с оставшимися шагами.',
     { steps: z.array(z.object({ tool: z.string().describe('имя инструмента, например move_to'), args: z.record(z.string(), z.any()).default({}).describe('его аргументы') })).min(1).max(20),
       stop_on_chat: z.enum(['addressed', 'any', 'never']).default('addressed').describe('какие сообщения игрового чата останавливают план: addressed — только с твоим именем или словом «стоп»; any — любое новое; never — никакие') },
     async (a) => {
