@@ -10,3 +10,6 @@ feedback/status.json
 feedback/verdict-*.json
 feedback/rejected-*.diff
 feedback/session-*.txt
+v2/server/config.json
+v2/server/tokens.json
+v2/server/log/

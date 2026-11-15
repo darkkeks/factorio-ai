@@ -1,0 +1,121 @@
+-- Реестр операций. Операция: {fn(A, params, req) → результат, agent = нужен персонаж, write = меняет мир
+-- (ответ запоминается по идентификатору запроса), admin = только администратору}.
+local U = require('agent.util')
+local J = require('agent.journal')
+local Q = require('agent.queue')
+local S = require('agent.state')
+
+local O = {list = {}}
+
+function O.register(name, def) O.list[name] = def end
+
+O.register('ping', {fn = function()
+  local ops, actions = {}, {}
+  for name, def in pairs(O.list) do ops[#ops + 1] = name end
+  for name, def in pairs(Q.actions) do actions[#actions + 1] = {name = name, instant = def.instant or false} end
+  table.sort(ops)
+  table.sort(actions, function(a, b) return a.name < b.name end)
+  return {mod = 'agent', version = S.VERSION, api = 2, tick = game.tick, paused = game.tick_paused, ops = ops, actions = actions}
+end})
+
+O.register('journal', {admin = true, fn = function(_, p)
+  local items, seq, first = J.read(p.since or 0, math.min(p.limit or 500, 2000))
+  return {events = U.list(items), seq = seq, first = first}
+end})
+
+-- Занят ли кто-нибудь: очередь действий или очередь ручного крафта (для правила паузы).
+local function busy_count()
+  local st, n = storage.agent, 0
+  for name in pairs(st.active) do n = n + 1 end
+  for name in pairs(st.crafting) do if not st.active[name] then n = n + 1 end end
+  return n
+end
+O.busy_count = busy_count
+
+O.register('busy', {fn = function() return {busy = busy_count(), paused = game.tick_paused} end})
+
+-- Правило паузы одним неделимым шагом: игра идёт, пока в ней есть люди, люди есть в голосовом канале
+-- или у любого персонажа непустая очередь. Вызывает сторож паузы; voice — есть ли люди в голосовом канале.
+O.register('pause_if_idle', {admin = true, fn = function(_, p)
+  local ignore = {}
+  for _, n in pairs(p.ignore or {}) do ignore[n] = true end
+  local humans = 0
+  for _, pl in pairs(game.connected_players) do if not ignore[pl.name] then humans = humans + 1 end end
+  local busy = busy_count()
+  local want = humans == 0 and not p.voice and busy == 0
+  local changed = game.tick_paused ~= want
+  game.tick_paused = want
+  return {paused = want, changed = changed, humans = humans, busy = busy}
+end})
+
+O.register('agents', {fn = function()
+  local out = {}
+  for name, A in pairs(storage.agent.agents) do
+    local e = A.entity
+    local r = {name = name, alive = (e and e.valid) or false, queue = #A.queue}
+    if e and e.valid then
+      r.position = U.pos(e.position)
+      r.health = U.r2(e.health)
+      r.action = A.queue[1] and A.queue[1].type or nil
+    end
+    out[#out + 1] = r
+  end
+  table.sort(out, function(a, b) return a.name < b.name end)
+  return {agents = U.list(out)}
+end})
+
+O.register('status', {agent = true, fn = function(A)
+  local e = A.entity
+  local main = e.get_main_inventory()
+  local crafting = {}
+  for i, c in pairs(e.crafting_queue or {}) do crafting[i] = {recipe = c.recipe, count = c.count} end
+  return {
+    name = A.name,
+    position = U.pos(e.position),
+    surface = e.surface.name,
+    health = U.r2(e.health),
+    max_health = e.max_health,
+    walking = e.walking_state.walking,
+    mining = e.mining_state.mining,
+    inventory = U.contents(main),
+    free_slots = main.count_empty_stacks(),
+    guns = U.contents(e.get_inventory(defines.inventory.character_guns)),
+    ammo = U.contents(e.get_inventory(defines.inventory.character_ammo)),
+    armor = U.contents(e.get_inventory(defines.inventory.character_armor)),
+    crafting = U.list(crafting),
+    queue = U.list(Q.view(A)),
+    reach = {build = e.build_distance, interact = e.reach_distance, resource = e.resource_reach_distance},
+    tick = game.tick,
+    paused = game.tick_paused,
+    deaths = A.deaths,
+  }
+end})
+
+O.register('queue', {agent = true, fn = function(A)
+  return {queue = U.list(Q.view(A))}
+end})
+
+-- Поставить действия в очередь. Игру на паузе будит только непустая очередь.
+O.register('act', {agent = true, write = true,
+  compact = function(res) return {actions = res.actions, finished = U.EMPTY, replayed = true} end,
+  fn = function(A, p)
+  if type(p.actions) ~= 'table' or #p.actions == 0 then U.fail('bad_request', 'actions: непустой список действий') end
+  if p.replace then Q.clear(A, 'очередь заменена новым запросом') end
+  local queued, finished = Q.enqueue(A, p.actions)
+  if A.queue[1] and game.tick_paused then game.tick_paused = false end
+  return {actions = queued, finished = U.list(finished), running = A.queue[1] and A.queue[1].id or nil, queue_length = #A.queue}
+end})
+
+O.register('cancel', {agent = true, write = true, fn = function(A, p)
+  local id = Q.cancel(A, p.action_id)
+  return {cancelled = id, queue_length = #A.queue}
+end})
+
+O.register('clear', {agent = true, write = true, fn = function(A)
+  return {cancelled = Q.clear(A)}
+end})
+
+-- Бот жив: сервер на хосте шлёт это, когда запросы бота до мода не доходят (чтение буфера событий).
+O.register('touch', {agent = true, fn = function() return {} end})
+
+return O
