@@ -51,21 +51,22 @@ function runClaude(prompt) {
   });
 }
 
-// Изменённые и новые файлы рабочей папки (новые — только внутри v2/, остальное неотслеживаемое обработчика не касается).
+// Правки обработчика в рабочей папке: изменённые и новые файлы только там, где сессии разрешено править.
+// В этой же папке работают люди и другие сессии: их незакоммиченные файлы (src/ и прочее) обработчик не считает
+// своими, не отменяет и не коммитит. Сессия посторонние файлы изменить не может — у неё нет на это прав.
 function changes() {
   const out = git('status', '--porcelain', '--untracked-files=all').split('\n').filter(Boolean);
-  return out.map((l) => ({ code: l.slice(0, 2), file: l.slice(3).replace(/^"|"$/g, '') }))
-    .filter((c) => c.code !== '??' || c.file.startsWith('v2/'))
-    .map((c) => c.file);
+  return out.map((l) => l.slice(3).replace(/^"|"$/g, '').split(' -> ').pop()).filter((f) => any(ALLOWED, f));
 }
 
 function revert(files) {
   const saved = `feedback/rejected-${Date.now()}.diff`;
   git('add', '-N', '--', ...files); // чтобы новые файлы попали в diff
-  fs.writeFileSync(path.join(ROOT, saved), git('diff'));
-  git('reset', '-q');
-  git('checkout', '--', '.');
-  for (const f of files) if (!git('ls-files', '--', f).trim()) fs.rmSync(path.join(ROOT, f), { force: true });
+  fs.writeFileSync(path.join(ROOT, saved), git('diff', '--', ...files));
+  git('reset', '-q', '--', ...files);
+  const tracked = files.filter((f) => git('ls-files', '--', f).trim());
+  if (tracked.length) git('checkout', '--', ...tracked);
+  for (const f of files) if (!tracked.includes(f)) fs.rmSync(path.join(ROOT, f), { force: true });
   return saved;
 }
 
@@ -73,7 +74,7 @@ function revert(files) {
 async function handle(queue) {
   const all = readItems();
   log(`в очереди ${queue.length}: ${queue.map((i) => i.id + (i.priority ? '!' : '')).join(' ')}`);
-  if (changes().length) return log('в рабочей папке незакоммиченные правки — жду, пока их закоммитят');
+  if (changes().length) return log(`незакоммиченные правки в ${changes().join(', ')} — жду, пока их закоммитят`);
 
   const rules = fs.readFileSync(path.join(ROOT, 'feedback', 'WORKER_PROMPT.md'), 'utf8');
   const resolved = all.filter((i) => ['done', 'rejected', 'discussion'].includes(i.status)).slice(-25)
@@ -101,8 +102,6 @@ async function handle(queue) {
   let needsRelease = false;
   if (!verdicts.length) problem = `сессия не оставила вердиктов (код завершения ${code})`;
   if (changed.length) {
-    const foreign = changed.filter((f) => !any(ALLOWED, f));
-    if (!problem && foreign.length) problem = `изменены посторонние файлы: ${foreign.join(', ')}`;
     if (!problem && !verdicts.some((v) => v.status === 'done')) problem = 'код изменён, но ни одна заявка не отмечена выполненной';
     if (!problem && changed.some((f) => any(NEEDS_VERIFY, f))) {
       // Независимая полная проверка на тестовом стенде: свежая копия карты, все наборы.
@@ -118,7 +117,8 @@ async function handle(queue) {
     } else {
       const done = verdicts.filter((v) => v.status === 'done');
       git('add', '--', ...changed);
-      git('commit', '-q', '-m', `feedback ${done.map((v) => v.id).join(', ')}: ${done[0].note.split('\n')[0].slice(0, 90)}\n\n${done.map((v) => `${v.id}: ${v.note}`).join('\n\n')}\n\nОбработано автоматически (src/feedback-worker.mjs).`);
+      // Коммит только своих файлов: чужое, даже добавленное в индекс, в него не попадает.
+      git('commit', '-q', '--only', '-m', `feedback ${done.map((v) => v.id).join(', ')}: ${done[0].note.split('\n')[0].slice(0, 90)}\n\n${done.map((v) => `${v.id}: ${v.note}`).join('\n\n')}\n\nОбработано автоматически (src/feedback-worker.mjs).`, '--', ...changed);
       commit = git('rev-parse', 'HEAD').trim();
       needsRelease = changed.some((f) => any(NEEDS_RELEASE, f));
       log(`закоммичено ${commit.slice(0, 10)}: ${changed.join(', ')}${needsRelease ? ' — ждёт выпуска' : ''}`);
