@@ -1370,6 +1370,204 @@ const BODY = {
     if A.map then r.map = {rows=rows, x0=cx0*32, y0=cy0*32} end
     return r`,
 
+  // Карта области символами, клетка — символ: то, что игрок видит на экране и на карте. Точно (вид постройки, направление
+  // ленты) — только там, где видно вживую: в 60 клетках от персонажа и в чанках под радаром. На остальной открытой карте —
+  // как на карте в игре: вода, руда, деревья, камни, скалы и «какая-то постройка» (#); врагов там не показываем.
+  // A.x1, A.y1 — клетка северо-западного угла, A.x2, A.y2 — за юго-восточным (не включая).
+  area_map: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    local W, H = A.x2 - A.x1, A.y2 - A.y1
+    local chart, vis = {}, {}
+    local function charted(x, y)
+      local cx, cy = math.floor(x/32), math.floor(y/32)
+      local k = cx..','..cy
+      if chart[k] == nil then chart[k] = f.is_chunk_charted(s, {cx, cy}) end
+      return chart[k]
+    end
+    local function live(x, y)
+      if dist({x=x+0.5, y=y+0.5}, e.position) <= 60 then return true end
+      local cx, cy = math.floor(x/32), math.floor(y/32)
+      local k = cx..','..cy
+      if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {cx, cy}) end
+      return vis[k]
+    end
+    -- В клетке остаётся самое важное: постройка > призрак > дерево, камень, скала > вода > руда.
+    local sym, rank = {}, {}
+    local function put(x, y, ch, r)
+      if x < A.x1 or x >= A.x2 or y < A.y1 or y >= A.y2 then return end
+      local k = (y - A.y1)*W + (x - A.x1)
+      if (rank[k] or 0) < r then rank[k] = r sym[k] = ch end
+    end
+    for _, t in pairs(s.find_tiles_filtered{area={{A.x1, A.y1}, {A.x2, A.y2}}, collision_mask='water_tile'}) do put(t.position.x, t.position.y, '~', 2) end
+    local ORE = {['iron-ore']='i', ['copper-ore']='c', coal='k', stone='s', ['uranium-ore']='u', ['crude-oil']='o'}
+    local ARROW = {north='^', east='>', south='v', west='<'}
+    local IGNORE = {unit=true, ['tile-ghost']=true, ['unit-spawner']=false}
+    local ores, builds, found = {}, {}, {}
+    for _, c in pairs(s.find_entities_filtered{area={{A.x1, A.y1}, {A.x2, A.y2}}}) do
+      if not SKIP[c.type] and not IGNORE[c.type] then
+        local kind
+        if c.type == 'resource' then kind = 'ore' ores[c.name] = true
+        elseif c.type == 'tree' then kind = '*'
+        elseif c.type == 'cliff' then kind = '%'
+        elseif c.type == 'entity-ghost' then if c.force == f then kind = '+' end
+        elseif c.force.name == 'enemy' then kind = '!'
+        elseif c.type == 'simple-entity' then kind = '@'
+        elseif c.prototype.selectable_in_game and next(c.prototype.collision_mask.layers) ~= nil then kind = 'b' builds[c.name] = true end
+        if kind then found[#found+1] = {c=c, kind=kind} end
+      end
+    end
+    -- Буквы: руда — строчные, постройки — заглавные (по первой букве имени, если свободна).
+    local function letters(names, fixed, pool)
+      local list, map, used = {}, {}, {}
+      for n in pairs(names) do list[#list+1] = n end
+      table.sort(list)
+      for _, n in ipairs(list) do if fixed[n] and not used[fixed[n]] then map[n] = fixed[n] used[fixed[n]] = true end end
+      for _, n in ipairs(list) do
+        if not map[n] then
+          local first = pool:find(n:sub(1, 1):upper(), 1, true) or pool:find(n:sub(1, 1):lower(), 1, true)
+          local ch = first and pool:sub(first, first)
+          if not ch or used[ch] then ch = nil for i = 1, #pool do local q = pool:sub(i, i) if not used[q] then ch = q break end end end
+          map[n] = ch or '#'
+          used[map[n]] = true
+        end
+      end
+      return map
+    end
+    local ore_sym = letters(ores, ORE, 'abdefghjlmnpqrtwxyz')
+    local b_sym = letters(builds, {pipe='='}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    local seen, details, counts = {}, {}, {}
+    for _, r in ipairs(found) do
+      local c, ch, rk = r.c, r.kind, 3
+      local bb = c.bounding_box
+      local ax, ay, bx, by = math.floor(bb.left_top.x+0.02), math.floor(bb.left_top.y+0.02), math.floor(bb.right_bottom.x-0.02), math.floor(bb.right_bottom.y-0.02)
+      local lv = live(math.floor(c.position.x), math.floor(c.position.y))
+      if ch == 'ore' then ch, rk = ore_sym[c.name], 1 seen[ch] = 'руда '..c.name
+      elseif ch == '+' then rk = 4
+      elseif ch == '!' then rk = lv and 5 or 0
+      elseif ch == 'b' then
+        rk = 5
+        if not lv then ch = '#'
+        elseif c.type == 'transport-belt' then ch = ARROW[dirname(c.direction)] or '#'
+        else
+          ch = b_sym[c.name] seen[ch] = c.name
+          counts[c.name] = (counts[c.name] or 0) + 1
+          if A.details and c.name ~= 'pipe' and #details < 200 then
+            local d = {name=c.name, x=c.position.x, y=c.position.y, direction=c.supports_direction and dirname(c.direction) or nil}
+            if c.type == 'underground-belt' then d.underground = c.belt_to_ground_type end
+            pcall(function() local rc = c.get_recipe() if rc then d.recipe = rc.name end end)
+            details[#details+1] = d
+          end
+        end
+      end
+      if rk > 0 then
+        seen[ch] = seen[ch] or true
+        for tx = ax, bx do for ty = ay, by do put(tx, ty, ch, rk) end end
+      end
+    end
+    local rows, free, unknown = {}, 0, 0
+    for y = 0, H-1 do
+      local row = {}
+      for x = 0, W-1 do
+        local ch = sym[y*W + x]
+        if not charted(A.x1+x, A.y1+y) then ch = '?' unknown = unknown + 1
+        elseif not ch then ch = '.' free = free + 1 end
+        row[x+1] = ch
+      end
+      rows[y+1] = table.concat(row)
+    end
+    local named = {}
+    for ch, v in pairs(seen) do if v ~= true then named[#named+1] = {s=ch, name=v} end end
+    table.sort(named, function(a, b) return a.s < b.s end)
+    local coarse = false
+    for _, c in pairs({{A.x1, A.y1}, {A.x2-1, A.y1}, {A.x1, A.y2-1}, {A.x2-1, A.y2-1}}) do if not live(c[1], c[2]) then coarse = true end end
+    return {x0=A.x1, y0=A.y1, w=W, h=H, rows=rows, named=named, symbols=seen, free=free, unexplored=unknown, coarse=coarse, buildings=counts, details=A.details and details or nil}`,
+
+  // Где лежит предмет: сундуки, машины (все их слоты; in_output — сколько из этого в выходном), клетки конвейеров.
+  // Игрок видит это, наведя мышь: рядом с собой и там, где карта показывается вживую (радар); ленты — только в 60 клетках.
+  where_items: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    if not prototypes.item[A.item] then fail('нет предмета '..A.item..' (нужно внутреннее имя, например iron-plate)') end
+    local vis = {}
+    local function visible(p)
+      if dist(p, e.position) <= 60 then return true end
+      local cx, cy = math.floor(p.x/32), math.floor(p.y/32)
+      local k = cx..','..cy
+      if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {cx, cy}) end
+      return vis[k]
+    end
+    local BOX = {container=true, ['logistic-container']=true, ['cargo-wagon']=true, car=true}
+    local stores, hidden, total = {}, 0, 0
+    for _, c in pairs(s.find_entities_filtered{position=e.position, radius=A.radius, force=f,
+      type={'container', 'logistic-container', 'cargo-wagon', 'car', 'furnace', 'assembling-machine', 'lab', 'boiler', 'mining-drill', 'reactor', 'rocket-silo', 'ammo-turret'}}) do
+      if not visible(c.position) then hidden = hidden + 1
+      else
+        local n, out = 0, nil
+        pcall(function() for i = 1, c.get_max_inventory_index() do local v = c.get_inventory(i) if v then n = n + v.get_item_count(A.item) end end end)
+        if n > 0 then
+          if not BOX[c.type] then out = 0 pcall(function() local v = c.get_output_inventory() if v then out = v.get_item_count(A.item) end end) end
+          total = total + n
+          stores[#stores+1] = {name=c.name, x=c.position.x, y=c.position.y, d=dist(c.position, e.position), count=n, in_output=out}
+        end
+      end
+    end
+    table.sort(stores, function(a, b) return a.d < b.d end)
+    local list = {}
+    for i = 1, math.min(#stores, A.limit) do local r = stores[i] r.dist = r1(r.d) r.d = nil list[i] = r end
+    local r = {item=A.item, have=e.get_item_count(A.item), radius=A.radius, places=#stores, total=total, list=list}
+    if hidden > 0 then r.not_visible = hidden end
+    if A.belts then
+      local cells, on, bl = {}, 0, {}
+      for _, c in pairs(s.find_entities_filtered{position=e.position, radius=math.min(A.radius, 60), force=f, type={'transport-belt', 'underground-belt', 'splitter'}}) do
+        local n = belt_items(c)[A.item]
+        if n then on = on + n cells[#cells+1] = {x=c.position.x, y=c.position.y, d=dist(c.position, e.position), count=n} end
+      end
+      table.sort(cells, function(a, b) return a.d < b.d end)
+      for i = 1, math.min(#cells, 8) do local c = cells[i] c.dist = r1(c.d) c.d = nil bl[i] = c end
+      r.belts = {cells=#cells, total=on, nearest=bl}
+    end
+    return r`,
+
+  // Статистика производства команды, как окно производства в игре (P): предметы и жидкости, произведено и потреблено
+  // за окно A.window (имя из defines.flow_precision_index), в пересчёте на минуту, и всего за игру.
+  production: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    local idx = defines.flow_precision_index[A.window]
+    local want
+    if A.items then
+      want = {}
+      for _, n in pairs(A.items) do
+        if not prototypes.item[n] and not prototypes.fluid[n] then fail('нет предмета или жидкости '..n..' (нужно внутреннее имя, например iron-plate)') end
+        want[n] = true
+      end
+    end
+    local function stat(st, exists)
+      local made, used = st.input_counts, st.output_counts
+      local names = {}
+      if want then for n in pairs(want) do if exists[n] then names[n] = true end end
+      else for n in pairs(made) do names[n] = true end for n in pairs(used) do names[n] = true end end
+      local list = {}
+      for n in pairs(names) do
+        local p = st.get_flow_count{name=n, category='input', precision_index=idx, count=true}
+        local c = st.get_flow_count{name=n, category='output', precision_index=idx, count=true}
+        if want or p > 0 or c > 0 then
+          list[#list+1] = {name=n, produced_per_min=r1(p/A.minutes), consumed_per_min=r1(c/A.minutes),
+            produced_total=math.floor(made[n] or 0), consumed_total=math.floor(used[n] or 0)}
+        end
+      end
+      table.sort(list, function(a, b) if a.produced_per_min ~= b.produced_per_min then return a.produced_per_min > b.produced_per_min end
+        if a.consumed_per_min ~= b.consumed_per_min then return a.consumed_per_min > b.consumed_per_min end return a.name < b.name end)
+      local out = {}
+      for i = 1, math.min(#list, A.limit) do out[i] = list[i] end
+      return out, #list
+    end
+    local r = {minutes=A.minutes}
+    r.items, r.items_count = stat(f.get_item_production_statistics(s), prototypes.item)
+    r.fluids, r.fluids_count = stat(f.get_fluid_production_statistics(s), prototypes.fluid)
+    return r`,
+
   recipe: `
     local f = bot().force
     local function info(rc)
@@ -2046,6 +2244,55 @@ export function createFactorioServer(botName, hooks) {
         if (r.map) r.map.legend = 'символ — чанк 32×32; первая строка — y от y0, первый символ — x от x0, дальше на восток и на юг. «.» чисто; 1–9 загрязнение (1 — от 1, каждая ступень вдвое больше, 9 — от 256); N — чанк с видимым гнездом; ? — карта не открыта';
         if (r.chunks_not_visible) r.note = 'гнёзда и кусаки показаны только там, где карту видно вживую; в остальных чанках они могут быть — подойди ближе или поставь радар';
         return r;
+      }),
+
+    def('area_map', 'Карта области одним вызовом вместо десятков inspect: прямоугольник (x, y)–(x2, y2) до 64×64 клеток, символ — клетка. rows[j][i] — клетка с x = x0+i, y = y0+j (её центр — +0.5), строки идут с севера на юг. «.» — пусто, можно строить; «~» вода; «*» дерево; «@» камень или обломки; «%» скала; строчные буквы — руда (на руде строить можно); «^ > v <» — конвейер, везёт в эту сторону; «=» труба; заглавные буквы — постройки (большая занимает несколько клеток); «+» призрак постройки (ghost_place); «!» вражеская постройка; «#» какая-то постройка (вид отсюда не видно); «?» карта не открыта. Какие буквы что значат в этой области — в legend, сколько каких построек — buildings. С details=true — ещё и список построек (кроме лент и труб) с точным центром, направлением, рецептом, входом/выходом подземного конвейера (до 200). Вид построек и направление лент видно в 60 клетках от персонажа и под радаром; на остальной открытой карте — только вода, руда, деревья, камни и «#» (тогда в ответе note). Идти никуда не нужно.',
+      { ...coords, x2: z.number().describe('x противоположного угла'), y2: z.number().describe('y противоположного угла'),
+        details: z.boolean().default(false).describe('приложить список построек с направлением и рецептом') },
+      async (a) => {
+        const sel = { x1: Math.floor(Math.min(a.x, a.x2)), y1: Math.floor(Math.min(a.y, a.y2)), x2: Math.floor(Math.max(a.x, a.x2)) + 1, y2: Math.floor(Math.max(a.y, a.y2)) + 1 };
+        if (sel.x2 - sel.x1 > 64 || sel.y2 - sel.y1 > 64) throw new Error('область больше 64×64 клеток: раздели её на части');
+        const r = await run('area_map', { ...sel, details: a.details });
+        const FIXED = { '.': 'пусто', '~': 'вода', '*': 'дерево', '@': 'камень или обломки', '%': 'скала', '+': 'призрак постройки', '!': 'вражеская постройка',
+          '#': 'постройка, вид не виден', '?': 'карта не открыта', '^': 'конвейер на север', '>': 'конвейер на восток', v: 'конвейер на юг', '<': 'конвейер на запад' };
+        const legend = {};
+        const rows = Array.isArray(r.rows) ? r.rows : [];
+        const text = rows.join('');
+        for (const [ch, name] of Object.entries(FIXED)) if (text.includes(ch)) legend[ch] = name;
+        for (const n of Array.isArray(r.named) ? r.named : []) legend[n.s] = n.name;
+        return { x0: r.x0, y0: r.y0, w: r.w, h: r.h, rows, legend, free: r.free, unexplored: r.unexplored || undefined,
+          buildings: r.buildings && !Array.isArray(r.buildings) ? r.buildings : undefined,
+          details: a.details ? (Array.isArray(r.details) ? r.details : []) : undefined,
+          note: r.coarse ? 'часть области дальше 60 клеток от персонажа и не под радаром: там постройки показаны как «#», без вида и направления, а враги не показаны — подойди ближе за точной картой' : undefined };
+      }),
+
+    def('where_items', 'Где лежит предмет: ближайшие сундуки, печи, сборочные автоматы, лаборатории, буры, вагоны, в которых он есть, с количеством, от ближних к дальним — чтобы потом собрать одним plan из take_items или вызовом gather. count — сколько всего в объекте (во всех слотах), in_output — сколько из этого в выходном слоте машины (остальное — её сырьё или топливо: забирая, остановишь её). belts — сколько лежит на конвейерах в 60 клетках и ближайшие клетки лент с ним. have — сколько уже у тебя. Видно в 60 клетках от персонажа и там, где карта показывается вживую (радар, игроки); сколько объектов в радиусе осталось вне видимости — not_visible. Идти никуда не нужно.',
+      { item: z.string().describe('внутреннее имя предмета, например iron-plate'),
+        radius: z.number().min(1).max(300).default(60).describe('радиус поиска от персонажа'),
+        limit: z.number().int().min(1).max(50).default(15).describe('сколько ближайших мест показать'),
+        belts: z.boolean().default(true).describe('смотреть ли конвейеры') },
+      async (a) => {
+        const r = await run('where_items', a);
+        if (!Array.isArray(r.list)) r.list = [];
+        if (r.belts && !Array.isArray(r.belts.nearest)) r.belts.nearest = [];
+        if (r.places > r.list.length) r.note = `показаны ближайшие ${r.list.length} из ${r.places}: остальные — с большим limit`;
+        return r;
+      }),
+
+    def('production', 'Статистика производства команды, как окно производства в игре: сколько каждого предмета и жидкости произведено и потреблено в минуту (среднее за последние minutes минут) и всего за игру — чтобы искать узкое место по цифрам: сколько колб в минуту, хватает ли схем, плит. Потребление выше производства — предмет проедается из запасов. Без items — самые производимые (limit штук); с items — только названные предметы и жидкости (нулевые тоже). «Произведено» — всё, что вышло из машин, буров и ручного крафта; «потреблено» — ушло в рецепты, лаборатории, топки и постройку.',
+      { items: z.array(z.string()).min(1).max(60).optional().describe('внутренние имена предметов и жидкостей, например ["automation-science-pack", "iron-plate", "petroleum-gas"]'),
+        minutes: z.number().default(10).describe('окно усреднения: 1, 10 или 60 минут'),
+        limit: z.number().int().min(1).max(100).default(40).describe('сколько строк показать без items') },
+      async (a) => {
+        const window = { 1: 'one_minute', 10: 'ten_minutes', 60: 'one_hour' }[a.minutes];
+        if (!window) throw new Error('minutes — 1, 10 или 60');
+        const r = await run('production', { items: a.items, minutes: a.minutes, window, limit: a.items ? 200 : a.limit });
+        const out = { minutes: r.minutes };
+        for (const k of ['items', 'fluids']) {
+          out[k] = Array.isArray(r[k]) ? r[k] : [];
+          if (r[`${k}_count`] > out[k].length) out[`${k}_not_shown`] = r[`${k}_count`] - out[k].length;
+        }
+        return out;
       }),
 
     def('recipe_info','Рецепт по имени рецепта или предмета: ингредиенты, результат, время, открыт ли.', { name: z.string() }, (a) => run('recipe', a)),
