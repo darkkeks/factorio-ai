@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Сторож паузы: игра идёт, пока в ней есть люди, люди есть в голосовом канале или у любого бота непустая очередь
+действий (или ручного крафта). Иначе — пауза.
+
+Правило исполняет мод одной командой (операция pause_if_idle), поэтому гонки «бот поставил действие, пока сторож
+решал» нет; поставленное действие само снимает паузу, не дожидаясь сторожа. Чтение мира игру не будит.
+Голосовой бот на хосте, пока в канале есть люди, обновляет файл ~/voice-active; если бот упал или выключен,
+файл устаревает. Если мода в игре нет (старое сохранение), работает прежнее правило без учёта очередей.
+"""
+import json, os, socket, struct, time
+
+HEARTBEAT = os.path.expanduser('~/voice-active')
+PASSWORD = os.environ['RCON_PASSWORD']
+PORT = int(os.environ.get('RCON_PORT', '27015'))
+# Клиент-камера веб-карты — не человек: с ним одним игра должна вставать на паузу.
+CAMERA = os.environ.get('CAMERA_PLAYER', 'camera')
+
+
+class Rcon:
+    def __init__(self):
+        self.sock = socket.create_connection(('127.0.0.1', PORT), timeout=10)
+        self.call(3, PASSWORD)
+
+    def call(self, kind, body):
+        data = struct.pack('<ii', 1, kind) + body.encode() + b'\0\0'
+        self.sock.sendall(struct.pack('<i', len(data)) + data)
+        size = struct.unpack('<i', self.read(4))[0]
+        packet = self.read(size)
+        if struct.unpack('<i', packet[:4])[0] == -1:
+            raise RuntimeError('RCON: неверный пароль')
+        return packet[8:-2].decode()
+
+    def read(self, n):
+        buf = b''
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError('RCON: соединение закрыто')
+            buf += chunk
+        return buf
+
+
+def legacy(rcon, voice):
+    players, paused = rcon.call(2, '/silent-command local n = 0 for _, p in pairs(game.connected_players) do if p.name ~= "%s" then n = n + 1 end end rcon.print(n .. " " .. tostring(game.tick_paused))' % CAMERA).split()
+    want = players == '0' and not voice
+    if want != (paused == 'true'):
+        rcon.call(2, '/silent-command game.tick_paused = %s' % ('true' if want else 'false'))
+        return want, 'игроков: %s, люди в голосовом канале: %s (мода нет)' % (players, 'да' if voice else 'нет')
+    return None, None
+
+
+rcon = None
+while True:
+    try:
+        rcon = rcon or Rcon()
+        voice = os.path.exists(HEARTBEAT) and time.time() - os.path.getmtime(HEARTBEAT) < 45
+        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'voice': voice, 'ignore': [CAMERA]}}
+        out = rcon.call(2, '/agent ' + json.dumps(req, ensure_ascii=False))
+        try:
+            r = json.loads(out)
+        except ValueError:
+            r = None
+        if r and r.get('ok'):
+            r = r['result']
+            if r['changed']:
+                print(time.strftime('%F %T'), 'пауза' if r['paused'] else 'игра идёт',
+                      '(игроков: %s, люди в голосовом канале: %s, занятых ботов: %s)' % (r['humans'], 'да' if voice else 'нет', r['busy']), flush=True)
+        else:
+            changed, why = legacy(rcon, voice)
+            if changed is not None:
+                print(time.strftime('%F %T'), 'пауза' if changed else 'игра идёт', '(%s)' % why, flush=True)
+    except Exception as e:  # сервер перезапускается — пробуем снова
+        print(time.strftime('%F %T'), 'ошибка:', e, flush=True)
+        rcon = None
+    time.sleep(5)

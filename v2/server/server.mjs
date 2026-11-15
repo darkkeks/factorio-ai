@@ -26,6 +26,8 @@ fs.mkdirSync(LOG_DIR, { recursive: true });
 const WAIT_DEFAULT_S = 30;  // сколько сервер сам ждёт завершения действия
 const WAIT_MAX_S = 110;
 const EVENTS_WAIT_MAX_S = 60;
+const WAIT_EXTERNAL_S = 50;
+const EXTERNAL = Symbol('external');
 
 const stamp = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().replace('T', ' ').slice(0, 23); };
 const log = (...a) => console.log(stamp(), ...a);
@@ -93,7 +95,8 @@ const waitSeconds = (body) => {
   if (body.wait === false) return 0;
   const s = body.wait_s == null ? WAIT_DEFAULT_S : Number(body.wait_s);
   if (!Number.isFinite(s) || s < 0) throw new GameError('bad_request', 'wait_s — неотрицательное число секунд');
-  return Math.min(s, WAIT_MAX_S);
+  // Снаружи запросы идут через nginx с таймаутом 60 с: ждём меньше, действие продолжается, итог — wait_action.
+  return Math.min(s, body[EXTERNAL] ? WAIT_EXTERNAL_S : WAIT_MAX_S);
 };
 
 const CONTROL = new Set(['wait', 'wait_s', 'id']);
@@ -102,6 +105,7 @@ function stripControl(body) {
   for (const k in body) if (!CONTROL.has(k)) p[k] = body[k];
   return p;
 }
+const carry = (from, to) => { if (from[EXTERNAL]) to[EXTERNAL] = true; return to; };
 
 // ── Операции ──
 const lastTouch = new Map();
@@ -125,7 +129,7 @@ async function runAct(who, body) {
 }
 
 async function runSingleAction(who, op, body) {
-  const { actions } = await runAct(who, { actions: [{ type: op, ...stripControl(body) }], wait: body.wait, wait_s: body.wait_s, id: body.id });
+  const { actions } = await runAct(who, carry(body, { actions: [{ type: op, ...stripControl(body) }], wait: body.wait, wait_s: body.wait_s, id: body.id }));
   const a = actions[0];
   if (a.state === 'running') return { running: true, action_id: a.action_id };
   if (a.state === 'done') return { action_id: a.action_id, ...a.result };
@@ -165,7 +169,7 @@ const special = {
   async events(who, body) {
     let waitS = body.wait_s == null ? 0 : Number(body.wait_s);
     if (!Number.isFinite(waitS) || waitS < 0) throw new GameError('bad_request', 'wait_s — неотрицательное число секунд');
-    waitS = Math.min(waitS, EVENTS_WAIT_MAX_S);
+    waitS = Math.min(waitS, body[EXTERNAL] ? WAIT_EXTERNAL_S : EVENTS_WAIT_MAX_S);
     const limit = Math.min(Number(body.limit) || 200, 1000);
     const types = body.types ? new Set([].concat(body.types)) : null;
     const me = who.agent;
@@ -232,6 +236,15 @@ const special = {
     return out;
   },
 
+  // Замечание о работе интерфейса: дописывается в файл, читают разработчики.
+  async feedback(who, body) {
+    const text = String(body.text ?? '').trim();
+    if (!text) throw new GameError('bad_request', 'text: что не так или чего не хватает');
+    if (text.length > 8000) throw new GameError('bad_request', 'текст длиннее 8000 символов');
+    fs.appendFileSync(path.join(LOG_DIR, 'feedback.jsonl'), JSON.stringify({ t: stamp(), from: who.agent || '(admin)', text }) + '\n');
+    return { saved: true };
+  },
+
   async metrics(who) {
     if (!who.admin) throw new GameError('forbidden', 'только администратору');
     const ops = {};
@@ -283,7 +296,14 @@ const server = http.createServer(async (req, res) => {
   const m = url.pathname.match(/^(?:\/[^/]+)*?\/v2\/([a-z_]+)\/?$/);
   let op = m?.[1], who = null, body = {}, out, status = 200;
   try {
-    if (!op) throw new GameError('unknown_op', 'адрес: POST /v2/<операция>, описание — GET /v2/help');
+    if (!op) {
+      // Старый интерфейс (MCP и команда fx) слал сюда JSON-RPC: отвечаем в его же виде, чтобы скрипты показали причину.
+      if (req.method === 'POST' && !url.pathname.includes('/v2/')) {
+        send(res, 200, { jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'Интерфейс заменён: инструментов MCP и команды fx больше нет. Теперь это HTTP с JSON: описание — curl -s ${FX_URL}v2/help, правила — /home/robot/bots/RULES.md.' } });
+        return;
+      }
+      throw new GameError('unknown_op', 'адрес: POST /v2/<операция>, описание — GET /v2/help');
+    }
     if (op === 'help' && req.method === 'GET') {
       out = await special.help();
       send(res, 200, out);
@@ -294,6 +314,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') body = await readBody(req);
     else if (req.method === 'GET') for (const [k, v] of url.searchParams) { try { body[k] = JSON.parse(v); } catch { body[k] = v; } }
     else throw new GameError('bad_request', 'метод: POST (или GET для запросов без тела)');
+    if (req.headers['x-forwarded-for']) body[EXTERNAL] = true;
     if (!game.ready && op !== 'metrics') throw new GameError(game.lastError?.includes('несовместим') ? 'incompatible' : 'game_unavailable', `игра недоступна: ${game.lastError || 'нет связи'}`);
     const result = await dispatch(who, op, body);
     out = { ok: true, ...result };
@@ -306,6 +327,13 @@ const server = http.createServer(async (req, res) => {
   }
   const ms = Math.round((performance.now() - t0) * 10) / 10;
   send(res, status, out);
+  // Строка на вызов в общий журнал (её же показывает веб-карта в панели бота); опрос событий туда не пишется.
+  if (who?.agent && op !== 'events') {
+    const args = Object.keys(body).length ? ' ' + JSON.stringify(body).slice(0, 300) : '';
+    const { ok: _ok, ...rest } = out;
+    const brief = out.ok ? JSON.stringify(rest).slice(0, 300) : `❌ ${out.error.code}: ${out.error.message}`.slice(0, 300);
+    console.log(`${stamp().slice(11)} 🔧 ${who.agent} ${op}${args} [${(ms / 1000).toFixed(2)} с] → ${brief}`);
+  }
   record({ t: stamp(), agent: who?.agent || (who?.admin ? '(admin)' : null), op, ms, ok: out.ok, code: out.ok ? undefined : out.error.code, tick: game.tick }, { args: body, response: out });
 });
 

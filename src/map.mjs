@@ -272,7 +272,7 @@ async function summaryLoop() {
 // Строки бота из логов: вызовы инструментов и его собственный текст. Реплики людей (🎤) не отдаём.
 function botLog(name) {
   let best = [], bestTime = 0;
-  for (const file of ['bot.log', 'mcp.log']) {
+  for (const file of ['bot.log', 'api.log']) {
     let text, mtime;
     try {
       const fd = fs.openSync(path.join(ROOT, file), 'r');

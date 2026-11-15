@@ -4,6 +4,7 @@ local J = require('agent.journal')
 local Q = require('agent.queue')
 local S = require('agent.state')
 local Fog = require('agent.fog')
+local Gui = require('agent.gui')
 
 local E = {handlers = {}, nth = {}}
 
@@ -237,6 +238,7 @@ E.handlers[defines.events.on_tick] = function(ev)
     flush_tally()
     scan_alerts()
   end
+  if ev.tick % 30 == 3 then Gui.tick(ev.tick - 3) end
   if ev.tick % 120 == 7 then scan_threats() end
   if ev.tick % 300 == 13 then scan_turrets() end
   if ev.tick % 3600 == 0 then J.prune_throttle(DAMAGE_EVERY) end

@@ -6,9 +6,11 @@ local J = require('agent.journal')
 local Plans = require('agent.plans')
 local Fog = require('agent.fog')
 local BP = require('agent.blueprints')
+local Gui = require('agent.gui')
+local Legacy = require('agent.legacy')
 
 local S = {}
-S.VERSION = 5
+S.VERSION = 7
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -132,9 +134,15 @@ function S.ensure()
   Plans.init(st)
   Fog.init(st)
   BP.init(st)
+  Gui.init(st)
+  Gui.setup_players()
   if not st.legacy then
     st.legacy = 1
     adopt_legacy(st)
+  end
+  if not st.legacy_plans then
+    st.legacy_plans = true
+    Legacy.plans(st)
   end
   st.version = S.VERSION
   return st

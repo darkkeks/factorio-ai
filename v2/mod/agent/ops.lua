@@ -4,6 +4,7 @@ local U = require('agent.util')
 local J = require('agent.journal')
 local Q = require('agent.queue')
 local S = require('agent.state')
+local Gui = require('agent.gui')
 
 local O = {list = {}}
 
@@ -17,6 +18,9 @@ O.register('ping', {fn = function()
   table.sort(actions, function(a, b) return a.name < b.name end)
   return {mod = 'agent', version = S.VERSION, api = 2, tick = game.tick, paused = game.tick_paused, ops = ops, actions = actions}
 end})
+
+-- Что перенесено со старой системы при первом запуске (для проверки переноса).
+O.register('legacy_report', {admin = true, fn = function() return storage.agent.legacy_report or {} end})
 
 O.register('journal', {admin = true, fn = function(_, p)
   local items, seq, first = J.read(p.since or 0, math.min(p.limit or 500, 2000))
@@ -113,6 +117,16 @@ end})
 
 O.register('clear', {agent = true, write = true, fn = function(A)
   return {cancelled = Q.clear(A)}
+end})
+
+-- Открыть человеку список ботов, окно-камеру или слежение — то же, что его собственные нажатия.
+O.register('show', {admin = true, fn = function(_, p)
+  local player = game.get_player(p.player or '')
+  if not player then U.fail('not_found', 'нет такого игрока') end
+  local A = p.agent and storage.agent.agents[p.agent]
+  if (p.what == 'camera' or p.what == 'follow') and not (A and A.entity and A.entity.valid) then U.fail('not_found', 'нет такого бота') end
+  Gui.show(player, p.what, A)
+  return {shown = p.what}
 end})
 
 -- Бот жив: сервер на хосте шлёт это, когда запросы бота до мода не доходят (чтение буфера событий).

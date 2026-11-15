@@ -18,6 +18,7 @@ require('agent.planning')
 require('agent.observe')
 require('agent.stats')
 local Fog = require('agent.fog')
+local Gui = require('agent.gui')
 
 local M = {events = {}}
 
@@ -85,6 +86,7 @@ local function listen(id, fn)
 end
 for id, fn in pairs(E.handlers) do listen(id, fn) end
 for id, fn in pairs(Fog.handlers) do listen(id, fn) end
+for id, fn in pairs(Gui.handlers) do listen(id, fn) end
 for id, list in pairs(chains) do
   M.events[id] = guarded(#list == 1 and list[1] or function(ev)
     for _, fn in ipairs(list) do fn(ev) end

@@ -1,4 +1,4 @@
--- Как бот называет объект мира: {unit = номер} или {x, y, name?} (объект в точке).
+-- Как бот называет объект мира: {x, y, name?, unit?} (объект в точке), {player = имя}, {agent = имя}.
 local U = require('agent.util')
 
 local T = {}
@@ -10,7 +10,20 @@ local SKIP = {character = true, corpse = true, ['item-entity'] = true, fish = tr
 
 --- Найти объект по ссылке; nil, если его нет.
 function T.find(surface, ref)
-  if type(ref) ~= 'table' then U.fail('bad_request', 'цель: ожидается {unit} или {x, y, name?}') end
+  if type(ref) ~= 'table' then U.fail('bad_request', 'цель: ожидается {x, y, name?}, {player} или {agent}') end
+  -- Человек или другой бот — по имени: их место команда знает, как игрок видит товарищей на карте.
+  if ref.player ~= nil then
+    local p = game.get_player(ref.player)
+    local c = p and p.connected and p.character
+    if c and c.valid and c.surface == surface then return c end
+    return nil
+  end
+  if ref.agent ~= nil then
+    local A = storage.agent.agents[ref.agent]
+    local c = A and A.entity
+    if c and c.valid and c.surface == surface then return c end
+    return nil
+  end
   if ref.unit and ref.x == nil then
     -- Движок находит по номеру не все виды построек: надёжная ссылка — координаты (номер можно приложить для сверки).
     local e = game.get_entity_by_unit_number(ref.unit)

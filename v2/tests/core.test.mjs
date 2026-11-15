@@ -32,7 +32,7 @@ test('ping: версия мода и список операций', async () =>
 test('help: описаны все операции и действия мода', async () => {
   const h = await (await fetch(`${process.env.V2_API || 'http://127.0.0.1:8790'}/v2/help`)).json();
   const p = await call('t-admin', 'ping');
-  const missing = [...p.ops, ...p.actions.map((a) => a.name)].filter((n) => !h.operations[n] && !['journal', 'touch', 'pause_if_idle'].includes(n));
+  const missing = [...p.ops, ...p.actions.map((a) => a.name)].filter((n) => !h.operations[n] && !['journal', 'touch', 'pause_if_idle', 'show', 'legacy_report'].includes(n));
   eq(missing, [], 'в help нет операций');
 });
 

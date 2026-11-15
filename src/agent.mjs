@@ -1,10 +1,13 @@
-// Сессия Claude Code одного человека: управляет его персонажем в Factorio через MCP и больше ничего не умеет.
+// Сессия Claude Code одного человека: управляет его персонажем в Factorio HTTP-запросами к серверу ботов
+// (v2/server) из своей оболочки в контейнере.
 import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { spawn, execFileSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import crypto from 'node:crypto';
-import { CLAUDE_BIN, CLAUDE_MODEL, STATE_FILE, ROBOT_CONTAINER, MCP_URL, MCP_TOKENS_FILE } from './config.mjs';
+import { CLAUDE_BIN, CLAUDE_MODEL, STATE_FILE, ROBOT_CONTAINER, API_URL } from './config.mjs';
+import { tokenFor } from './game-api.mjs';
+
+export { tokenFor };
 
 // В системном промпте только неизменное ядро: он фиксируется при создании сессии и при возобновлении не обновляется.
 // Все правила поведения лежат в файле rules/RULES.md (в контейнере — RULES_PATH); об его изменениях сессиям
@@ -27,23 +30,10 @@ const systemPrompt = (human, bot) => `
 перечитай файл правил.
 `.trim();
 
-// Саб-агенты: главная сессия остаётся на связи, а работу руками ведёт фоновый саб-агент с теми же инструментами factorio.
+// Саб-агенты: главная сессия остаётся на связи, а работу руками ведёт фоновый саб-агент с тем же доступом к игре.
 const SUBAGENT_TOOLS = ['Task', 'SendMessage', 'TaskList', 'TaskStop'];
 // Собственное окружение бота в контейнере: оболочка и файлы, чтобы писать и запускать свою автоматизацию.
 const ENV_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
-
-/** Токен персонажа для MCP по HTTP; если его ещё нет — выдаём. */
-export function tokenFor(bot) {
-  let tokens = {};
-  try { tokens = JSON.parse(fs.readFileSync(MCP_TOKENS_FILE, 'utf8')); } catch { /* файла ещё нет */ }
-  let token = Object.keys(tokens).find((t) => tokens[t] === bot);
-  if (!token) {
-    token = crypto.randomBytes(18).toString('base64url');
-    tokens[token] = bot;
-    fs.writeFileSync(MCP_TOKENS_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
-  }
-  return token;
-}
 
 export const slug = (name) => name.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'bot';
 
@@ -132,8 +122,8 @@ export class Agent extends EventEmitter {
                 this.#killInContainer();
                 const pass = ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION'].filter((k) => env[k]).flatMap((k) => ['-e', `${k}=${env[k]}`]);
                 pass.push('-e', 'ENABLE_CLAUDEAI_MCP_SERVERS=false');
-                // Для собственных скриптов бота: команда fx и прямые запросы к MCP от имени его персонажа.
-                pass.push('-e', `FX_URL=${MCP_URL}`, '-e', `FX_TOKEN=${this.token}`, '-e', `FX_BOT=${this.bot}`, '-e', `FX_HOME=/home/robot/bots/${slug(this.bot)}`);
+                // Доступ к игре: адрес сервера ботов и токен персонажа (имена переменных исторические).
+                pass.push('-e', `FX_URL=${API_URL}`, '-e', `FX_TOKEN=${this.token}`, '-e', `FX_BOT=${this.bot}`, '-e', `FX_HOME=/home/robot/bots/${slug(this.bot)}`);
                 return spawn('docker', ['exec', '-i', '-w', '/home/robot', ...pass, ROBOT_CONTAINER, 'claude', ...args], { stdio: ['pipe', 'pipe', 'inherit'], signal });
               },
             } : { pathToClaudeCodeExecutable: CLAUDE_BIN }),
@@ -143,17 +133,17 @@ export class Agent extends EventEmitter {
             // Никаких настроек с диска. Встроенные инструменты: саб-агенты и собственное окружение бота в контейнере.
             tools: [...SUBAGENT_TOOLS, ...ENV_TOOLS],
             settingSources: [],
-            // Инструменты живут в отдельном процессе: их обновление не требует перезапуска сессий.
-            mcpServers: { factorio: { type: 'http', url: MCP_URL, headers: { Authorization: `Bearer ${this.token}` } } },
+            // Игра — через HTTP из оболочки (сервер ботов — отдельный процесс, его обновление сессий не касается).
+            mcpServers: {},
             strictMcpConfig: true, // никаких коннекторов аккаунта (Docs, почта и т. п.)
-            allowedTools: ['mcp__factorio', ...SUBAGENT_TOOLS, ...ENV_TOOLS],
+            allowedTools: [...SUBAGENT_TOOLS, ...ENV_TOOLS],
             permissionMode: 'dontAsk',
           },
         });
         for await (const msg of this.q) {
           if (msg.type === 'system' && msg.subtype === 'init') {
             if (!gotInit && process.env.DEBUG_TOOLS) console.log(msg.tools.join(" "));
-            if (!gotInit) console.log(`[agent ${this.bot}] сессия ${msg.session_id}, модель ${msg.model}, инструменты кроме factorio: ${msg.tools.filter((t) => !t.startsWith("mcp__factorio__")).join(", ") || "нет"}`);
+            if (!gotInit) console.log(`[agent ${this.bot}] сессия ${msg.session_id}, модель ${msg.model}, инструменты: ${msg.tools.join(", ") || "нет"}`);
             gotInit = true;
             saveSession(this.key, msg.session_id);
           } else if (msg.type === 'assistant' && !msg.parent_tool_use_id) {

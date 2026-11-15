@@ -1,0 +1,7 @@
+{
+  "http": { "host": "172.25.0.1", "port": 8765 },
+  "rcon": { "host": "127.0.0.1", "port": 27015, "password": "<пароль RCON из rcon.json>" },
+  "tokens": "../../mcp-tokens.json",
+  "logDir": "log",
+  "pollMs": 100
+}

@@ -8,7 +8,7 @@ import * as cfg from './config.mjs';
 import { transcribe, fromDiscordPcm, Utterances } from './speech.mjs';
 import net from 'node:net';
 import fs from 'node:fs';
-import { createFactorioServer } from './factorio.mjs';
+import { gameCall } from './game-api.mjs';
 
 const stamp = () => new Date().toISOString().slice(11, 23);
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
@@ -80,13 +80,12 @@ function join(connection, member) {
   const p = { name, bot: `${name}-бот`, utt: new Utterances(), decoder: new OpusScript(48000, 2), lastPacket: 0, silenceFed: Infinity, gone: false };
   people.set(member.id, p);
 
-  // Здесь экземпляр инструментов нужен только чтобы создать персонажа; сессия ходит за ними в отдельный процесс MCP.
-  const fx = createFactorioServer(p.bot, { log: () => {}, aborted: () => false });
   // Сессия живёт дольше присутствия человека в канале: вышел — бот продолжает начатое, вернулся — та же сессия.
   sessions.send({ op: 'ensure', id: member.id, human: name, bot: p.bot });
   sessions.send({ op: 'present', ids: [...people.keys()] });
-  fx.ensure().then(
-    (r) => log(`➕ ${name} в канале: персонаж «${p.bot}» на сервере в точке ${r.pos.x}, ${r.pos.y}`),
+  // Первое обращение от имени персонажа создаёт его на сервере, если его ещё нет.
+  gameCall(p.bot, 'status').then(
+    (r) => log(`➕ ${name} в канале: персонаж «${p.bot}» на сервере в точке ${r.position.x}, ${r.position.y}`),
     (e) => log(`⚠️ ${p.bot}: сервер Factorio недоступен: ${e.message}`),
   );
 
