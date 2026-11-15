@@ -67,8 +67,38 @@ const list = (v) => (Array.isArray(v) ? v : []); // пустая таблица 
 const LUA = {
   live: `
     local out = {tick=game.tick, paused=game.tick_paused, bots={}, players={}, chat={}}
+    -- Чем занят бот — той же строкой, что мод показывает над его головой (v2/mod/agent/gui.lua, G.describe):
+    -- первое действие очереди, цель ходьбы, сколько предметов уже обработано, сколько действий ждёт следом.
+    local ACTIONS = {walk_to='идёт', mine='добывает', place='строит', build_ghosts='строит по плану', transfer='перекладывает',
+      configure='настраивает', repair='чинит', wait='ждёт', craft='крафтит', say='говорит', research='исследования'}
+    local agents = (storage.agent or {}).agents or {}
+    local function describe(name, e)
+      local A = agents[name]
+      if not A then return nil end
+      local text
+      local act = A.queue and A.queue[1]
+      if act then
+        text = ACTIONS[act.type] or act.type
+        local st = act.st
+        if st then
+          local w = st.w
+          if w and w.goal then text = text .. ' → ' .. math.floor(w.goal.x) .. ', ' .. math.floor(w.goal.y) end
+          if st.items then
+            local done = 0
+            for _, it in ipairs(st.items) do if it.state then done = done + 1 end end
+            text = text .. ' ' .. done .. '/' .. #st.items
+          end
+        end
+        if #A.queue > 1 then text = text .. ' (+' .. (#A.queue - 1) .. ')' end
+      elseif e.crafting_queue_size > 0 then text = 'крафтит'
+      else text = 'свободен' end
+      return text
+    end
     for name, e in pairs(storage.vb or {}) do
-      if e.valid then out.bots[#out.bots+1] = {name=name, x=e.position.x, y=e.position.y, surface=e.surface.name} end
+      if e.valid then
+        local ok, act = pcall(describe, name, e)
+        out.bots[#out.bots+1] = {name=name, x=e.position.x, y=e.position.y, surface=e.surface.name, act=ok and act or nil}
+      end
     end
     for _, p in pairs(game.connected_players) do
       if p.name ~= A.camera then out.players[#out.players+1] = {name=p.name, x=p.position.x, y=p.position.y, surface=p.surface.name} end
@@ -260,7 +290,7 @@ async function liveLoop() {
   for (;;) {
     try {
       const r = await lua(LUA.live, { camera: CAMERA, since: chatSeq });
-      const here = (a) => list(a).filter((p) => p.surface === SURFACE).map((p) => ({ name: p.name, x: +p.x.toFixed(2), y: +p.y.toFixed(2) }));
+      const here = (a) => list(a).filter((p) => p.surface === SURFACE).map((p) => ({ name: p.name, x: +p.x.toFixed(2), y: +p.y.toFixed(2), ...(p.act ? { act: String(p.act).slice(0, 80) } : {}) }));
       if (!live.ok && quickFails < 3) nextStart = 0; // сервер игры снова отвечает — камеру можно пробовать сразу
       if (r.paused && !pausedAt) pausedAt = Date.now();
       if (!r.paused) pausedAt = 0;

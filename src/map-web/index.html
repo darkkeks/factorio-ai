@@ -18,6 +18,9 @@
   .actor span { position: absolute; left: 0; top: -30px; transform: translateX(-50%); padding: 1px 6px; border-radius: 3px;
     background: rgba(17, 17, 17, .8); color: #ffcc33; font-weight: 600; font-size: 12px; }
   .actor.player span { color: #6fd3ff; }
+  /* Что бот делает сейчас — как надпись над головой в игре. */
+  .actor small { position: absolute; left: 0; top: -11px; transform: translateX(-50%); padding: 0 5px; border-radius: 3px; background: rgba(17, 17, 17, .75); color: #cfe6ff; font-size: 11px; }
+  .actor small:empty { display: none; }
   .actor.bot { cursor: pointer; }
   .actor.sel i { outline: 2px solid #fff; }
 
@@ -235,11 +238,12 @@ function syncActors(kind, list) {
     seen.add(k);
     let m = markers.get(k);
     if (!m) {
-      m = L.marker(ll(a.x, a.y), { icon: L.divIcon({ className: `actor ${kind}`, html: `<i></i><span>${esc(a.name)}</span>`, iconSize: [0, 0] }), keyboard: false, zIndexOffset: kind === 'bot' ? 100 : 0 }).addTo(map);
+      m = L.marker(ll(a.x, a.y), { icon: L.divIcon({ className: `actor ${kind}`, html: `<i></i><span>${esc(a.name)}</span><small></small>`, iconSize: [0, 0] }), keyboard: false, zIndexOffset: kind === 'bot' ? 100 : 0 }).addTo(map);
       if (kind === 'bot') m.on('click', () => openBot(a.name));
       markers.set(k, m);
     } else m.setLatLng(ll(a.x, a.y));
-    m.getElement()?.classList.toggle('sel', kind === 'bot' && a.name === selected);
+    const el = m.getElement();
+    if (el) { el.classList.toggle('sel', kind === 'bot' && a.name === selected); const sm = el.querySelector('small'); if (sm && sm.textContent !== (a.act || '')) sm.textContent = a.act || ''; }
   }
   for (const [k, m] of markers) if (k.startsWith(kind + ':') && !seen.has(k)) { m.remove(); markers.delete(k); }
 }
@@ -382,10 +386,11 @@ async function loadBot() {
     if (!r.ok) { $('bot-body').innerHTML = '<div class="muted">бота нет на сервере</div>'; return; }
     const b = await r.json();
     const inv = Object.entries(b.inventory).sort((x, y) => y[1] - x[1]);
-    const doing = b.mining ? 'копает' : b.walking ? 'идёт' : b.queue.length ? 'крафтит' : 'стоит';
+    const live = actors.find((x) => x.name === name);
+    const doing = (live && live.act) || (b.mining ? 'копает' : b.walking ? 'идёт' : b.queue.length ? 'крафтит' : 'стоит');
     const body = $('bot-body'), keep = body.scrollTop;
     const html = `
-      <div class="muted">${doing} · (${b.x.toFixed(0)}, ${b.y.toFixed(0)}) · здоровье ${b.health} из ${b.max_health}</div>
+      <div class="muted"><b style="color:#cfe6ff">${esc(doing)}</b> · (${b.x.toFixed(0)}, ${b.y.toFixed(0)}) · здоровье ${b.health} из ${b.max_health}</div>
       <div class="bar"><b style="width:${Math.min(100, 100 * b.health / b.max_health)}%"></b></div>
       <h3>Очередь крафта</h3><div class="items">${b.queue.length ? b.queue.map((q) => slot(q.recipe, q.count)).join('') : '<span class="muted">пусто</span>'}</div>
       <h3>Инвентарь</h3><div class="items">${inv.length ? inv.map(([k, v]) => slot(k, v)).join('') : '<span class="muted">пусто</span>'}</div>
