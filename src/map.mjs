@@ -910,9 +910,10 @@ const NAMES = JSON.stringify({ ru: loadNames('ru'), en: loadNames('en') });
 // Чья сессия — выясняем тремя независимыми способами и запоминаем навсегда (state-map.json), чтобы сессия
 // не пропадала из списка, когда один из источников меняется:
 //   1) запущенные процессы claude: имя бота в переменной FX_BOT, id сессии в --resume (самый надёжный, но только для живых);
-//   2) сам транскрипт: в записи с системным промптом сказано «персонажем по имени «…»» (берём последнюю такую запись);
-//   3) строки «[agent Имя] сессия <id>» в bot.log и sessions.log (только если других сведений нет).
-const owners = new Map();      // id сессии -> { bot, rank } — rank: 3 процесс, 2 транскрипт, 1 лог
+//   2) строки «[agent Имя] сессия <id>» в bot.log и sessions.log (последняя строка главнее: бота могли переименовать);
+//   3) сам транскрипт: в записи с системным промптом сказано «персонажем по имени «…»» — это имя на момент создания
+//      сессии, поэтому им только заполняем пробелы, когда в логах сессии нет.
+const owners = new Map();      // id сессии -> { bot, rank } — rank: 3 процесс, 2 лог, 1 транскрипт
 const scanned = new Map();     // id сессии -> сколько байт транскрипта уже просмотрено
 const logPos = new Map();      // файл лога -> сколько уже прочитано
 const botSessions = new Map(); // бот -> Set(id сессии), строится из owners
@@ -922,7 +923,7 @@ let ownersChanged = false, lastScan = 0;
 function learn(id, bot, rank) {
   const cur = owners.get(id);
   if (cur && (cur.rank > rank || (cur.bot === bot && cur.rank === rank))) return;
-  if (cur?.bot !== bot) log(`сессия ${id} — ${bot}${cur ? ` (было: ${cur.bot})` : ''}, источник: ${['', 'лог', 'транскрипт', 'процесс'][rank]}`);
+  if (cur?.bot !== bot) log(`сессия ${id} — ${bot}${cur ? ` (было: ${cur.bot})` : ''}, источник: ${['', 'транскрипт', 'лог', 'процесс'][rank]}`);
   owners.set(id, { bot, rank });
   ownersChanged = true;
   botSessions.clear();
@@ -967,7 +968,7 @@ function scanTranscripts() {
       }
       scanned.set(id, size - Buffer.byteLength(tail, 'latin1'));
       ownersChanged = true;
-      if (bot) learn(id, bot, 2);
+      if (bot) learn(id, bot, 1);
     } catch { /* файл исчез */ }
   }
 }
@@ -981,7 +982,7 @@ function scanLogs() {
       if (size === pos) continue;
       const text = readRange(file, pos, size).toString('utf8');
       logPos.set(name, size);
-      for (const m of text.matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) learn(m[2], m[1], 1);
+      for (const m of text.matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) learn(m[2], m[1], 2);
     } catch { /* лога нет */ }
   }
 }
