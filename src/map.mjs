@@ -1314,7 +1314,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.exit(0);
   });
 }
-// Перезапуск сервиса без остановки камеры (после правок кода): kill -USR2 <pid>; новый процесс подхватит её по camera.pid.
+// Перезапуск сервиса без остановки камеры (после правок кода): kill -USR2 $(pgrep -f '^node src/map.mjs');
+// новый процесс подхватит камеру по camera.pid. Процесс НЕЛЬЗЯ искать по порту 8766: тот же номер порта
+// (на 127.0.0.1) слушает хозяин сессий ботов src/sessions.mjs, и сигнал, посланный «всем на 8766», обрывает сессии ботов.
 process.on('SIGUSR2', () => { saveState(); if (encoder) encoder.kill('SIGTERM'); process.exit(0); });
 fs.mkdirSync(TILES, { recursive: true });
 loadState();
