@@ -7,10 +7,22 @@
 
 ## Запуск
 
-    tmux new-window -d -t 0: -n discord-voice ~/claude/discord-voice/run.sh     # запустить
-    tmux kill-window -t 0:discord-voice                                         # остановить
+Три процесса в tmux (сессия `0`), у каждого свой лог:
 
-Лог — `bot.log`. Бот заходит в канал, когда там появляется человек, и выходит, когда канал пустеет.
+    tmux new-window -d -t 0: -n factorio-mcp      ~/claude/discord-voice/run-mcp.sh       # инструменты игры, mcp.log
+    tmux new-window -d -t 0: -n factorio-sessions ~/claude/discord-voice/run-sessions.sh  # сессии Claude, sessions.log
+    tmux new-window -d -t 0: -n discord-voice     ~/claude/discord-voice/run.sh           # Discord и звук, bot.log
+
+Они разделены, чтобы обновления не прерывали работу ботов:
+
+| Что изменилось | Что перезапустить | Сессии и саб-агенты |
+|---|---|---|
+| инструменты (`src/factorio.mjs`) | `factorio-mcp` (обработчик заявок делает это сам) | не прерываются |
+| правила ботов (`rules/RULES.md`) | ничего — изменения рассылаются сессиям автоматически | не прерываются |
+| Discord, звук (`src/main.mjs`, `src/speech.mjs`) | `discord-voice` | не прерываются |
+| сессии (`src/sessions.mjs`, `src/agent.mjs`), Claude Code в контейнере | `factorio-sessions` | прерываются: сессии возобновляются с тем же контекстом, саб-агенты теряются |
+
+Голосовой бот заходит в канал, когда там появляется человек, и выходит, когда канал пустеет.
 Под одним токеном Discord в голосовом канале может сидеть только один процесс.
 
 ## Как это работает
@@ -37,7 +49,9 @@
 
 - `src/main.mjs` — Discord (discord.js + @discordjs/voice, DAVE), приём звука, лог в чат.
 - `src/speech.mjs` — Silero VAD и распознавание GigaAM v3 через sherpa-onnx-node 1.x; модели в `models/`.
-- `src/agent.mjs` — сессия Claude и её системный промпт.
+- `src/sessions.mjs` — хозяин сессий: держит процессы Claude, раздаёт им реплики, игровой чат и обновления правил.
+- `src/agent.mjs` — одна сессия Claude; в системном промпте только неизменное ядро.
+- `rules/RULES.md` — правила поведения ботов; копия лежит в контейнере (`~/robot/bots/RULES.md`), боты читают её сами.
 - `src/factorio.mjs`, `src/rcon.mjs` — MCP-инструменты и клиент RCON (`rcon.json` — адрес и пароль).
 - `src/agent-test.mjs` — проверка без Discord: `node src/agent-test.mjs Имя "Клод, осмотрись"`.
 

@@ -15,8 +15,8 @@ import { lua } from './rcon.mjs';
 const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/claude-code/bin/claude');
 const MODEL = process.env.WORKER_MODEL || 'claude-fable-5-2';
 const TIMEOUT_MS = 45 * 60_000;
-const ALLOWED_CHANGES = ['src/factorio.mjs', 'README.md'];
-const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)',
+const ALLOWED_CHANGES = ['src/factorio.mjs', 'README.md', 'rules/RULES.md'];
+const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)', 'Edit(rules/RULES.md)',
   'Bash(node --check *)', 'Bash(node src/tool-test.mjs *)', 'Bash(git diff *)', 'Bash(git status *)'];
 // Окна tmux, которые нужно перезапустить после изменения инструментов (только если они сейчас запущены).
 const RESTART = { 'factorio-mcp': 'run-mcp.sh' }; // голосовой бот перезапускать не нужно: сессии ходят в этот процесс по HTTP

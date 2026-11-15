@@ -6,11 +6,9 @@ import { joinVoiceChannel, entersState, getVoiceConnection, VoiceConnectionStatu
 import OpusScript from 'opusscript';
 import * as cfg from './config.mjs';
 import { transcribe, fromDiscordPcm, Utterances } from './speech.mjs';
-import os from 'node:os';
-import path from 'node:path';
-import { Agent, forgetSession, slug } from './agent.mjs';
+import net from 'node:net';
 import fs from 'node:fs';
-import { createFactorioServer, readChat } from './factorio.mjs';
+import { createFactorioServer } from './factorio.mjs';
 
 const stamp = () => new Date().toISOString().slice(11, 23);
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
@@ -33,31 +31,41 @@ setInterval(() => {
 
 // ───────────────────────── Люди: слух + сессия + персонаж ─────────────────────────
 
-const agents = new Map(); // userId -> Agent; не удаляются при выходе человека из канала
-const people = new Map(); // userId -> { name, bot, agent, utt, decoder, stream, lastPacket, silenceFed, gone }
+const people = new Map(); // userId -> { name, bot, utt, decoder, stream, lastPacket, silenceFed, gone }
 
-function startAgent(id, name, bot) {
-  const agent = new Agent(id, name, bot);
-  agent.on('text', (text) => log(`🤖 ${bot}: ${text}`));
-  agent.on('error', (e) => log(`⚠️ ${bot}: ${e.message}`));
-  agents.set(id, agent);
-  return agent;
-}
-
-// Сброс сессии по просьбе хозяина: бот сохраняет заметки и создаёт файл RESET в своей папке (см. промпт),
-// мы закрываем сессию и начинаем новую с чистого контекста.
-setInterval(() => {
-  for (const [id, agent] of agents) {
-    const flag = path.join(os.homedir(), 'robot/bots', slug(agent.bot), 'RESET');
-    if (!fs.existsSync(flag)) continue;
-    fs.rmSync(flag, { force: true });
-    agent.close();
-    forgetSession(id);
-    const fresh = startAgent(id, agent.human, agent.bot);
-    if (people.has(id)) people.get(id).agent = fresh;
-    log(`♻️ ${agent.bot}: сессия сброшена по просьбе хозяина, начата новая`);
-  }
-}, 2000);
+// ── Сессии Claude живут в отдельном процессе (src/sessions.mjs); здесь только связь с ним ──
+// Благодаря этому перезапуск голосового бота не прерывает сессии и их саб-агентов.
+const sessions = (() => {
+  let sock = null;
+  const send = (obj) => { if (sock?.writable) sock.write(JSON.stringify(obj) + '\n'); };
+  const connect = () => {
+    const s = net.connect(Number(process.env.SESSIONS_PORT || 8766), '127.0.0.1');
+    let buf = '';
+    s.on('connect', () => {
+      sock = s;
+      // После (пере)подключения напоминаем, кто в канале: хозяин сессий мог перезапуститься.
+      for (const [id, p] of people) send({ op: 'ensure', id, human: p.name, bot: p.bot });
+      send({ op: 'present', ids: [...people.keys()] });
+    });
+    s.on('data', (d) => {
+      buf += d;
+      for (let i; (i = buf.indexOf('\n')) >= 0;) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        try {
+          const ev = JSON.parse(line);
+          if (ev.ev === 'text') log(`🤖 ${ev.bot}: ${ev.text}`);
+          else if (ev.ev === 'error') log(`⚠️ ${ev.bot}: ${ev.text}`);
+          else if (ev.ev === 'reset') log(`♻️ ${ev.bot}: ${ev.text}`);
+          else if (ev.ev === 'rules') log(`📜 ${ev.text}`);
+        } catch { /* обрывок строки */ }
+      }
+    });
+    s.on('error', () => {});
+    s.on('close', () => { if (sock === s) sock = null; setTimeout(connect, 2000); });
+  };
+  connect();
+  return { send, connected: () => Boolean(sock) };
+})();
 
 function join(connection, member) {
   if (people.has(member.id) || member.user.bot) return;
@@ -70,7 +78,8 @@ function join(connection, member) {
   // Здесь экземпляр инструментов нужен только чтобы создать персонажа; сессия ходит за ними в отдельный процесс MCP.
   const fx = createFactorioServer(p.bot, { log: () => {}, aborted: () => false });
   // Сессия живёт дольше присутствия человека в канале: вышел — бот продолжает начатое, вернулся — та же сессия.
-  p.agent = agents.get(member.id) ?? startAgent(member.id, name, p.bot);
+  sessions.send({ op: 'ensure', id: member.id, human: name, bot: p.bot });
+  sessions.send({ op: 'present', ids: [...people.keys()] });
   fx.ensure().then(
     (r) => log(`➕ ${name} в канале: персонаж «${p.bot}» на сервере в точке ${r.pos.x}, ${r.pos.y}`),
     (e) => log(`⚠️ ${p.bot}: сервер Factorio недоступен: ${e.message}`),
@@ -95,6 +104,7 @@ function leave(userId) {
   p.stream.destroy();
   p.decoder.delete?.();
   log(`➖ ${p.name} вышел из канала; «${p.bot}» продолжает начатое и ждёт хозяина`);
+  sessions.send({ op: 'present', ids: [...people.keys()] });
 }
 
 // Процедуру сброса передаём прямо в сообщении: возобновлённая сессия работает со старым системным промптом
@@ -115,27 +125,12 @@ function feed(p, samples) {
       // и будет прочитана, когда модель дойдёт до неё; текущие действия не прерываются.
       // «Сбрось сессию» распознаётся как «брось сессию», «сброс сессии» и т. п. — подсказываем сессии, что имелось в виду.
       const reset = /(с?брос\p{L}*|очист\p{L}*|обнул\p{L}*|перезапуст\p{L}*)\s+(\p{L}+\s+)?(сесси|контекст)/iu.test(text);
-      p.agent.send(`[${p.name}]: ${text}` + (reset ? RESET_HOWTO : ''));
+      const id = [...people].find(([, v]) => v === p)?.[0];
+      if (!sessions.connected()) log('⚠️ нет связи с хозяином сессий — реплика не доставлена');
+      sessions.send({ op: 'say', id, text: `[${p.name}]: ${text}` + (reset ? RESET_HOWTO : '') });
     }, (e) => console.log(stamp(), 'stt error', e.message));
   }
 }
-
-// Сообщения ботов из игрового чата (в том числе от внешних клиентов MCP) раздаём сессиям остальных персонажей.
-let chatSeq = null;
-setInterval(async () => {
-  try {
-    const r = await readChat(chatSeq ?? Number.MAX_SAFE_INTEGER);
-    if (chatSeq !== null) {
-      for (const m of r.messages) {
-        for (const [id, agent] of agents) {
-          // Пока хозяина нет в канале, чат будит только занятого бота: иначе дозорные скрипты всю ночь жгли бы ходы впустую.
-          if (agent.bot !== m.from && (people.has(id) || agent.busy)) agent.send(`[игровой чат] ${m.from}: ${m.text}`);
-        }
-      }
-    }
-    chatSeq = r.seq;
-  } catch { /* сервер перезапускается */ }
-}, 2000);
 
 // Discord не шлёт пакеты, пока человек молчит, поэтому тишину для детектора пауз дорисовываем сами.
 const SILENCE = new Float32Array(320);
