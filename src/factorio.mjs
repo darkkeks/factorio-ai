@@ -184,6 +184,21 @@ local function marks()
 end
 `;
 
+// Повороты по плану (fb-051): ghost_place с replace не сносит такую же постройку, повёрнутую иначе, а записывает
+// «повернуть» в storage.vb_rot ({e, dir, by, plan}); поворачивает её потом персонаж руками (ghost_build → rotate_many).
+const ROT_FN = `
+-- Повороты, которые ещё предстоит сделать: без снесённого, уже повёрнутого как надо и помеченного на снос.
+local function rots()
+  local keep = {}
+  for _, r in pairs(storage.vb_rot or {}) do
+    if r.e.valid and r.e.direction ~= r.dir and not r.e.to_be_deconstructed() then keep[#keep+1] = r end
+  end
+  storage.vb_rot = keep
+  return keep
+end
+local function in_sel(p) return not A.x1 or (p.x >= A.x1 and p.x <= A.x2 and p.y >= A.y1 and p.y <= A.y2) end
+`;
+
 // Осмотреть объект в точке (x, y) глазами персонажа e. Общая часть inspect и inspect_many.
 const INSPECT_FN = `
 local function inspect_one(e, x, y)
@@ -969,7 +984,7 @@ const BODY = {
   // без предметов и мгновенно; строить их потом надо руками из инвентаря — ghost_build идёт через place_many).
   // Планы лежат в storage.vb_ghost[имя] = {by, ents — сами призраки}; дописывать и убирать план может только автор.
   // A.items — список {item, x, y, direction, underground, recipe}; повторный вызов с теми же клетками ничего не дублирует.
-  ghost_add: MARK_FN + `
+  ghost_add: MARK_FN + ROT_FN + `
     local e = bot()
     local s, f = e.surface, e.force
     storage.vb_ghost = storage.vb_ghost or {}
@@ -986,6 +1001,17 @@ const BODY = {
     local function no(it, why) blocked_count = blocked_count + 1 if #blocked < 15 then blocked[#blocked+1] = {item=it.item, x=it.x, y=it.y, why=why} end end
     local M = marks()
     local marked, marked_count = {}, 0
+    local R = rots()
+    local to_rotate, rotate_count, wrong_dir = {}, 0, 0
+    -- Такую же постройку, повёрнутую иначе, игрок не сносит, а поворачивает на месте. Так можно, если она вообще
+    -- поворачивается и при повороте занимает те же клетки (квадратная или разворот на 180°); подземный конвейер
+    -- при повороте меняет вход на выход, его — только сносом.
+    local function turnable(c, pr, dir)
+      if not c.supports_direction or not c.rotatable or c.type == 'underground-belt' then return false end
+      local cb = pr.collision_box
+      local w, h = cb.right_bottom.x - cb.left_top.x, cb.right_bottom.y - cb.left_top.y
+      return math.abs(w - h) < 0.05 or (dir - c.direction) % 8 == 0
+    end
     -- Можно ли поставить призрак. С A.replace — как чертёж поверх построек: то, что мешает (постройки своей команды,
     -- деревья, камни), помечается на снос, и призрак встаёт поверх; если всё равно нельзя — пометки снимаются обратно.
     local function can_ghost(pr, it, dir)
@@ -1019,14 +1045,26 @@ const BODY = {
       elseif not f.is_chunk_charted(s, {math.floor(it.x/32), math.floor(it.y/32)}) then no(it, 'карта здесь не открыта')
       else
         local dir = defines.direction[it.direction or 'north']
-        local same
+        local same, turn
         for _, c in pairs(s.find_entities_filtered{area={{it.x-0.1, it.y-0.1}, {it.x+0.1, it.y+0.1}}, force=f}) do
           if (c.name == pr.name or (c.type == 'entity-ghost' and c.ghost_name == pr.name)) and dist(c.position, it) < 0.1 then
-            -- С replace такая же постройка, но помеченная на снос или повёрнутая иначе, — не «уже стоит»: её заменит призрак.
-            if not (A.replace and c.type ~= 'entity-ghost' and (c.to_be_deconstructed() or (c.supports_direction and c.direction ~= dir))) then same = c end
+            -- С replace такая же постройка, но помеченная на снос или повёрнутая иначе, — не «уже стоит»: повёрнутую
+            -- иначе надо повернуть (turn), а помеченную на снос и ту, что на месте не повернуть, заменит призрак.
+            if c.type == 'entity-ghost' then same = c
+            elseif c.to_be_deconstructed() then if not A.replace then same = c end
+            elseif c.supports_direction and c.direction ~= dir then
+              if not A.replace then same = c wrong_dir = wrong_dir + 1
+              elseif turnable(c, pr, dir) then turn = c end
+            else same = c end
           end
         end
-        if same then already = already + 1
+        if turn then
+          local found
+          for _, r in pairs(R) do if r.e == turn then r.dir = dir r.by = A.bot r.plan = A.name found = true end end
+          if not found then R[#R+1] = {e=turn, dir=dir, by=A.bot, plan=A.name} end
+          rotate_count = rotate_count + 1
+          if #to_rotate < 30 then to_rotate[#to_rotate+1] = {name=turn.name, x=turn.position.x, y=turn.position.y, from=dirname(turn.direction), to=dirname(dir)} end
+        elseif same then already = already + 1
         elseif #ents >= 5000 then full = true no(it, 'в плане уже 5000 призраков: заведи план с другим именем')
         elseif not can_ghost(pr, it, dir) then no(it, A.replace and 'занято тем, что нельзя пометить на снос (чужой призрак, вода, не та поверхность)' or 'занято или не та поверхность (поверх построек — replace=true)')
         else
@@ -1046,12 +1084,12 @@ const BODY = {
       storage.vb_ghost[A.name] = {by=A.bot, ents=ents}
       if storage.vb_ghost_done then storage.vb_ghost_done[A.name] = nil end
     else storage.vb_ghost[A.name] = nil end
-    return {placed=placed, already=already, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full, marked=marked, marked_count=marked_count}`,
+    return {placed=placed, already=already, wrong_dir=wrong_dir, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full, marked=marked, marked_count=marked_count, to_rotate=to_rotate, rotate_count=rotate_count}`,
 
   // Призраки плана A.name и/или в прямоугольнике A.x1..A.y2: сколько чего нужно, что есть в инвентаре, границы;
   // A.limit — сколько призраков приложить списком (ближайшие к персонажу сверху). Без имени и области — список планов.
   // Призраки видны на карте всей команде, поэтому расстояние не ограничено. Заодно чистит планы от построенного.
-  ghost_q: MARK_FN + `
+  ghost_q: MARK_FN + ROT_FN + `
     local e = bot()
     local s, f = e.surface, e.force
     storage.vb_ghost = storage.vb_ghost or {}
@@ -1079,17 +1117,28 @@ const BODY = {
     local names = {}
     for n in pairs(storage.vb_ghost) do names[#names+1] = n end
     table.sort(names)
+    -- Повороты по планам (ghost_place с replace): план, от которого остались одни повороты, всё ещё план.
+    local RA, rot_n, rot_by, has_rot = rots(), {}, {}, false
+    for _, r in pairs(RA) do
+      rot_n[r.plan] = (rot_n[r.plan] or 0) + 1 rot_by[r.plan] = r.by
+      if r.plan == A.name then has_rot = true end
+    end
     if not A.name and not A.x1 then
       local list = {}
       for _, n in ipairs(names) do
         local by = storage.vb_ghost[n].by
         local l = live(n)
-        if #l > 0 then list[#list+1] = {name=n, by=by, ghosts=#l, area=box(l)} end
+        if #l > 0 then list[#list+1] = {name=n, by=by, ghosts=#l, to_rotate=rot_n[n], area=box(l)} rot_n[n] = nil end
       end
+      for n, k in pairs(rot_n) do list[#list+1] = {name=n, by=rot_by[n], ghosts=0, to_rotate=k} end
+      table.sort(list, function(a, b) return a.name < b.name end)
       return {plans=list, count=#list}
     end
+    local RS = {}
+    for _, r in pairs(RA) do if (not A.name or r.plan == A.name) and in_sel(r.e.position) then RS[#RS+1] = r end end
     local list = {}
-    if A.name then
+    if A.name and not storage.vb_ghost[A.name] and has_rot then
+    elseif A.name then
       if not storage.vb_ghost[A.name] then
         local d = (storage.vb_ghost_done or {})[A.name]
         if d then return {name=A.name, by=d.by, ghosts=0, already_built=true, cost={}, have={}, missing={}, enough=true, items={},
@@ -1142,17 +1191,35 @@ const BODY = {
       blockers = {}
       for i = 1, math.min(#blk, A.blockers) do blockers[i] = mark_row(blk[i].c) end
     end
-    return {name=A.name, by=A.name and storage.vb_ghost[A.name] and storage.vb_ghost[A.name].by or nil, ghosts=#rows, to_remove=#blk, area=box(list), cost=cost, have=have, missing=missing, enough=enough, items=items, blockers=blockers}`,
+    local rotations
+    if A.rotations then
+      table.sort(RS, function(a, b) return dist(me, a.e.position) < dist(me, b.e.position) end)
+      rotations = {}
+      for i = 1, math.min(#RS, A.rotations) do
+        local c = RS[i].e
+        rotations[i] = {name=c.name, x=c.position.x, y=c.position.y, direction=dirname(RS[i].dir)}
+      end
+    end
+    return {name=A.name, by=A.name and (storage.vb_ghost[A.name] and storage.vb_ghost[A.name].by or rot_by[A.name]) or nil, ghosts=#rows, to_remove=#blk, to_rotate=#RS, area=box(list), cost=cost, have=have, missing=missing, enough=enough, items=items, blockers=blockers, rotations=rotations}`,
 
   // Убрать призраки своих планов: план A.name целиком или его часть в области; только область — свои планы в ней.
-  ghost_clear: MARK_FN + `
+  ghost_clear: MARK_FN + ROT_FN + `
     bot()
     storage.vb_ghost = storage.vb_ghost or {}
+    local RA = rots()
     if A.name then
       local pl = storage.vb_ghost[A.name]
+      if not pl then for _, r in pairs(RA) do if r.plan == A.name then pl = {by=r.by, ents={}} end end end
       if not pl then fail('нет плана '..A.name) end
       if pl.by ~= A.bot then fail('план '..A.name..' ведёт '..pl.by..': убрать его может только он') end
     end
+    -- Запланированные повороты этих планов забываются вместе с призраками (сами постройки не трогаются).
+    local keep_rot, rotations_dropped = {}, 0
+    for _, r in pairs(RA) do
+      if r.by == A.bot and (not A.name or r.plan == A.name) and in_sel(r.e.position) then rotations_dropped = rotations_dropped + 1
+      else keep_rot[#keep_rot+1] = r end
+    end
+    storage.vb_rot = keep_rot
     local removed, plans = 0, {}
     for n, pl in pairs(storage.vb_ghost) do
       if pl.by == A.bot and (not A.name or n == A.name) then
@@ -1177,7 +1244,7 @@ const BODY = {
         if m.e.cancel_deconstruction(m.e.force.name == 'neutral' and game.forces.player or m.e.force) ~= false then unmarked = unmarked + 1 end
       end
     end
-    return {removed=removed, unmarked=unmarked, plans=plans}`,
+    return {removed=removed, unmarked=unmarked, rotations_dropped=rotations_dropped, plans=plans}`,
 
   // Метки сноса — как планировщик разборки в игре: видны всем, помеченная постройка перестаёт работать, снимает её потом
   // персонаж руками (demolish). A.points — список точек, иначе прямоугольник A.x1..A.y2; A.names — только такие объекты
@@ -1280,6 +1347,35 @@ const BODY = {
           free_at = math.max(free_at, game.tick - 30) + math.max(2, math.ceil(mt*60/speed))
           out[#out+1] = {i=it.i, ok=true}
         else out[#out+1] = {i=it.i, ok=false, why='не снимается: в инвентаре нет места'} end
+      end
+    end
+    storage.vb_dm[A.bot] = free_at
+    return {results=out, far=far, waiting=waiting, wait_ticks=math.max(0, free_at - game.tick)}`,
+
+  // Повернуть руками постройки из списка A.items ({i, name, x, y, direction}) — только те, до которых персонаж
+  // дотягивается (10 клеток), и в темпе игрока: навести и нажать «повернуть» — около пяти в секунду (руки общие
+  // с разборкой, storage.vb_dm). Ничего не снимается и не тратится.
+  rotate_many: `
+    local e = bot()
+    local s, f = e.surface, e.force
+    storage.vb_dm = storage.vb_dm or {}
+    local free_at = math.max(storage.vb_dm[A.bot] or 0, game.tick - 30)
+    local out, far, waiting = {}, 0, 0
+    for _, it in ipairs(A.items) do
+      local t
+      for _, c in pairs(s.find_entities_filtered{name=it.name, area={{it.x-0.1, it.y-0.1}, {it.x+0.1, it.y+0.1}}, force=f}) do
+        if dist(c.position, it) < 0.1 then t = c end
+      end
+      local dir = defines.direction[it.direction]
+      if not t or t.direction == dir then out[#out+1] = {i=it.i, gone=true}
+      elseif dist(e.position, t.position) > 10 then far = far + 1
+      elseif free_at > game.tick then waiting = waiting + 1
+      else
+        pcall(function() t.direction = dir end)
+        if t.valid and t.direction == dir then
+          free_at = math.max(free_at, game.tick - 30) + 12
+          out[#out+1] = {i=it.i, ok=true}
+        else out[#out+1] = {i=it.i, ok=false, why='не поворачивается (мешает соседняя постройка или труба?)'} end
       end
     end
     storage.vb_dm[A.bot] = free_at
@@ -2753,8 +2849,8 @@ export function createFactorioServer(botName, hooks) {
   /** Добавить призраки items в план name (BODY.ghost_add). Общая часть ghost_place и route. */
   async function ghostAdd(name, items, replace = false) {
     const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
-    const marked = [];
-    let markedCount = 0;
+    const marked = [], toRotate = [];
+    let markedCount = 0, rotateCount = 0, wrongDir = 0;
     // Кусками, чтобы команда оставалась короткой.
     for (let i = 0; i < items.length; i += 50) {
       const r = await run('ghost_add', { name, items: items.slice(i, i + 50), replace: replace || undefined });
@@ -2762,11 +2858,16 @@ export function createFactorioServer(botName, hooks) {
       if (Array.isArray(r.blocked)) out.blocked.push(...r.blocked);
       if (Array.isArray(r.marked)) marked.push(...r.marked);
       markedCount += r.marked_count || 0;
+      if (Array.isArray(r.to_rotate)) toRotate.push(...r.to_rotate);
+      rotateCount += r.rotate_count || 0;
+      wrongDir += r.wrong_dir || 0;
       if (r.full) break;
     }
     out.blocked = out.blocked.slice(0, 15);
     if (!out.blocked_count) { delete out.blocked; delete out.blocked_count; }
     if (markedCount) { out.marked_for_removal = marked.slice(0, 30); out.marked_count = markedCount; }
+    if (rotateCount) { out.to_rotate = toRotate.slice(0, 30); out.to_rotate_count = rotateCount; }
+    if (wrongDir) { out.already_wrong_direction = wrongDir; out.warning = `из already ${wrongDir} — такие же постройки, но повёрнутые иначе, чем в плане: они останутся как есть; чтобы план их повернул, повтори вызов с replace=true`; }
     return out;
   }
 
@@ -2802,6 +2903,35 @@ export function createFactorioServer(botName, hooks) {
       try { await approach(t.x, t.y, t.close ? 2.5 : 8); } catch (e) { if (/враг/.test(e.message)) { stopped = e.message; break; } }
     }
     return { removed, skipped, full, stopped: stopped || undefined };
+  }
+
+  /** Повернуть руками постройки (BODY.rotate_many): items — {name, x, y, direction} из ghost_q. Устроено как demolishMany. */
+  async function rotateMany(items, deadline) {
+    let pending = items.map((it, k) => ({ ...it, i: k + 1 }));
+    const skipped = [];
+    let rotated = 0, stopped, walkedFor = null;
+    while (pending.length) {
+      const r = await run('rotate_many', { items: pending });
+      const results = Array.isArray(r.results) ? r.results : [];
+      const gone = new Set();
+      for (const x of results) {
+        const it = pending.find((p) => p.i === x.i);
+        gone.add(x.i);
+        if (x.ok) rotated++;
+        else if (!x.gone) skipped.push({ name: it.name, x: it.x, y: it.y, why: x.why });
+      }
+      pending = pending.filter((p) => !gone.has(p.i));
+      if (!pending.length) break;
+      stopped = await interrupted();
+      if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов';
+      if (stopped) break;
+      if (results.length || r.waiting > 0) { await sleep(Math.min(1000, Math.max(50, (r.wait_ticks || 0) * 16))); continue; }
+      const t = pending[0];
+      if (walkedFor === t.i) { skipped.push({ name: t.name, x: t.x, y: t.y, why: 'не смог подойти' }); pending.shift(); continue; }
+      walkedFor = t.i;
+      try { await approach(t.x, t.y, 8); } catch (e) { if (/враг/.test(e.message)) { stopped = e.message; break; } }
+    }
+    return { rotated, skipped, stopped: stopped || undefined };
   }
 
   /**
@@ -3097,7 +3227,7 @@ export function createFactorioServer(botName, hooks) {
     def('template_delete', 'Удалить свой шаблон построек (сами постройки на карте не трогает).', { name: z.string() },
       (a) => run('tpl_delete', { name: a.name.trim() })),
 
-    def('ghost_place', 'План-призраки: поставить на карту призраки построек, как чертёж в игре, — план виден всем на карте (и людям, и ботам), стройку можно согласовать до начала. Предметы не нужны и ничего не тратится: призрак — только разметка; строит его потом ghost_build из инвентаря. Призраки добавляются в план с именем name; план можно дописывать частями — сколько угодно вызовов под одним именем (до 500 призраков за вызов, до 5000 в плане), так что одним планом размечается целый район. Что ставить: либо items — список {item, x, y, direction, underground, recipe}, либо template — шаблон (template_save), (x, y) — клетка его северо-западного угла после поворота, rotation — поворот. Ставить можно где угодно на открытой карте, идти туда не нужно. Где уже стоит такая же постройка или такой же призрак — пропускается (already), так что повторять вызов безопасно; занятые клетки — в blocked с причиной. С replace=true план рисуется поверх существующих построек, как чертёж с заменой: всё, что мешает призраку (постройки своей команды, в том числе такая же, но повёрнутая иначе, деревья, камни), помечается на снос — метка видна всем, помеченная постройка сразу перестаёт работать; что помечено — в marked_for_removal (до 30) и marked_count. ghost_build сначала снимает помеченное, потом строит. Дописывать и убирать план может только автор.',
+    def('ghost_place', 'План-призраки: поставить на карту призраки построек, как чертёж в игре, — план виден всем на карте (и людям, и ботам), стройку можно согласовать до начала. Предметы не нужны и ничего не тратится: призрак — только разметка; строит его потом ghost_build из инвентаря. Призраки добавляются в план с именем name; план можно дописывать частями — сколько угодно вызовов под одним именем (до 500 призраков за вызов, до 5000 в плане), так что одним планом размечается целый район. Что ставить: либо items — список {item, x, y, direction, underground, recipe}, либо template — шаблон (template_save), (x, y) — клетка его северо-западного угла после поворота, rotation — поворот. Ставить можно где угодно на открытой карте, идти туда не нужно. Где уже стоит такая же постройка или такой же призрак — пропускается (already), так что повторять вызов безопасно; занятые клетки — в blocked с причиной. С replace=true план рисуется поверх существующих построек, как чертёж с заменой: всё, что мешает призраку (постройки своей команды, деревья, камни), помечается на снос — метка видна всем, помеченная постройка сразу перестаёт работать; что помечено — в marked_for_removal (до 30) и marked_count. Такая же постройка, но повёрнутая иначе (конвейер, манипулятор, бур и т. п.), не сносится: она попадает в to_rotate ({name, x, y, from, to}; to_rotate_count) и продолжает работать как раньше, пока ghost_build её не повернёт на месте. ghost_build сначала снимает помеченное, потом поворачивает, потом строит. Без replace такая постройка считается уже стоящей (already) и остаётся повёрнутой по-старому — об этом скажет warning. Дописывать и убирать план может только автор.',
       { name: z.string().min(1).max(40).describe('имя плана'),
         items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
           direction: z.enum(DIRECTIONS).default('north').describe('как в place'),
@@ -3118,11 +3248,11 @@ export function createFactorioServer(botName, hooks) {
         }
         if (!items) throw new Error('укажи items или template');
         const out = await ghostAdd(a.name.trim(), items, a.replace);
-        out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build' + (out.marked_count ? ' (сначала сам снимет помеченное на снос)' : '');
+        out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build' + (out.marked_count || out.to_rotate_count ? ' (сначала сам снимет помеченное на снос и повернёт то, что в to_rotate)' : '');
         return out;
       }),
 
-    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area), сколько построек под этими призраками помечено на снос (to_remove). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает из списка, а по имени отвечает already_built=true и ghosts=0.',
+    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area), сколько построек под этими призраками помечено на снос (to_remove), сколько построек план велел повернуть на месте (to_rotate). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает из списка, а по имени отвечает already_built=true и ghosts=0.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
         layout: z.boolean().default(false).describe('приложить список призраков (до 100 ближайших)') },
@@ -3135,7 +3265,7 @@ export function createFactorioServer(botName, hooks) {
         return r;
       }),
 
-    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Если под призраками есть постройки, помеченные на снос (ghost_place с replace=true, mark_remove), сначала снимает их руками — содержимое и сама постройка идут в инвентарь (removed); кончилось место — останавливается (stopped), разгрузись и повтори. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов. План, в котором призраков уже не осталось (всё построено), — не ошибка: already_built=true.',
+    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Если под призраками есть постройки, помеченные на снос (ghost_place с replace=true, mark_remove), сначала снимает их руками — содержимое и сама постройка идут в инвентарь (removed); кончилось место — останавливается (stopped), разгрузись и повтори. Затем поворачивает на месте постройки, которые план велел повернуть (to_rotate из ghost_place с replace=true): подходит и поворачивает руками, около пяти в секунду (rotated; не вышло — not_rotated, осталось — to_rotate_left). Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов. План, в котором призраков уже не осталось (всё построено), — не ошибка: already_built=true.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
         wait_craft_s: waitCraftArg },
@@ -3167,13 +3297,29 @@ export function createFactorioServer(botName, hooks) {
             stopped = r.stopped;
           }
         }
-        const removal = () => (Object.keys(removed).length || notRemoved.length ? { removed, not_removed: notRemoved.length ? notRemoved.slice(0, 15) : undefined } : {});
+        let rotated = 0;
+        const notRotated = [];
+        const removal = () => ({ ...(Object.keys(removed).length || notRemoved.length ? { removed, not_removed: notRemoved.length ? notRemoved.slice(0, 15) : undefined } : {}),
+          ...(rotated || notRotated.length ? { rotated, not_rotated: notRotated.length ? notRotated.slice(0, 15) : undefined } : {}) });
         if (stopped) {
           const q = await run('ghost_q', { ...sel, limit: 0 }).catch(() => null);
-          return { plan: sel.name, placed: 0, ...removal(), to_remove_left: q ? q.to_remove : undefined, ghosts_left: q ? q.ghosts : undefined, stopped, completed: false,
+          return { plan: sel.name, placed: 0, ...removal(), to_remove_left: q ? q.to_remove : undefined, to_rotate_left: q && q.to_rotate ? q.to_rotate : undefined, ghosts_left: q ? q.ghosts : undefined, stopped, completed: false,
             note: inventoryFull ? 'снос не закончен: освободи инвентарь (сложи снятое в сундук) и повтори тот же вызов' : 'снос не закончен: повтори тот же вызов' };
         }
-        for (;;) {
+        // Потом поворачивается то, что план велел повернуть (ghost_place с replace поверх такой же постройки).
+        if (q0.to_rotate > 0) {
+          const tried = new Set();
+          while (!stopped) {
+            const qr = await run('ghost_q', { ...sel, limit: 0, rotations: 150 + tried.size });
+            const todo = (Array.isArray(qr.rotations) ? qr.rotations : []).filter((b) => !tried.has(`${b.name}@${b.x},${b.y}`));
+            if (!todo.length) break;
+            const r = await rotateMany(todo, deadline);
+            rotated += r.rotated;
+            for (const s of r.skipped) { tried.add(`${s.name}@${s.x},${s.y}`); notRotated.push(s); }
+            stopped = r.stopped;
+          }
+        }
+        for (; !stopped;) {
           const q = await run('ghost_q', { ...sel, limit: 150 });
           const have = { ...q.have };
           const todo = [];
@@ -3200,8 +3346,8 @@ export function createFactorioServer(botName, hooks) {
         for (const x of built) by[x.placed] = (by[x.placed] || 0) + 1;
         const miss = q && q.missing && Object.keys(q.missing).length ? q.missing : undefined;
         const sk = [...skipped.values()];
-        return { plan: sel.name, placed: built.length, ...removal(), waited_craft_s: waited ?? undefined, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
-          skipped: sk.slice(0, 15), skipped_count: sk.length, stopped, completed: q ? q.ghosts === 0 : undefined,
+        return { plan: sel.name, placed: built.length, ...removal(), waited_craft_s: waited ?? undefined, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, to_rotate_left: q && q.to_rotate ? q.to_rotate : undefined, missing: miss,
+          skipped: sk.slice(0, 15), skipped_count: sk.length, stopped, completed: q ? q.ghosts === 0 && !q.to_rotate : undefined,
           note: q && q.ghosts > 0 && !miss && !sk.length ? 'не всё успел: повтори тот же вызов' : undefined };
       }),
 
