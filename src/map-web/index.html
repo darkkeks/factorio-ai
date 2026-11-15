@@ -43,6 +43,13 @@
   .event b { color: #ffcc33; font-weight: 600; }
 
   #bot { position: absolute; z-index: 1000; left: 10px; bottom: 26px; width: 380px; max-width: calc(100vw - 20px); max-height: 55%; overflow-y: auto; padding: 10px 12px; box-sizing: border-box; }
+  #live { position: absolute; z-index: 1000; left: 10px; top: 84px; width: 480px; max-width: calc(100vw - 20px); padding: 6px; box-sizing: border-box; }
+  #live.big { width: 960px; }
+  #live.hidden { display: none; }
+  #live video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 3px; }
+  #live header { display: flex; align-items: center; gap: 8px; padding: 0 2px 5px; }
+  #live header span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #live-btn { position: absolute; z-index: 1001; left: 10px; top: 84px; }
   #bot header { display: flex; align-items: center; gap: 8px; }
   #bot header b { flex: 1; color: #ffcc33; font-size: 16px; }
   button { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
@@ -65,6 +72,11 @@
   <h3>Электросеть</h3><div id="power" class="muted">—</div>
   <h3>Тревоги</h3><div id="alerts" class="muted">—</div>
   <h3>События</h3><div id="events" class="muted">—</div>
+</div>
+<button id="live-btn" class="box">▶ живое окно</button>
+<div id="live" class="box hidden">
+  <header><span id="live-cap" class="muted">подключение…</span><button id="live-auto" title="Камера сама выбирает, за кем следить">авто</button><button id="live-size">⤢</button><button id="live-close">✕</button></header>
+  <video id="live-video" muted autoplay playsinline></video>
 </div>
 <div id="bot" class="box hidden">
   <header><b id="bot-name"></b><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
@@ -198,6 +210,7 @@ function onLive(m) {
   $('st-conn').textContent = m.ok ? '' : 'сервер игры не отвечает';
   $('st-conn').className = m.ok ? '' : 'bad';
   actors = m.bots;
+  showTarget(m);
   syncActors('bot', m.bots);
   syncActors('player', m.players);
   if (following && selected) {
@@ -206,9 +219,76 @@ function onLive(m) {
   }
 }
 
+// ---------- живое окно ----------
+// Видео из окна клиента-камеры: один вид на всех зрителей. Рамка на карте показывает, куда смотрит камера.
+let camSize = { w: 53, h: 30 }, camFrame = null, liveWs = null, liveTimer = null, liveBroken = false;
+function showTarget(m) {
+  const t = m.target, a = t && (t.kind === 'bot' ? m.bots : m.players).find((x) => x.name === t.name);
+  const open = !$('live').classList.contains('hidden');
+  if (!a || !open) { if (camFrame) { camFrame.remove(); camFrame = null; } }
+  else {
+    const b = [ll(a.x - camSize.w / 2, a.y - camSize.h / 2), ll(a.x + camSize.w / 2, a.y + camSize.h / 2)];
+    if (camFrame) camFrame.setBounds(b); else camFrame = L.rectangle(b, { color: '#ffcc33', weight: 1.5, fill: false, dashArray: '6 4', interactive: false }).addTo(map);
+  }
+  if (!liveBroken) $('live-cap').textContent = !m.ok ? 'сервер игры не отвечает' : !m.camera ? 'камера не в игре' : t ? `камера следит за: ${t.name}${t.manual ? '' : ' (сама выбрала)'}` : 'камере не за кем следить';
+  $('live-auto').classList.toggle('on', !!t && !t.manual);
+}
+function liveStart() {
+  const video = $('live-video');
+  const MS = window.ManagedMediaSource || window.MediaSource, mime = 'video/mp4; codecs="avc1.42E01F"';
+  if (!MS || !MS.isTypeSupported(mime)) { liveBroken = true; $('live-cap').textContent = 'этот браузер не умеет показывать живое окно (нужен H.264)'; return; }
+  const ms = new MS();
+  let sb = null, queue = [];
+  video.disableRemotePlayback = true;
+  video.src = URL.createObjectURL(ms);
+  const pump = () => {
+    if (!sb || sb.updating || ms.readyState !== 'open') return;
+    try {
+      // Держим в буфере только последние секунды.
+      if (video.buffered.length && video.buffered.start(0) < video.currentTime - 8) return sb.remove(0, video.currentTime - 4);
+      if (queue.length) sb.appendBuffer(queue.shift());
+    } catch { queue = []; }
+  };
+  ms.addEventListener('sourceopen', () => {
+    sb = ms.addSourceBuffer(mime);
+    sb.mode = 'sequence'; // фрагменты идут подряд, с какого бы места ни подключились
+    sb.addEventListener('updateend', pump);
+    pump();
+  });
+  const sock = liveWs = new WebSocket(new URL('video', location.href.split('#')[0]).href.replace(/^http/, 'ws'));
+  sock.binaryType = 'arraybuffer';
+  sock.onmessage = (e) => { if (queue.length > 30) queue = []; queue.push(e.data); pump(); };
+  sock.onclose = () => { if (liveWs === sock) { liveStop(); liveTimer = setTimeout(() => { if (!$('live').classList.contains('hidden')) liveStart(); }, 2000); } };
+  // Не отставать от эфира: накопилось больше полутора секунд — перепрыгиваем к свежему.
+  liveTimer = setInterval(() => {
+    const b = video.buffered;
+    if (!b.length) return;
+    const end = b.end(b.length - 1);
+    if (end - video.currentTime > 1.5 || video.currentTime < b.start(b.length - 1)) video.currentTime = end - 0.3;
+    if (video.paused) video.play().catch(() => {});
+  }, 1000);
+}
+function liveStop() {
+  clearInterval(liveTimer); clearTimeout(liveTimer);
+  const s = liveWs; liveWs = null;
+  if (s) s.close();
+  const v = $('live-video');
+  if (v.src) { URL.revokeObjectURL(v.src); v.removeAttribute('src'); v.load(); }
+}
+$('live-btn').onclick = () => { $('live').classList.remove('hidden'); $('live-btn').style.display = 'none'; liveStart(); };
+$('live-close').onclick = () => { $('live').classList.add('hidden'); $('live-btn').style.display = ''; liveStop(); if (camFrame) { camFrame.remove(); camFrame = null; } };
+$('live-size').onclick = () => $('live').classList.toggle('big');
+$('live-auto').onclick = () => wsSend({ t: 'follow', name: null });
+if (new URLSearchParams(location.search).has('live')) $('live-btn').onclick(); // ссылка сразу с живым окном: ?live
+
 // ---------- панель бота ----------
 let botTimer = null;
-function setFollow(on) { following = on && !!selected; $('bot-follow').classList.toggle('on', following); }
+function setFollow(on) {
+  following = on && !!selected;
+  $('bot-follow').classList.toggle('on', following);
+  // Камера живого окна идёт за тем же ботом, пока его не отпустили кнопкой «авто».
+  if (following) wsSend({ t: 'follow', kind: 'bot', name: selected });
+}
 function openBot(name) {
   selected = name;
   $('bot').classList.remove('hidden');
@@ -277,6 +357,7 @@ if (innerWidth > 900) $('side').classList.remove('hidden');
 
 // ---------- связь с сервисом ----------
 let ws = null;
+function wsSend(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 function sendView() {
   const b = map.getBounds();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'view', x1: b.getWest(), x2: b.getEast(), y1: b.getSouth(), y2: b.getNorth(), z: viewZ() }));
@@ -307,6 +388,7 @@ function connect() {
     if (m.now) offset = m.now - Date.now();
     if (m.t === 'hello') {
       sweepMs = m.sweep_ms;
+      if (m.cam) camSize = m.cam;
       tiles.clear();
       for (const [z, x, y, ts] of m.tiles) tiles.set(`${z}/${x}/${y}`, ts);
       setCharted(m.chunks);

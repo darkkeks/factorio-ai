@@ -1,0 +1,15 @@
+# https://factorio.darkkeks.me (Cloudflare → nginx-proxy по VIRTUAL_HOST) → сервис карты на хосте (src/map.mjs).
+# Запуск: docker compose up -d
+services:
+  web:
+    image: nginx:alpine
+    container_name: factorio-map
+    restart: unless-stopped
+    environment:
+      VIRTUAL_HOST: factorio.darkkeks.me
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [server-stuff_default]
+networks:
+  server-stuff_default:
+    external: true

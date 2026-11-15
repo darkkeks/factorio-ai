@@ -24,12 +24,15 @@ const SERVER_SETTINGS = path.join(os.homedir(), 'robot/factorio/space-age-1/serv
 const GAME_ADDR = process.env.GAME_ADDR || '127.0.0.1:34197';
 const CAMERA_DIR = process.env.CAMERA_DIR || path.join(os.homedir(), 'factorio-camera'); // внутри — factorio/ (полная копия игры)
 const CAMERA_MANAGE = process.env.CAMERA_MANAGE !== '0';   // 0 — клиент-камеру запускают руками
-const CAMERA_CPUS = process.env.CAMERA_CPUS || '6,7';      // ядра, на которых живёт клиент
-const CAMERA_WINDOW = '640x480';                           // окно клиента; размер снимков от него не зависит
+const CAMERA_CPUS = process.env.CAMERA_CPUS || '2-7';      // потоки процессора, на которых живёт клиент
+const CAMERA_WINDOW = '1280x720';                          // окно клиента — кадр живого окна; размер снимков от него не зависит
+const CAMERA_DISPLAY = process.env.CAMERA_DISPLAY || ':96'; // дисплей Xvfb клиента
+const CAMERA_DATA = process.env.CAMERA_DATA || path.join(CAMERA_DIR, 'factorio'); // папка данных клиента (config, script-output)
+const CAMERA_ZOOM = 0.75;                                  // масштаб живого окна: 24 пикселя на клетку, 53×30 клеток в кадре
 const CAMERA_START_MS = 240_000;                           // сколько ждать подключения после запуска
 const CAMERA_RETRY_MS = 900_000;                           // пауза после неудачного запуска (сервер не пускает); перезапуск сервера её сбрасывает
 const SHOT_DIR = 'map-shots';                              // подпапка script-output клиента
-const SHOTS = path.join(CAMERA_DIR, 'factorio/script-output', SHOT_DIR);
+const SHOTS = path.join(CAMERA_DATA, 'script-output', SHOT_DIR);
 const TILES = process.env.MAP_TILES || path.join(CAMERA_DIR, 'tiles');
 const PID_FILE = path.join(CAMERA_DIR, 'camera.pid');
 const WEB = path.join(ROOT, 'src/map-web');
@@ -38,13 +41,18 @@ const TILE = 512;              // размер тайла в пикселях
 const ZMAX = 5;                // самый подробный уровень: масштаб игры 1, 32 пикселя на клетку
                                // уровень 0 — масштаб 1/32, меньше игра снимать не умеет
 const JPEG_QUALITY = 75;
-const FRESH_MS = 5_000;        // цель для участков в поле зрения и вокруг ботов и игроков
+const FRESH_MS = 5_000;        // цель для участков вокруг ботов и игроков
+const VIEW_MS = 2_000;         // цель для того, на что смотрят зрители (сколько успеет камера)
 const SWEEP_MS = 600_000;      // цель полного фонового обхода
 const BATCH = 8;               // снимков в одной команде RCON
 const PAUSE_MS = 20;           // пауза между пачками
 const SHOT_TIMEOUT_MS = 20_000;
 const VIEW_TILES = 80;         // сколько тайлов одного зрителя считать приоритетными
 const MAX_CLIENTS = 50;
+const VIDEO_FPS = 30;
+const VIDEO_KBPS = 2000;
+const VIDEO_IDLE_MS = 15_000;  // через сколько после ухода последнего зрителя живого окна останавливать кодирование
+const AUTO_HOLD_MS = 20_000;   // камера сама не перескакивает между ботами чаще
 
 const stamp = () => new Date().toISOString().slice(11, 23);
 const log = (...a) => console.log(stamp(), ...a);
@@ -133,7 +141,27 @@ const LUA = {
     end
     return {n=#A.shots}`,
 
-  // Единственное изменение в игре: камера входит с персонажем, как любой новый игрок, — делаем её зрителем.
+  // Живое окно: скрыть интерфейс клиента, держать в центре кадра бота или игрока.
+  // Меняет только настройки и положение самого игрока-камеры.
+  follow: `
+    local p = game.get_player(A.camera)
+    if not p or not p.connected then return {ok=false} end
+    if A.setup then
+      local v = p.game_view_settings
+      for _, k in pairs({'show_controller_gui', 'show_minimap', 'show_research_info', 'show_alert_gui', 'update_entity_selection',
+          'show_side_menu', 'show_map_view_options', 'show_entity_tooltip', 'show_quickbar', 'show_shortcut_bar', 'show_crafting_queue',
+          'show_tool_bar', 'show_hotkey_suggestions', 'show_surface_list'}) do pcall(function() v[k] = false end) end
+      v.show_entity_info = true
+    end
+    p.zoom = A.zoom
+    p.clear_console()
+    local e
+    if A.kind == 'bot' then e = (storage.vb or {})[A.name]
+    elseif A.kind == 'player' then local t = game.get_player(A.name) e = t and t.connected and t.character or nil end
+    if e and e.valid then p.centered_on = e return {ok=true} end
+    return {ok=false}`,
+
+  // Камера входит с персонажем, как любой новый игрок, — делаем её зрителем.
   spectate: `
     local p = game.get_player(A.camera)
     if p and p.controller_type ~= defines.controllers.spectator then
@@ -149,8 +177,13 @@ const LUA = {
 const tiles = new Map();   // "z/x/y" -> { z, x, y, ts } — все тайлы, задевающие разведанные чанки; ts — когда снят
 let charted = [];          // разведанные чанки: x, y, x, y, …
 let pausedAt = 0;          // когда игра встала на паузу (0 — идёт)
+const moved = new Map();   // "bot:имя" | "player:имя" -> когда последний раз сдвинулся
+const lastPos = new Map();
+let target = null;         // за кем следит камера: { kind, name, by: ws | null, since }
+let targetSent = '';       // что уже передано клиенту-камере
+let targetAt = 0;
 const clients = new Set();
-let live = { tick: 0, paused: false, bots: [], players: [], ok: false, camera: false };
+let live = { tick: 0, paused: false, bots: [], players: [], ok: false, camera: false, target: null };
 let summary = null;
 let events = [];           // лента: сообщения ботов и решения по заявкам из игрового чата ботов
 let chatSeq = 0;
@@ -170,7 +203,11 @@ async function liveLoop() {
       if (r.paused && !pausedAt) pausedAt = Date.now();
       if (!r.paused) pausedAt = 0;
       if (r.camera?.connected && !r.camera.spectator) { await lua(LUA.spectate, { camera: CAMERA }); log('камера переведена в режим зрителя'); }
-      live = { tick: r.tick, paused: r.paused, bots: here(r.bots), players: here(r.players), ok: true, camera: !!r.camera?.connected };
+      const was = live.camera;
+      live = { tick: r.tick, paused: r.paused, bots: here(r.bots), players: here(r.players), ok: true, camera: !!r.camera?.connected, target: live.target };
+      if (live.camera && !was) targetSent = ''; // камера только что вошла: настроить заново
+      await aimCamera();
+      if (live.camera && viewers.size && !encoder) startVideo();
       const fresh = list(r.chat).map((m) => ({ seq: m.seq, from: m.from, text: String(m.text).slice(0, 600), at: Date.now() }));
       if (r.seq < chatSeq) { chatSeq = 0; events = []; } // карту сменили
       else if (fresh.length) {
@@ -187,6 +224,34 @@ async function liveLoop() {
     broadcast({ t: 'live', ...live });
     await sleep(1000);
   }
+}
+
+// За кем следит камера: за тем, кого выбрал зритель (последний выбор главнее), иначе — за тем, кто сейчас движется.
+async function aimCamera() {
+  const now = Date.now();
+  const all = [...live.bots.map((a) => ({ ...a, kind: 'bot' })), ...live.players.map((a) => ({ ...a, kind: 'player' }))];
+  for (const a of all) {
+    const k = `${a.kind}:${a.name}`, p = lastPos.get(k);
+    if (!p || p.x !== a.x || p.y !== a.y) { if (p) moved.set(k, now); lastPos.set(k, { x: a.x, y: a.y }); }
+  }
+  const has = (t) => t && all.some((a) => a.kind === t.kind && a.name === t.name);
+  if (target?.by && (!clients.has(target.by) || !has(target))) target = null;
+  if (!target?.by) {
+    const holding = has(target) && now - target.since < AUTO_HOLD_MS;
+    const stillMoving = has(target) && now - (moved.get(`${target.kind}:${target.name}`) ?? 0) < 5000;
+    if (!holding && !stillMoving) {
+      const best = all.map((a) => ({ a, at: moved.get(`${a.kind}:${a.name}`) ?? 0 })).sort((x, y) => y.at - x.at || (x.a.kind === 'bot' ? -1 : 1))[0];
+      if (best && !(has(target) && best.at === 0)) { if (!has(target) || best.a.name !== target.name || best.a.kind !== target.kind) target = { kind: best.a.kind, name: best.a.name, by: null, since: now }; }
+      else if (!has(target)) target = null;
+    }
+  }
+  live.target = target ? { kind: target.kind, name: target.name, manual: !!target.by } : null;
+  if (!live.camera || !target) return;
+  const id = `${target.kind}:${target.name}`;
+  // Повторяем раз в 10 секунд: персонаж мог погибнуть и появиться заново, а заодно чистим чат с экрана клиента.
+  if (id === targetSent && now - targetAt < 10_000) return;
+  const r = await lua(LUA.follow, { camera: CAMERA, kind: target.kind, name: target.name, zoom: CAMERA_ZOOM, setup: targetSent === '' });
+  if (r.ok) { if (id !== targetSent) log(`камера следит за ${target.name}${target.by ? ' (выбор зрителя)' : ''}`); targetSent = id; targetAt = now; }
 }
 
 async function summaryLoop() {
@@ -296,12 +361,14 @@ function pick() {
     const x = Math.round(a.x / s), y = Math.round(a.y / s);
     for (let dx = -1; dx <= 0; dx++) for (let dy = -1; dy <= 0; dy++) hot.add(key(ZMAX, x + dx, y + dy));
   }
-  for (const ws of clients) for (const k of ws.view ?? []) hot.add(k);
+  const viewed = new Set();
+  for (const ws of clients) for (const k of ws.view ?? []) viewed.add(k);
   const now = Date.now(), due = [];
   for (const [k, t] of tiles) {
     if (live.paused && pausedAt && t.ts > pausedAt) continue; // на паузе картинка не меняется
-    const score = (now - t.ts) / (hot.has(k) ? FRESH_MS : SWEEP_MS);
-    if (score >= 1) due.push([t.ts === 0 && hot.has(k) ? Infinity : score, t]);
+    const want = viewed.has(k) ? VIEW_MS : hot.has(k) ? FRESH_MS : SWEEP_MS;
+    const score = (now - t.ts) / want;
+    if (score >= 1) due.push([t.ts === 0 && want !== SWEEP_MS ? Infinity : score, t]);
   }
   due.sort((a, b) => b[0] - a[0]);
   return due.slice(0, BATCH).map((d) => d[1]);
@@ -376,14 +443,16 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 function startCamera() {
   fs.rmSync(SHOTS, { recursive: true, force: true });
   const bin = path.join(CAMERA_DIR, 'factorio/bin/x64/factorio');
-  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, 'xvfb-run', '-a', '-s', `-screen 0 ${CAMERA_WINDOW}x24`,
-    bin, '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
+  const args = [bin, '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
+  if (process.env.CAMERA_CONFIG) args.push('--config', process.env.CAMERA_CONFIG);
   const pw = gamePassword();
   if (pw) args.push('--password', pw);
+  // Xvfb и клиент — в одной группе процессов, чтобы останавливать их вместе. Дисплей фиксированный: с него же берётся видео.
+  const script = `Xvfb ${CAMERA_DISPLAY} -screen 0 ${CAMERA_WINDOW}x24 -nolisten tcp & X=$!; sleep 1; DISPLAY=${CAMERA_DISPLAY} nice -n 10 taskset -c ${CAMERA_CPUS} "$@"; kill $X`;
   const env = { ...process.env };
   delete env.LD_LIBRARY_PATH; // чужие библиотеки из окружения ломают системный Mesa
   const out = fs.openSync(path.join(CAMERA_DIR, 'camera.log'), 'a');
-  const child = spawn('nice', args, { cwd: CAMERA_DIR, env, detached: true, stdio: ['ignore', out, out] });
+  const child = spawn('sh', ['-c', script, 'camera', ...args], { cwd: CAMERA_DIR, env, detached: true, stdio: ['ignore', out, out] });
   fs.closeSync(out);
   child.unref();
   child.on('exit', (code) => { if (camera?.pid === child.pid) { log(`клиент-камера завершился (код ${code})`); camera = null; nextStart = Date.now() + 20_000; } });
@@ -420,6 +489,61 @@ async function cameraLoop() {
       try { startCamera(); } catch (e) { log('не смог запустить клиент-камеру:', e.message); nextStart = now + 60_000; }
     }
   }
+}
+
+// ---------- живое окно: видео из окна клиента-камеры ----------
+// ffmpeg снимает дисплей клиента и отдаёт H.264 во фрагментированном MP4; каждый фрагмент начинается с ключевого кадра,
+// поэтому зрителя можно подключить с любого фрагмента. Кодируем, только пока живое окно кто-то смотрит.
+
+const viewers = new Set(); // WebSocket зрителей живого окна
+let encoder = null, videoInit = null, videoIdle = null;
+
+function startVideo() {
+  if (encoder || !live.camera) return;
+  const gop = Math.round(VIDEO_FPS / 2);
+  const env = { ...process.env };
+  delete env.LD_LIBRARY_PATH;
+  encoder = spawn('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-framerate', String(VIDEO_FPS), '-video_size', CAMERA_WINDOW, '-i', CAMERA_DISPLAY,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
+    '-g', String(gop), '-keyint_min', String(gop), '-sc_threshold', '0', '-b:v', `${VIDEO_KBPS}k`, '-maxrate', `${VIDEO_KBPS * 1.5}k`, '-bufsize', `${VIDEO_KBPS}k`,
+    '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const me = encoder;
+  let buf = Buffer.alloc(0), head = [], moof = null;
+  videoInit = null;
+  me.stdout.on('data', (d) => {
+    buf = buf.length ? Buffer.concat([buf, d]) : d;
+    while (buf.length >= 8) {
+      const size = buf.readUInt32BE(0), type = buf.toString('latin1', 4, 8);
+      if (size < 8 || buf.length < size) break;
+      const box = buf.subarray(0, size);
+      buf = buf.subarray(size);
+      if (type === 'moof') { if (!videoInit) videoInit = Buffer.concat(head); moof = box; }
+      else if (type === 'mdat' && moof) {
+        const frag = Buffer.concat([moof, box]);
+        moof = null;
+        for (const ws of viewers) {
+          if (ws.readyState !== 1 || ws.bufferedAmount > 3_000_000) continue; // не успевает — пропускаем фрагмент
+          if (!ws.started) { ws.send(videoInit); ws.started = true; }
+          ws.send(frag);
+        }
+      } else if (!videoInit) head.push(box);
+    }
+  });
+  me.stderr.on('data', (d) => log('ffmpeg:', String(d).trim().slice(0, 300)));
+  me.on('exit', (code) => {
+    if (encoder !== me) return;
+    encoder = null;
+    log(`кодирование живого окна остановлено (код ${code})`);
+    for (const ws of viewers) ws.started = false;
+    if (viewers.size) setTimeout(startVideo, 3000); // камера перезапускается — пробуем снова
+  });
+  log('кодирование живого окна запущено');
+}
+
+function stopVideo() {
+  const me = encoder;
+  encoder = null;
+  if (me) { me.kill('SIGTERM'); log('живое окно никто не смотрит — кодирование остановлено'); }
 }
 
 // ---------- названия на русском из файлов игры ----------
@@ -477,16 +601,42 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 2048 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 2048 });
+const wssVideo = new WebSocketServer({ noServer: true, maxPayload: 64 });
+server.on('upgrade', (req, socket, headUp) => {
+  const p = new URL(req.url, 'http://x').pathname;
+  const target = p === '/ws' ? wss : p === '/video' ? wssVideo : null;
+  if (!target) return socket.destroy();
+  target.handleUpgrade(req, socket, headUp, (ws) => target.emit('connection', ws, req));
+});
+wssVideo.on('connection', (ws) => {
+  if (viewers.size >= MAX_CLIENTS) return ws.close(1013, 'слишком много зрителей');
+  viewers.add(ws);
+  clearTimeout(videoIdle);
+  startVideo();
+  const gone = () => {
+    viewers.delete(ws);
+    if (!viewers.size) { clearTimeout(videoIdle); videoIdle = setTimeout(() => { if (!viewers.size) stopVideo(); }, VIDEO_IDLE_MS); }
+  };
+  ws.on('close', gone);
+  ws.on('error', gone);
+});
 wss.on('connection', (ws) => {
   if (clients.size >= MAX_CLIENTS) return ws.close(1013, 'слишком много зрителей');
   clients.add(ws);
   const tl = [];
   for (const t of tiles.values()) tl.push([t.z, t.x, t.y, t.ts]);
-  send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, tiles: tl, chunks: charted, summary, events, live, now: Date.now() });
+  send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, chunks: charted, summary, events, live, now: Date.now() });
   ws.on('message', (data) => {
     try {
       const m = JSON.parse(data);
+      if (m.t === 'follow') {
+        // Зритель выбрал, за кем следить камере живого окна (null — отпустить, камера выбирает сама).
+        if (m.name == null) { if (target?.by === ws) target = null; return; }
+        const kind = m.kind === 'player' ? 'player' : 'bot';
+        if ((kind === 'bot' ? live.bots : live.players).some((a) => a.name === m.name)) target = { kind, name: m.name, by: ws, since: Date.now() };
+        return;
+      }
       if (m.t !== 'view' || ![m.x1, m.y1, m.x2, m.y2, m.z].every(Number.isFinite)) return;
       const z = Math.max(0, Math.min(ZMAX, Math.round(m.z))), s = span(z);
       const x1 = Math.floor(Math.min(m.x1, m.x2) / s), x2 = Math.floor(Math.max(m.x1, m.x2) / s);
@@ -508,6 +658,7 @@ setInterval(() => { log(`зрителей ${clients.size}, тайлов ${tiles.
 // Штатная остановка сервиса останавливает и клиент-камеру; после падения сервиса клиент остаётся, и следующий запуск его подхватит.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
+    if (encoder) encoder.kill('SIGTERM');
     if (camera) { try { process.kill(-camera.pid, 'SIGTERM'); } catch { /* уже нет */ } fs.rmSync(PID_FILE, { force: true }); }
     process.exit(0);
   });
