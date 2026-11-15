@@ -1428,6 +1428,254 @@ const BODY = {
     for _, c in pairs({{A.x1, A.y1}, {A.x2-1, A.y1}, {A.x1, A.y2-1}, {A.x2-1, A.y2-1}}) do if not live(c[1], c[2]) then coarse = true end end
     return {x0=A.x1, y0=A.y1, w=W, h=H, rows=rows, named=named, symbols=seen, free=free, unexplored=unknown, coarse=coarse, buildings=counts, details=A.details and details or nil}`,
 
+  // Маршрут конвейера или трубы от клетки (A.fx, A.fy) до (A.tx, A.ty): только расчёт по тому, что игрок видит на
+  // экране и карте (как area_map), ничего не ставит. A* по клеткам, состояние — клетка, направление прихода и признак
+  // «здесь выход из-под земли» (после него можно только прямо). Занятое (постройки, деревья, камни, скалы, вода,
+  // призраки, неоткрытая карта) обходится или проходится под землёй парой подземных концов. Чужое не задеваем:
+  // труба не ложится в клетку, куда смотрит соединение чужой трубы или машины; лента — в клетку, куда везёт чужая лента;
+  // подземный участок не пересекает по той же оси чужие подземные концы и не ставит свои концы внутри чужой пары.
+  // Начало и конец маршрута от этих запретов свободны: там соединение и нужно.
+  route: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    local ip = prototypes.item[A.item]
+    local pr = ip and ip.place_result
+    if not pr or (pr.type ~= 'transport-belt' and pr.type ~= 'pipe') then fail('route прокладывает только конвейер или трубу: item — например transport-belt, fast-transport-belt, pipe') end
+    local pipe = pr.type == 'pipe'
+    local ug, ugitem, maxd
+    if A.underground then
+      if pipe then ug = prototypes.entity['pipe-to-ground'] else pcall(function() ug = pr.related_underground_belt end) end
+      if ug then
+        pcall(function() maxd = ug.max_underground_distance end)
+        if pipe and not maxd then maxd = 10 end
+        local it = ug.items_to_place_this
+        ugitem = it and it[1] and it[1].name
+        if not maxd or not ugitem then ug = nil end
+      end
+    end
+    local m = A.margin
+    local x1, y1 = math.min(A.fx, A.tx)-m, math.min(A.fy, A.ty)-m
+    local x2, y2 = math.max(A.fx, A.tx)+m+1, math.max(A.fy, A.ty)+m+1
+    local H = y2-y1
+    local function idx(x, y) if x < x1 or x >= x2 or y < y1 or y >= y2 then return nil end return (x-x1)*H + (y-y1) end
+    local chart, vis = {}, {}
+    local function charted(x, y)
+      local cx, cy = math.floor(x/32), math.floor(y/32)
+      local k = cx..','..cy
+      if chart[k] == nil then chart[k] = f.is_chunk_charted(s, {cx, cy}) end
+      return chart[k]
+    end
+    local function live(x, y)
+      if dist({x=x+0.5, y=y+0.5}, e.position) <= 60 then return true end
+      local cx, cy = math.floor(x/32), math.floor(y/32)
+      local k = cx..','..cy
+      if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {cx, cy}) end
+      return vis[k]
+    end
+    local DV = {[0]={0,-1}, {1,0}, {0,1}, {-1,0}}
+    local DN = {[0]='north', 'east', 'south', 'west'}
+    local function d4(dir) return dir == defines.direction.north and 0 or dir == defines.direction.east and 1 or dir == defines.direction.south and 2 or dir == defines.direction.west and 3 or nil end
+    -- blocked — чем занята клетка; bad — клетка, где наша лента или труба соединится с чужим; ugend — чужой подземный конец
+    -- того же вида (значение — ось: 0 север-юг, 1 запад-восток); span[ось] — клетки между концами чужой подземной пары.
+    local blocked, bad, ugend, span, coarse = {}, {}, {}, {[0]={}, {}}, false
+    local function mark(t, x, y, v) local k = idx(math.floor(x), math.floor(y)) if k then t[k] = v == nil and true or v end end
+    local function between(p, q)
+      local ax, ay, bx, by = math.floor(p.x), math.floor(p.y), math.floor(q.x), math.floor(q.y)
+      if ax == bx then for y = math.min(ay, by)+1, math.max(ay, by)-1 do mark(span[0], ax, y) end
+      elseif ay == by then for x = math.min(ax, bx)+1, math.max(ax, bx)-1 do mark(span[1], x, ay) end end
+    end
+    local function around(ax, ay, bx, by)
+      for x = ax, bx do mark(bad, x, ay-1) mark(bad, x, by+1) end
+      for y = ay, by do mark(bad, ax-1, y) mark(bad, bx+1, y) end
+    end
+    for _, t in pairs(s.find_tiles_filtered{area={{x1, y1}, {x2, y2}}, collision_mask='water_tile'}) do mark(blocked, t.position.x, t.position.y, 'вода') end
+    local FLUID = {pipe=true, ['pipe-to-ground']=true, ['storage-tank']=true, pump=true}
+    for _, c in pairs(s.find_entities_filtered{area={{x1, y1}, {x2, y2}}}) do
+      local ty = c.type
+      if not SKIP[ty] and ty ~= 'resource' and ty ~= 'unit' and ty ~= 'tile-ghost' then
+        local lv = live(math.floor(c.position.x), math.floor(c.position.y))
+        local enemy = c.force.name == 'enemy'
+        local ghost = ty == 'entity-ghost'
+        local what
+        if ty == 'tree' then what = 'дерево' elseif ty == 'cliff' then what = 'скала' elseif ty == 'simple-entity' then what = 'камень'
+        elseif ghost then if c.force == f then what = 'призрак '..c.ghost_name end
+        elseif enemy then if lv then what = 'вражеская постройка' end
+        elseif c.prototype.selectable_in_game and next(c.prototype.collision_mask.layers) ~= nil then what = lv and c.name or 'постройка' end
+        if what then
+          local bb = c.bounding_box
+          local ax, ay, bx, by = math.floor(bb.left_top.x+0.02), math.floor(bb.left_top.y+0.02), math.floor(bb.right_bottom.x-0.02), math.floor(bb.right_bottom.y-0.02)
+          for tx = ax, bx do for ty2 = ay, by do mark(blocked, tx, ty2, what) end end
+          local build = not enemy and ty ~= 'tree' and ty ~= 'cliff' and ty ~= 'simple-entity'
+          if build and not lv then
+            -- Вид постройки отсюда не виден: трубу рядом с ней не кладём — вдруг это труба.
+            coarse = true
+            if pipe then around(ax, ay, bx, by) end
+          elseif build then
+            local t = ghost and c.ghost_type or ty
+            local d = d4(c.direction)
+            if not pipe then
+              local out = false
+              if t == 'underground-belt' then pcall(function() out = c.belt_to_ground_type == 'output' end) end
+              if d and (t == 'transport-belt' or out) then mark(bad, c.position.x+DV[d][1], c.position.y+DV[d][2])
+              elseif d and t == 'splitter' then
+                local v = DV[d]
+                for _, o in pairs{-0.5, 0.5} do mark(bad, c.position.x+v[1]-v[2]*o, c.position.y+v[2]+v[1]*o) end
+              end
+              if d and t == 'underground-belt' and ug and (ghost and c.ghost_name or c.name) == ug.name then
+                mark(ugend, c.position.x, c.position.y, d % 2)
+                -- Парный конец: ближайший такой же конвейер на той же линии (вход ищет выход впереди, выход — вход позади).
+                local inp = false
+                pcall(function() inp = c.belt_to_ground_type == 'input' end)
+                local sg = inp and 1 or -1
+                for j = 1, maxd do
+                  local o = s.find_entities_filtered{name=ug.name, position={c.position.x+DV[d][1]*j*sg, c.position.y+DV[d][2]*j*sg}}[1]
+                  if o and o.direction == c.direction then
+                    if (o.belt_to_ground_type == 'input') ~= inp then between(c.position, o.position) end
+                    break
+                  end
+                end
+              end
+            elseif t == 'pipe-to-ground' then
+              -- Подземная труба выходит на поверхность только с той стороны, куда смотрит; пара — ближайший встречный конец позади.
+              if d then
+                mark(bad, c.position.x+DV[d][1], c.position.y+DV[d][2])
+                mark(ugend, c.position.x, c.position.y, d % 2)
+                if not ghost then
+                  for j = 1, maxd or 10 do
+                    local o = s.find_entities_filtered{type='pipe-to-ground', position={c.position.x-DV[d][1]*j, c.position.y-DV[d][2]*j}}[1]
+                    local od = o and d4(o.direction)
+                    if od and od % 2 == d % 2 then
+                      if od == (d+2) % 4 then between(c.position, o.position) end
+                      break
+                    end
+                  end
+                end
+              else around(ax, ay, bx, by) end
+            elseif t == 'pipe' then around(ax, ay, bx, by)
+            else
+              -- Машина с жидкостными входами (бак, насос, котёл, химзавод, бур...): где именно вход, не разбираем — рядом трубу не кладём.
+              local nfb
+              pcall(function() nfb = #(ghost and c.ghost_prototype or c.prototype).fluidbox_prototypes end)
+              if nfb == nil then nfb = (FLUID[t] or t == 'boiler' or t == 'generator' or t == 'offshore-pump' or t == 'assembling-machine' or t == 'mining-drill' or t == 'fluid-turret') and 1 or 0 end
+              if nfb > 0 then around(ax, ay, bx, by) end
+            end
+          end
+        end
+      end
+    end
+    for _, c in pairs({{x1, y1}, {x2-1, y1}, {x1, y2-1}, {x2-1, y2-1}}) do if not live(c[1], c[2]) then coarse = true end end
+    local sk, gk = idx(A.fx, A.fy), idx(A.tx, A.ty)
+    for _, q in pairs{{A.fx, A.fy, 'начало', sk}, {A.tx, A.ty, 'конец', gk}} do
+      if not charted(q[1], q[2]) then fail(q[3]..' маршрута: карта там не открыта') end
+      if blocked[q[4]] then fail(q[3]..' маршрута, клетка '..q[1]..','..q[2]..', занято: '..blocked[q[4]]..'. Укажи свободную клетку рядом') end
+    end
+    local function free(k, x, y) return k and not blocked[k] and charted(x, y) end
+    local function surf_ok(k) return k == sk or k == gk or not bad[k] end
+    local function ug_ok(k, ax) return not span[ax][k] and (pipe or k == sk or k == gk or not bad[k]) end
+    local heap, n = {}, 0
+    local function push(v)
+      n = n + 1
+      local i = n
+      heap[i] = v
+      while i > 1 do
+        local p = math.floor(i/2)
+        if heap[p][1] <= heap[i][1] then break end
+        heap[p], heap[i] = heap[i], heap[p]
+        i = p
+      end
+    end
+    local function pop()
+      local top = heap[1]
+      heap[1] = heap[n] heap[n] = nil n = n - 1
+      local i = 1
+      while true do
+        local l, r, q = i*2, i*2+1, i
+        if l <= n and heap[l][1] < heap[q][1] then q = l end
+        if r <= n and heap[r][1] < heap[q][1] then q = r end
+        if q == i then break end
+        heap[q], heap[i] = heap[i], heap[q]
+        i = q
+      end
+      return top
+    end
+    local function h(x, y) return (math.abs(x-A.tx) + math.abs(y-A.ty))*1.1 end
+    local g, from, closed = {}, {}, {}
+    for d = 0, 3 do g[sk*8+d*2] = 0 push{h(A.fx, A.fy), 0, A.fx, A.fy, d, 0} end
+    local ed = (not pipe) and A.end_dir or nil
+    local goal, pops = nil, 0
+    local function relax(id0, nx, ny, nk, nd, nf, ng)
+      local id = nk*8 + nd*2 + nf
+      if not closed[id] and (not g[id] or ng < g[id] - 0.0001) then g[id] = ng from[id] = id0 push{ng + h(nx, ny), ng, nx, ny, nd, nf} end
+    end
+    while n > 0 do
+      local c = pop()
+      local gc, x, y, d, fl = c[2], c[3], c[4], c[5], c[6]
+      local k = idx(x, y)
+      local id = k*8 + d*2 + fl
+      if not closed[id] and gc <= g[id] + 0.0001 then
+        closed[id] = true
+        pops = pops + 1
+        if k == gk and (not ed or (fl == 1 and d == ed) or (fl == 0 and d ~= (ed+2) % 4)) then goal = id break end
+        if pops > 120000 then break end
+        if fl == 1 or surf_ok(k) then
+          for nd = 0, 3 do
+            if nd == d or (fl == 0 and nd ~= (d+2) % 4) then
+              local nx, ny = x+DV[nd][1], y+DV[nd][2]
+              local nk = idx(nx, ny)
+              if free(nk, nx, ny) then relax(id, nx, ny, nk, nd, 0, gc + 1 + (nd ~= d and 0.2 or 0)) end
+            end
+          end
+        end
+        if ug and fl == 0 and ug_ok(k, d % 2) then
+          local v = DV[d]
+          for j = 2, maxd do
+            local ix, iy = x+v[1]*(j-1), y+v[2]*(j-1)
+            local ik = idx(ix, iy)
+            if not ik or ugend[ik] == d % 2 or not charted(ix, iy) then break end
+            local nx, ny = x+v[1]*j, y+v[2]*j
+            local nk = idx(nx, ny)
+            if free(nk, nx, ny) and ug_ok(nk, d % 2) then relax(id, nx, ny, nk, d, 1, gc + j*1.2 + 2) end
+          end
+        end
+      end
+    end
+    if not goal then
+      -- Не дошли: подскажем, что стоит вокруг концов маршрута.
+      fail(pops > 120000 and 'маршрут не найден: слишком сложный обход, раздели путь на части через промежуточные точки' or 'маршрут не найден: конец отрезан (вода, постройки, неоткрытая карта) в пределах полосы поиска; попробуй margin больше или другие клетки начала и конца')
+    end
+    local st = {}
+    local id = goal
+    while id do
+      local k = math.floor(id/8)
+      st[#st+1] = {x=x1+math.floor(k/H), y=y1+k % H, d=math.floor(id/2) % 4, fl=id % 2}
+      id = from[id]
+    end
+    local items, cost, pairs_n, turns = {}, {}, 0, 0
+    for i = #st, 1, -1 do
+      local c, nx = st[i], st[i-1]
+      local it = {x=c.x+0.5, y=c.y+0.5}
+      if c.fl == 1 then
+        it.item, it.direction = ugitem, DN[c.d]
+        if not pipe then it.underground = 'output' end
+      elseif nx and nx.fl == 1 then
+        pairs_n = pairs_n + 1
+        it.item = ugitem
+        if pipe then it.direction = DN[(nx.d+2) % 4] else it.direction, it.underground = DN[nx.d], 'input' end
+      else
+        it.item = A.item
+        if not pipe then it.direction = DN[nx and nx.d or ed or c.d] end
+        if nx and i < #st and nx.d ~= c.d then turns = turns + 1 end
+      end
+      cost[it.item] = (cost[it.item] or 0) + 1
+      items[#items+1] = it
+    end
+    local have, missing, enough = {}, {}, true
+    for k, v in pairs(cost) do
+      have[k] = e.get_item_count(k)
+      if have[k] < v then missing[k] = v - have[k] enough = false end
+    end
+    return {items=items, cells=#items, length=math.abs(A.fx-A.tx)+math.abs(A.fy-A.ty)+1, underground_pairs=pairs_n, turns=turns, cost=cost, have=have, missing=missing, enough=enough, coarse=coarse}`,
+
   // Где лежит предмет: сундуки, машины (все их слоты; in_output — сколько из этого в выходном), клетки конвейеров.
   // Игрок видит это, наведя мышь: рядом с собой и там, где карта показывается вживую (радар); ленты — только в 60 клетках.
   where_items: `
@@ -1704,6 +1952,21 @@ export function createFactorioServer(botName, hooks) {
     if (Math.hypot(me.x - x, me.y - y) > reach) await walk(x, y, Math.max(1.5, reach - 2));
   }
 
+  /** Добавить призраки items в план name (BODY.ghost_add). Общая часть ghost_place и route. */
+  async function ghostAdd(name, items) {
+    const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
+    // Кусками, чтобы команда оставалась короткой.
+    for (let i = 0; i < items.length; i += 50) {
+      const r = await run('ghost_add', { name, items: items.slice(i, i + 50) });
+      out.placed += r.placed; out.already += r.already; out.blocked_count += r.blocked_count; out.in_plan = r.in_plan;
+      if (Array.isArray(r.blocked)) out.blocked.push(...r.blocked);
+      if (r.full) break;
+    }
+    out.blocked = out.blocked.slice(0, 15);
+    if (!out.blocked_count) { delete out.blocked; delete out.blocked_count; }
+    return out;
+  }
+
   /**
    * Поставить группу построек (BODY.place_many): подходит к первой непоставленной и ставит всё, до чего дотягивается.
    * Общая часть place_many и template_place. В skipped у постройки, которой, похоже, мешает сам персонаж, стоит self.
@@ -1976,17 +2239,7 @@ export function createFactorioServer(botName, hooks) {
           items = Array.isArray(p.items) ? p.items : [];
         }
         if (!items) throw new Error('укажи items или template');
-        const name = a.name.trim();
-        const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
-        // Кусками, чтобы команда оставалась короткой.
-        for (let i = 0; i < items.length; i += 50) {
-          const r = await run('ghost_add', { name, items: items.slice(i, i + 50) });
-          out.placed += r.placed; out.already += r.already; out.blocked_count += r.blocked_count; out.in_plan = r.in_plan;
-          if (Array.isArray(r.blocked)) out.blocked.push(...r.blocked);
-          if (r.full) break;
-        }
-        out.blocked = out.blocked.slice(0, 15);
-        if (!out.blocked_count) { delete out.blocked; delete out.blocked_count; }
+        const out = await ghostAdd(a.name.trim(), items);
         out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build';
         return out;
       }),
@@ -2211,6 +2464,40 @@ export function createFactorioServer(botName, hooks) {
           buildings: r.buildings && !Array.isArray(r.buildings) ? r.buildings : undefined,
           details: a.details ? (Array.isArray(r.details) ? r.details : []) : undefined,
           note: r.coarse ? 'часть области дальше 60 клеток от персонажа и не под радаром: там постройки показаны как «#», без вида и направления, а враги не показаны — подойди ближе за точной картой' : undefined };
+      }),
+
+    def('route', 'Маршрут конвейера или трубы от клетки (x, y) до (x2, y2): находит путь в обход построек, деревьев, камней, скал, воды и призраков, а где обойти нельзя или далеко — проходит под землёй (подземный конвейер того же вида или pipe-to-ground, в пределах их дальности). Ничего не ставит и не тратит — это расчёт по тому, что видно на карте; идти никуда не нужно. Чужое не задевает: труба не ложится в клетку, где соединилась бы с чужой трубой или входом машины; лента не ложится туда, куда высыпает чужая лента; подземный участок не путается с чужими подземными концами на той же линии. Начало и конец от этих запретов свободны (там ты и подключаешься), обе клетки должны быть свободны. Ответ: items — список {item, x, y, direction, underground} по порядку от начала к концу, его можно целиком передать в ghost_place или place_many (по 50 штук); segments — то же коротко, прямыми участками; cost / have / missing — сколько чего нужно и чего не хватает. С ghost=имя плана маршрут сразу размечается призраками (как ghost_place), а вместо items приходит только сводка — потом ghost_build. Лента: каждая клетка везёт к следующей, последняя — по ходу или в end_direction. Точно видно в 60 клетках от персонажа и под радаром; дальше постройки — просто препятствия (тогда в ответе note).',
+      { item: z.string().default('transport-belt').describe('что прокладываем: конвейер (transport-belt, fast-transport-belt, ...) или pipe'),
+        ...coords, x2: z.number().describe('x конечной клетки'), y2: z.number().describe('y конечной клетки'),
+        end_direction: z.enum(DIRECTIONS).optional().describe('только для конвейера: куда должна везти последняя клетка (по умолчанию — по ходу маршрута)'),
+        underground: z.boolean().default(true).describe('можно ли проходить под землёй; false — только обход по поверхности'),
+        margin: z.number().int().min(3).max(40).default(15).describe('на сколько клеток обход может выходить за прямоугольник между началом и концом'),
+        ghost: z.string().min(1).max(40).optional().describe('имя плана: сразу поставить маршрут призраками (ghost_place)') },
+      async (a) => {
+        const q = { item: a.item.trim(), fx: Math.floor(a.x), fy: Math.floor(a.y), tx: Math.floor(a.x2), ty: Math.floor(a.y2),
+          end_dir: a.end_direction ? DIRECTIONS.indexOf(a.end_direction) : undefined, underground: a.underground, margin: a.margin };
+        if (q.fx === q.tx && q.fy === q.ty) throw new Error('начало и конец — одна и та же клетка');
+        if (Math.abs(q.fx - q.tx) > 250 || Math.abs(q.fy - q.ty) > 250) throw new Error('слишком далеко: до 250 клеток по каждой оси, длинный маршрут веди по частям');
+        if ((Math.abs(q.fx - q.tx) + 2 * q.margin + 1) * (Math.abs(q.fy - q.ty) + 2 * q.margin + 1) > 60000) throw new Error('слишком большая область поиска: уменьши margin или веди маршрут по частям через промежуточные точки');
+        const r = await run('route', q);
+        const items = Array.isArray(r.items) ? r.items : [];
+        // Прямые участки: подряд идущие клетки с тем же предметом и направлением (подземные концы — каждый отдельно).
+        const segments = [];
+        for (const it of items) {
+          const g = segments[segments.length - 1];
+          const dx = g ? it.x - g.to.x : 0, dy = g ? it.y - g.to.y : 0;
+          if (g && it.item === q.item && g.item === it.item && g.direction === it.direction && Math.abs(dx) + Math.abs(dy) === 1 && (g.n === 1 || (dx === g.dx && dy === g.dy))) {
+            g.dx = dx; g.dy = dy; g.to = { x: it.x, y: it.y }; g.n++;
+          } else segments.push({ item: it.item, from: { x: it.x, y: it.y }, to: { x: it.x, y: it.y }, n: 1, direction: it.direction, underground: it.underground });
+        }
+        for (const g of segments) { delete g.dx; delete g.dy; if (g.n === 1) delete g.to; }
+        const obj = (v) => (v && !Array.isArray(v) ? v : {});
+        const out = { item: q.item, from: { x: q.fx + 0.5, y: q.fy + 0.5 }, to: { x: q.tx + 0.5, y: q.ty + 0.5 }, cells: r.cells, underground_pairs: r.underground_pairs, turns: r.turns,
+          cost: obj(r.cost), have: obj(r.have), missing: obj(r.missing), enough: r.enough, segments };
+        if (r.coarse) out.note = 'часть области дальше 60 клеток от персонажа и не под радаром: там постройки учтены только как препятствия (не видно, трубы это или ленты и куда они смотрят) — перед стройкой подойди ближе и пересчитай';
+        if (a.ghost) out.ghosts = await ghostAdd(a.ghost.trim(), items);
+        else out.items = items;
+        return out;
       }),
 
     def('where_items', 'Где лежит предмет: ближайшие сундуки, печи, сборочные автоматы, лаборатории, буры, вагоны, в которых он есть, с количеством, от ближних к дальним — чтобы потом забрать одним вызовом gather, явно указав источники (sources). count — сколько всего в объекте (во всех слотах), in_output — сколько из этого в выходном слоте машины (остальное — её сырьё или топливо: забирая, остановишь её). belts — сколько лежит на конвейерах в 60 клетках и ближайшие клетки лент с ним. have — сколько уже у тебя. Видно в 60 клетках от персонажа и там, где карта показывается вживую (радар, игроки); сколько объектов в радиусе осталось вне видимости — not_visible. Идти никуда не нужно.',
