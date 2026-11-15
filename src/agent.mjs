@@ -1,6 +1,8 @@
 // Сессия Claude Code одного человека: управляет его персонажем в Factorio HTTP-запросами к серверу ботов
 // (v2/server) из своей оболочки в контейнере.
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { spawn, execFileSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -35,6 +37,43 @@ const SUBAGENT_TOOLS = ['Task', 'SendMessage', 'TaskList', 'TaskStop'];
 // Собственное окружение бота в контейнере: оболочка и файлы, чтобы писать и запускать свою автоматизацию.
 const ENV_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
 
+// Транскрипты сессий ботов на хосте: <id>.jsonl — главная сессия, <id>/subagents/agent-<agentId>.jsonl и .meta.json — саб-агенты.
+const TRANSCRIPTS = process.env.CLAUDE_SESSIONS || path.join(os.homedir(), 'robot/.claude/projects/-home-robot');
+const RECENTLY_MS = 5 * 60_000;
+
+/**
+ * Саб-агенты сессии, оборванные последней остановкой её процесса: не помечены завершёнными и писали в транскрипт
+ * в последние минуты перед тем, как сессия замолчала. Фоновые саб-агенты живут внутри процесса Claude и вместе с ним
+ * умирают; их история остаётся на диске, и главная сессия может их продолжить.
+ */
+export function interruptedSubagents(sessionId) {
+  try {
+    const dir = path.join(TRANSCRIPTS, sessionId, 'subagents');
+    let last = 0;
+    try { last = fs.statSync(path.join(TRANSCRIPTS, `${sessionId}.jsonl`)).mtimeMs; } catch { /* главного транскрипта нет */ }
+    const open = [];
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith('agent-') || !f.endsWith('.meta.json')) continue;
+      const id = f.slice(6, -10);
+      let meta, mtime;
+      try { meta = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); mtime = fs.statSync(path.join(dir, `agent-${id}.jsonl`)).mtimeMs; } catch { continue; }
+      last = Math.max(last, mtime);
+      if (!meta.finished) open.push({ id, description: String(meta.description || '').slice(0, 120), mtime });
+    }
+    return open.filter((a) => last - a.mtime < RECENTLY_MS).sort((a, b) => b.mtime - a.mtime).slice(0, 8);
+  } catch { return []; } // саб-агентов не было
+}
+
+/** Сообщение сессии после перезапуска её процесса; null, если продолжать некого. */
+export function restartNotice(sessionId) {
+  const lost = interruptedSubagents(sessionId);
+  if (!lost.length) return null;
+  const list = lost.map((a) => `«${a.description || 'без названия'}» (id ${a.id})`).join(', ');
+  return `[система]: твой процесс был перезапущен извне, не по твоей просьбе. Контекст разговора сохранён, но фоновые саб-агенты оборваны: ${list}. ` +
+    'Тех, чья работа ещё нужна, продолжи сам, не дожидаясь хозяина: SendMessage на id саб-агента — его контекст сохранён, скажи продолжать с места остановки; ' +
+    'если так не выходит — запусти нового с тем же заданием. Законченных и ненужных не трогай. Хозяину напиши одну строку: кого продолжил.';
+}
+
 export const slug = (name) => name.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'bot';
 
 function loadState() {
@@ -65,6 +104,8 @@ export class Agent extends EventEmitter {
     super();
     Object.assign(this, { key, human, bot, token: tokenFor(bot), busy: false, stopped: false });
     const state = loadState();
+    // Сессия возобновляется после остановки процесса (перезапуск хозяина сессий): кого из саб-агентов оборвало.
+    const notice = state[key] ? restartNotice(state[key]) : null;
     this.#run(state[key]);
     if (!state[key]) {
       this.send(`[система]: началась новая сессия. Прочитай правила в ${RULES_PATH} и свои заметки в $FX_HOME/notes.md (если файл есть), посмотри status.`);
@@ -72,6 +113,7 @@ export class Agent extends EventEmitter {
       // Сессия создана до переноса правил в файл: её системный промпт устарел и уже не изменится.
       this.send(`[система]: твои правила работы теперь лежат в файле ${RULES_PATH}, а не в системных инструкциях. Прочитай его целиком сейчас (Read) — он важнее прежних инструкций. Когда он изменится, тебе придёт сообщение с перечнем изменений.`);
     }
+    if (notice) this.send(notice);
   }
 
   /** Передать сессии реплику; если ход уже идёт, она подмешивается в него. */
@@ -101,6 +143,7 @@ export class Agent extends EventEmitter {
       let wake = null;
       let done = false;
       this.push = (m) => { queue.push(m); wake?.(); };
+      if (this.pendingNotice) { const n = this.pendingNotice; this.pendingNotice = null; this.send(n); }
       this.finish = () => { done = true; wake?.(); };
       const input = (async function* () {
         while (!done) {
@@ -168,6 +211,8 @@ export class Agent extends EventEmitter {
       if (this.stopped) break;
       // Если возобновить старую сессию не удалось — начинаем новую.
       resume = resume && !gotInit ? undefined : loadState()[this.key];
+      // Процесс Claude завершился сам, а хозяин сессий жив: саб-агенты оборваны так же — после возобновления сообщим.
+      if (resume) this.pendingNotice = restartNotice(resume);
       await new Promise((r) => setTimeout(r, 1500));
     }
   }
