@@ -1909,17 +1909,17 @@ export function createFactorioServer(botName, hooks) {
     for (;;) {
       const s = await run('follow', { i, n });
       gapMs = Date.now() - sent;
-      if (s.done) return { done: true };
+      if (s.done) return { done: true, left: 0 };
       if (my !== walkSeq) return { superseded: true };
       if (hooks.aborted()) return { interrupted: true };
       if (lastTick !== null) { const gap = s.tick - lastTick; n = Math.max(gap, lastGap) + 1; lastGap = gap; }
       lastTick = s.tick;
       // Снесло далеко от пути (например, задержка скакнула) — путь надо искать заново.
-      if (s.off > 3) return { lost: true };
+      if (s.off > 3) return { lost: true, left: best };
       // Застрял — значит, остаток пути перестал уменьшаться (а не просто стоит: по ленте может и возить туда-сюда).
       if (s.i > i) i = s.i;
       if (s.d < best - 0.05) { best = s.d; lastProgress = Date.now(); }
-      if (Date.now() - lastProgress > Math.max(1500, gapMs * 4)) return { stuck: true };
+      if (Date.now() - lastProgress > Math.max(1500, gapMs * 4)) return { stuck: true, left: best };
       if (Date.now() >= deadline) return { timeout: true };
       await sleep(30);
       sent = Date.now();
@@ -1929,7 +1929,9 @@ export function createFactorioServer(botName, hooks) {
   // Ходьба только пешком: ищем путь в обход препятствий (BODY.path) и идём по нему. Дальний путь строится кусками;
   // если что-то помешало по дороге, путь ищется заново с нового места. Не получилось — честно говорим, где
   // остановились: переносить персонажа нельзя. pos в ответе — настоящая позиция после остановки.
-  async function walk(x, y, tol = 1.5) {
+  // Обход ограничен (fb-040): если идти пришлось бы втрое дальше, чем по прямой (и больше 30 клеток), персонаж не идёт
+  // или останавливается — иначе короткий переход по базе превращается в петлю на сотни клеток. longWay снимает предел.
+  async function walk(x, y, tol = 1.5, longWay = false) {
     const my = ++walkSeq;
     const deadline = Date.now() + 90_000;
     const r1 = (v) => Math.round(v * 10) / 10;
@@ -1937,6 +1939,7 @@ export function createFactorioServer(botName, hooks) {
     try {
       let bestEnd = Infinity;
       let stuckAt = null;
+      let walked = 0, straight0 = null;
       for (let plans = 0; ; plans++) {
         if (plans >= 20) { out = { fail: 'не дошёл: слишком много обходов' }; break; }
         const p = await run('path', { x, y, tol });
@@ -1952,7 +1955,17 @@ export function createFactorioServer(botName, hooks) {
           break;
         }
         bestEnd = Math.min(bestEnd, endDist);
+        let len = 0;
+        for (let k = 1; k < points.length; k++) len += Math.hypot(points[k].x - points[k - 1].x, points[k].y - points[k - 1].y);
+        if (straight0 === null) straight0 = Math.hypot(points[0].x - x, points[0].y - y);
+        // Сколько идти самое меньшее: уже пройденное, этот кусок пути и по прямой от его конца до цели.
+        const need = walked + len + (p.found ? 0 : Math.max(0, endDist - tol));
+        if (!longWay && need > Math.max(30, straight0 * 3)) {
+          out = { fail: `обход слишком длинный: идти не меньше ${Math.round(need)} клеток${walked > 1 ? ` (из них ${Math.round(walked)} уже пройдено)` : ''}, а по прямой было ${Math.round(straight0)} — дорогу перегораживают постройки (трубы, стены, плотные ряды машин; трубы не перешагивает и игрок). Посмотри area_map и иди через промежуточные точки, сделай проход (подземная труба) или, если длинный обход устраивает, повтори move_to с long_way=true` };
+          break;
+        }
         const s = await follow(points, my, deadline);
+        if (s.left !== undefined) walked += Math.max(0, len - (Number.isFinite(s.left) ? s.left : len));
         if (s.superseded) { out = { interrupted: 'прервано другим действием с ходьбой' }; break; }
         if (s.interrupted) { out = { interrupted: 'прервано новой репликой' }; break; }
         if (s.timeout) { out = { fail: 'ещё не дошёл: вызови ещё раз' }; break; }
@@ -2105,13 +2118,14 @@ export function createFactorioServer(botName, hooks) {
 
     def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with).', coords, (a) => run('inspect', a)),
 
-    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Если дойти не удалось — not_reached с причиной и distance_left: персонаж остановился в ближайшей к цели точке, до которой нашёл путь.',
-      { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio') },
+    def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Если дойти не удалось — not_reached с причиной и distance_left: персонаж остановился в ближайшей к цели точке, до которой нашёл путь. Обход ограничен: если идти пришлось бы больше чем втрое дальше прямой (и больше 30 клеток), персонаж не идёт (или останавливается, как только это выяснилось) и отвечает not_reached «обход слишком длинный» — тогда иди через промежуточные точки или повтори с long_way=true. Трубы, как и для игрока, непроходимы (конвейеры проходимы): проход через линию труб — подземная труба.',
+      { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio'),
+        long_way: z.boolean().default(false).describe('true — идти, даже если обход намного длиннее прямой (вокруг озера, длинной стены)') },
       async (a) => {
         let target = a;
         if (a.player) target = await run('player_pos', { player: a.player });
         else if (a.x === undefined || a.y === undefined) throw new Error('нужны x и y либо player');
-        return walk(target.x, target.y, a.player ? 2.5 : 1.5);
+        return walk(target.x, target.y, a.player ? 2.5 : 1.5, a.long_way);
       }),
 
     def('mine', 'Добывать руками ресурс, дерево или камень в точке. Сам подходит. Примерно одна единица в секунду.',
