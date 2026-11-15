@@ -37,7 +37,11 @@ const people = new Map(); // userId -> { name, bot, utt, decoder, stream, lastPa
 // Благодаря этому перезапуск голосового бота не прерывает сессии и их саб-агентов.
 const sessions = (() => {
   let sock = null;
-  const send = (obj) => { if (sock?.writable) sock.write(JSON.stringify(obj) + '\n'); };
+  const pending = []; // реплики, сказанные, пока хозяин сессий недоступен (перезапускается): доставим после подключения
+  const send = (obj) => {
+    if (sock?.writable) sock.write(JSON.stringify(obj) + '\n');
+    else if (obj.op === 'say' && pending.length < 50) pending.push(obj);
+  };
   const connect = () => {
     const s = net.connect(Number(process.env.SESSIONS_PORT || 8766), '127.0.0.1');
     let buf = '';
@@ -46,6 +50,7 @@ const sessions = (() => {
       // После (пере)подключения напоминаем, кто в канале: хозяин сессий мог перезапуститься.
       for (const [id, p] of people) send({ op: 'ensure', id, human: p.name, bot: p.bot });
       send({ op: 'present', ids: [...people.keys()] });
+      for (const m of pending.splice(0)) send(m);
     });
     s.on('data', (d) => {
       buf += d;
@@ -126,7 +131,7 @@ function feed(p, samples) {
       // «Сбрось сессию» распознаётся как «брось сессию», «сброс сессии» и т. п. — подсказываем сессии, что имелось в виду.
       const reset = /(с?брос\p{L}*|очист\p{L}*|обнул\p{L}*|перезапуст\p{L}*)\s+(\p{L}+\s+)?(сесси|контекст)/iu.test(text);
       const id = [...people].find(([, v]) => v === p)?.[0];
-      if (!sessions.connected()) log('⚠️ нет связи с хозяином сессий — реплика не доставлена');
+      if (!sessions.connected()) console.log(stamp(), 'нет связи с хозяином сессий — реплика будет доставлена после подключения');
       sessions.send({ op: 'say', id, text: `[${p.name}]: ${text}` + (reset ? RESET_HOWTO : '') });
     }, (e) => console.log(stamp(), 'stt error', e.message));
   }
