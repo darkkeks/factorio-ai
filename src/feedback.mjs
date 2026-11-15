@@ -77,7 +77,7 @@ if (import.meta.filename === process.argv[1]) {
   if (cmd === 'set' && a && b) { setStatus(a, b, rest.join(' ') || undefined); console.log(a, '→', b); }
   else if (cmd === 'prio' && a) { setStatus(a, 'new', undefined, true); console.log(a, '→ в очередь с приоритетом'); }
   else if (cmd === 'add' && a && b) console.log(submitFeedback(a, [b, ...rest].join(' ')));
-  else if (cmd === 'release') { fs.writeFileSync(RELEASE_NOW, new Date().toISOString()); console.log('обработчик выпустит накопленное обновление при ближайшей проверке (до 30 секунд), даже если в игре люди'); }
+  else if (cmd === 'release') { fs.writeFileSync(RELEASE_NOW, new Date().toISOString()); console.log('обработчик выпустит накопленное обновление, даже если в игре люди: сразу (до 30 секунд), а если он сейчас разбирает заявку — как закончит заход (правки захода войдут в тот же выпуск)'); }
   else if (cmd === 'pending') {
     const p = readItems().filter((i) => i.status === 'done' && i.released === false);
     console.log(p.length ? p.map((i) => `${i.id} ${i.from}: ${i.text.replace(/\s+/g, ' ').slice(0, 80)}`).join('\n') : 'нет заявок, ждущих выпуска', '\nвыпущено:', JSON.stringify(readRelease().commit), readRelease().at);
