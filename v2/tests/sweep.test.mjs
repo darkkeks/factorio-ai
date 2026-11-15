@@ -147,7 +147,7 @@ test('mine и place каждого вида построек: снять в ин
 });
 
 test('подземные конвейеры и трубы: пара, осмотр, чертёж', async () => {
-  await lua(`local e = storage.agent.agents[A.name].entity e.clear_items_inside() e.insert{name = 'underground-belt', count = 4} e.insert{name = 'pipe-to-ground', count = 2} e.insert{name = 'splitter', count = 1} e.teleport({A.x + 30.5, A.y + 29.5}) return true`, { name: NAME, x: O.x, y: O.y });
+  await lua(`local e = storage.agent.agents[A.name].entity for _, x in pairs(e.surface.find_entities_filtered{area = {{A.x - 2, A.y - 2}, {A.x + 62, A.y + 34}}}) do if x.type ~= 'character' then x.destroy() end end e.clear_items_inside() e.insert{name = 'underground-belt', count = 4} e.insert{name = 'pipe-to-ground', count = 2} e.insert{name = 'splitter', count = 1} e.teleport({A.x + 30.5, A.y + 29.5}) return true`, { name: NAME, x: O.x, y: O.y });
   const y = O.y + 31.5;
   const r = await call(A, 'place', { items: [
     { item: 'underground-belt', x: O.x + 26.5, y, direction: 'east' }, { item: 'underground-belt', x: O.x + 30.5, y, direction: 'east' },
