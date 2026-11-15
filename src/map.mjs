@@ -419,7 +419,7 @@ async function renderBatch(batch) {
 
 async function renderLoop() {
   for (;;) {
-    const batch = live.ok && live.camera ? pick() : [];
+    const batch = live.ok && live.camera && (!CAMERA_MANAGE || camera?.joined) ? pick() : [];
     if (batch.length) {
       try { await renderBatch(batch); } catch (e) { log('перерисовка:', e.message); await sleep(2000); }
     }
@@ -592,13 +592,13 @@ function stopVideo() {
 
 // ---------- названия на русском из файлов игры ----------
 
-function loadNames() {
+function loadNames(lang) {
   const out = {};
   const want = { 'item-name': 1, 'entity-name': 1, 'fluid-name': 1, 'recipe-name': 1, 'technology-name': 1 };
   let mods = [];
   try { mods = fs.readdirSync(GAME_DATA); } catch { return out; }
   for (const mod of mods) {
-    const dir = path.join(GAME_DATA, mod, 'locale/ru');
+    const dir = path.join(GAME_DATA, mod, 'locale', lang);
     let files = [];
     try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.cfg')); } catch { continue; }
     for (const f of files) {
@@ -613,7 +613,8 @@ function loadNames() {
   }
   return out;
 }
-const NAMES = JSON.stringify(loadNames());
+// Русские названия — для показа, английские — для ссылок на вики (страницы там называются по-английски).
+const NAMES = JSON.stringify({ ru: loadNames('ru'), en: loadNames('en') });
 
 // ---------- сессии Claude ботов ----------
 // Транскрипты лежат в SESSIONS: <id>.jsonl — главная сессия, <id>/subagents/agent-<agentId>.jsonl (+ .meta.json) — субагенты.

@@ -103,6 +103,11 @@
   .items .slot img { position: absolute; left: 3px; top: 3px; width: 34px; height: 34px; object-fit: cover; object-position: left center; }
   .items .slot img + small { display: none; }
   .items .slot b { position: absolute; right: 2px; bottom: 0; font-size: 12px; font-weight: 700; color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000, 1px 1px 1px #000; }
+  .items .slot { cursor: pointer; }
+  #tip { position: fixed; z-index: 2000; max-width: 260px; padding: 5px 9px; font-size: 13px; background: #101010; border: 1px solid #666; border-radius: 4px; box-shadow: 0 2px 8px #000; pointer-events: none; }
+  #tip.pinned { pointer-events: auto; }
+  #tip.hidden { display: none; }
+  #tip a { display: block; margin-top: 4px; color: #6fd3ff; }
   .items .slot small { position: absolute; inset: 2px; font-size: 8px; line-height: 1.1; overflow: hidden; overflow-wrap: anywhere; color: #ccc; }
   .log div { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
   .log .tool { font-family: ui-monospace, monospace; font-size: 12px; color: #b9c7d6; }
@@ -130,6 +135,7 @@
   <header><b id="sess-bot"></b><select id="sess-list" title="Сессия"></select><button id="sess-arch" title="Убрать эту сессию в архив (или вернуть)">в архив</button><label id="sess-show-l" title="Показывать убранное в архив"><input type="checkbox" id="sess-show"> архив <span id="sess-archn"></span></label><button id="sess-close">✕</button></header>
   <div id="sess-main"><div id="sess-tree"></div><div id="sess-log"></div></div>
 </div>
+<div id="tip" class="hidden"></div>
 <div id="bot" class="box hidden">
   <header><b id="bot-name"></b><button id="bot-sess">сессии</button><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
   <div id="bot-body"></div>
@@ -140,8 +146,8 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-let NAMES = {};
-fetch('names.json').then((r) => r.json()).then((n) => { NAMES = n; renderSummary(); }).catch(() => {});
+let NAMES = {}, NAMES_EN = {};
+fetch('names.json').then((r) => r.json()).then((n) => { NAMES = n.ru || {}; NAMES_EN = n.en || {}; renderSummary(); }).catch(() => {});
 const nm = (k) => NAMES[k] || k;
 const STATUS = { no_fuel: 'нет топлива', no_power: 'нет питания', low_power: 'мало питания', not_plugged_in_electric_network: 'не подключено к сети',
   no_minable_resources: 'руда кончилась', missing_science_packs: 'нет колб', no_ammo: 'нет патронов', no_input_fluid: 'нет жидкости', missing_required_fluid: 'нет жидкости' };
@@ -380,7 +386,7 @@ $('bot-follow').onclick = () => {
 const utcTime = (t) => { const d = new Date(); const [h, mi, s] = t.split(':').map(Number); d.setUTCHours(h, mi, s); return d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
 // Ячейка как в игре: иконка и количество; название — во всплывающей подсказке. Нет иконки — показываем название.
 const count = (v) => (v >= 10000 ? `${Math.round(v / 1000)}k` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v);
-const slot = (name, n) => `<div class="slot" title="${esc(nm(name))} × ${n}"><img src="icon/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()"><small>${esc(nm(name))}</small><b>${count(n)}</b></div>`;
+const slot = (name, n) => `<div class="slot" data-item="${esc(name)}" data-n="${n}"><img src="icon/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()"><small>${esc(nm(name))}</small><b>${count(n)}</b></div>`;
 let lastBotHtml = '';
 async function loadBot() {
   const name = selected;
@@ -402,6 +408,7 @@ async function loadBot() {
     lastBotHtml = html;
     body.innerHTML = html;
     body.scrollTop = keep;
+    if (tipFor && !document.contains(tipFor)) { const again = body.querySelector(`.slot[data-item="${CSS.escape(tipFor.dataset.item)}"]`); if (again && tip.classList.contains('pinned')) showTip(again, true); else hideTip(); }
   } catch { /* следующая попытка через 2 секунды */ }
 }
 
@@ -542,6 +549,34 @@ $('sess-tree').onclick = (e) => {
 $('sess-list').onchange = (e) => pickSession(e.target.value);
 $('sess-close').onclick = closeSessions;
 $('bot-sess').onclick = () => openSessions(selected);
+
+// ---------- подсказка по предмету ----------
+// Наведение — название сразу; клик или касание — подсказка закрепляется, в ней ссылка на вики.
+const tip = $('tip');
+let tipFor = null;
+function wikiUrl(name) {
+  const en = NAMES_EN[name];
+  return en ? `https://wiki.factorio.com/${encodeURIComponent(en.replace(/ /g, '_'))}/ru` : `https://wiki.factorio.com/index.php?search=${encodeURIComponent(name.replace(/-/g, ' '))}`;
+}
+function showTip(el, pinned) {
+  const name = el.dataset.item;
+  tipFor = el;
+  tip.innerHTML = `<b>${esc(nm(name))}</b> × ${esc(el.dataset.n)}` + (pinned ? `<a href="${esc(wikiUrl(name))}" target="_blank" rel="noopener">открыть в вики ↗</a>` : '');
+  tip.classList.toggle('pinned', pinned);
+  tip.classList.remove('hidden');
+  const r = el.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.max(6, Math.min(innerWidth - w - 6, r.left + r.width / 2 - w / 2)) + 'px';
+  tip.style.top = (r.top - h - 6 > 6 ? r.top - h - 6 : r.bottom + 6) + 'px';
+}
+function hideTip() { tip.classList.add('hidden'); tip.classList.remove('pinned'); tipFor = null; }
+document.addEventListener('mouseover', (e) => { const el = e.target.closest && e.target.closest('.slot[data-item]'); if (el && !tip.classList.contains('pinned')) showTip(el, false); });
+document.addEventListener('mouseout', (e) => { if (!tip.classList.contains('pinned') && e.target.closest && e.target.closest('.slot[data-item]')) hideTip(); });
+document.addEventListener('click', (e) => {
+  if (e.target.closest('#tip')) return;
+  const el = e.target.closest('.slot[data-item]');
+  if (el) showTip(el, true); else if (!tip.classList.contains('hidden')) hideTip();
+});
+window.addEventListener('scroll', () => { if (!tip.classList.contains('hidden')) hideTip(); }, true);
 
 // ---------- сводка ----------
 let summary = null, events = [];
