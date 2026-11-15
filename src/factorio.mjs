@@ -154,6 +154,41 @@ local function place_one(e, a)
 end
 `;
 
+// Осмотреть объект в точке (x, y) глазами персонажа e. Общая часть inspect и inspect_many.
+const INSPECT_FN = `
+local function inspect_one(e, x, y)
+  local t = at(e, x, y, true)
+  local r = {name=t.name, type=t.type, pos=P(t.position), dist=r1(dist(t.position, e.position))}
+  if t.type == 'resource' then r.amount = t.amount return r end
+  if t.type == 'character-corpse' then
+    r.items = contents(t.get_inventory(defines.inventory.character_corpse))
+    r.note = 'труп персонажа: забрать всё — take_items без item'
+    return r
+  end
+  r.direction = t.supports_direction and dirname(t.direction) or nil
+  if t.health then r.health = math.floor(t.health) end
+  pcall(function() local rc = t.get_recipe() if rc then r.recipe = rc.name end end)
+  r.status = status_of(t)
+  if t.type == 'inserter' then
+    r.takes_from, r.puts_to = arm(t)
+    pcall(function() if t.held_stack.valid_for_read then r.holding = t.held_stack.name end end)
+  end
+  if BELT[t.type] then r.on_belt = belt_items(t) r.lanes = belt_lanes(t) end
+  if t.type == 'underground-belt' then r.underground = t.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
+    local o = t.underground_belt_neighbour
+    if o then r.paired_with = P(o.position)
+    else r.paired_with = t.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход, смотрящий туда же' or 'пары нет: позади по ходу в пределах дальности нужен вход, смотрящий туда же' end
+  end
+  pcall(function() r.crafting_progress = r1(t.crafting_progress) end)
+  pcall(function() if t.mining_target then r.mining_target = t.mining_target.name end end)
+  local inv = {}
+  pcall(function() for i = 1, t.get_max_inventory_index() do local c = contents(t.get_inventory(i)) if next(c) then for k, v in pairs(c) do inv[k] = (inv[k] or 0) + v end end end end)
+  r.items = BELT[t.type] and r.on_belt or inv
+  pcall(function() if t.burner then r.fuel_left = t.burner.remaining_burning_fuel > 0 or next(contents(t.burner.inventory)) ~= nil end end)
+  return r
+end
+`;
+
 const BODY = {
   ensure: `local e = bot() return {pos=P(e.position)}`,
 
@@ -656,37 +691,21 @@ const BODY = {
     for i = 1, math.min(#found, 5) do local c = found[i] out[i] = {pos=P(c.position), dist=r1(dist(c.position, e.position)), amount=c.type == 'resource' and c.amount or nil} end
     return {name=A.name, total_found=#found, radius=A.radius, nearest=out}`,
 
-  inspect: `
+  inspect: INSPECT_FN + `
+    return inspect_one(bot(), A.x, A.y)`,
+
+  // Осмотр списка точек A.points одним вызовом; ответы в том же порядке. Пустая точка — не ошибка, а {empty=true}.
+  inspect_many: INSPECT_FN + `
     local e = bot()
-    local t = at(e, A.x, A.y, true)
-    local r = {name=t.name, type=t.type, pos=P(t.position), dist=r1(dist(t.position, e.position))}
-    if t.type == 'resource' then r.amount = t.amount return r end
-    if t.type == 'character-corpse' then
-      r.items = contents(t.get_inventory(defines.inventory.character_corpse))
-      r.note = 'труп персонажа: забрать всё — take_items без item'
-      return r
+    local out, found, empty = {}, 0, 0
+    for i, p in ipairs(A.points) do
+      local ok, r = pcall(inspect_one, e, p.x, p.y)
+      if ok then found = found + 1 r.x, r.y = p.x, p.y
+      elseif tostring(r):find('ничего нет', 1, true) then empty = empty + 1 r = {x=p.x, y=p.y, empty=true}
+      else r = {x=p.x, y=p.y, error=tostring(r)} end
+      out[i] = r
     end
-    r.direction = t.supports_direction and dirname(t.direction) or nil
-    if t.health then r.health = math.floor(t.health) end
-    pcall(function() local rc = t.get_recipe() if rc then r.recipe = rc.name end end)
-    r.status = status_of(t)
-    if t.type == 'inserter' then
-      r.takes_from, r.puts_to = arm(t)
-      pcall(function() if t.held_stack.valid_for_read then r.holding = t.held_stack.name end end)
-    end
-    if BELT[t.type] then r.on_belt = belt_items(t) r.lanes = belt_lanes(t) end
-    if t.type == 'underground-belt' then r.underground = t.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
-      local o = t.underground_belt_neighbour
-      if o then r.paired_with = P(o.position)
-      else r.paired_with = t.belt_to_ground_type == 'input' and 'пары нет: впереди по ходу в пределах дальности нужен выход, смотрящий туда же' or 'пары нет: позади по ходу в пределах дальности нужен вход, смотрящий туда же' end
-    end
-    pcall(function() r.crafting_progress = r1(t.crafting_progress) end)
-    pcall(function() if t.mining_target then r.mining_target = t.mining_target.name end end)
-    local inv = {}
-    pcall(function() for i = 1, t.get_max_inventory_index() do local c = contents(t.get_inventory(i)) if next(c) then for k, v in pairs(c) do inv[k] = (inv[k] or 0) + v end end end end)
-    r.items = BELT[t.type] and r.on_belt or inv
-    pcall(function() if t.burner then r.fuel_left = t.burner.remaining_burning_fuel > 0 or next(contents(t.burner.inventory)) ~= nil end end)
-    return r`,
+    return {results=out, found=found, empty=empty}`,
 
   mine: `
     local e = bot()
@@ -1679,13 +1698,18 @@ const BODY = {
         for tx = ax, bx do for ty = ay, by do put(tx, ty, ch, rk) end end
       end
     end
-    local rows, free, unknown = {}, 0, 0
+    local rows, free, unknown, memory, mx, my = {}, 0, 0, 0, 0, 0
     for y = 0, H-1 do
       local row = {}
       for x = 0, W-1 do
         local ch = sym[y*W + x]
         if not charted(A.x1+x, A.y1+y) then ch = '?' unknown = unknown + 1
-        elseif not ch then ch = '.' free = free + 1 end
+        else
+          -- Вживую не видно: клетка известна только по памяти карты, пустая рисуется «,», а не «.».
+          local lv = live(A.x1+x, A.y1+y)
+          if not lv then memory = memory + 1 mx = mx + A.x1 + x my = my + A.y1 + y end
+          if not ch then if lv then ch = '.' free = free + 1 else ch = ',' end end
+        end
         row[x+1] = ch
       end
       rows[y+1] = table.concat(row)
@@ -1693,9 +1717,8 @@ const BODY = {
     local named = {}
     for ch, v in pairs(seen) do if v ~= true then named[#named+1] = {s=ch, name=v} end end
     table.sort(named, function(a, b) return a.s < b.s end)
-    local coarse = false
-    for _, c in pairs({{A.x1, A.y1}, {A.x2-1, A.y1}, {A.x1, A.y2-1}, {A.x2-1, A.y2-1}}) do if not live(c[1], c[2]) then coarse = true end end
-    return {x0=A.x1, y0=A.y1, w=W, h=H, rows=rows, named=named, symbols=seen, free=free, unexplored=unknown, coarse=coarse, buildings=counts, details=A.details and details or nil}`,
+    return {x0=A.x1, y0=A.y1, w=W, h=H, rows=rows, named=named, symbols=seen, free=free, unexplored=unknown, memory=memory,
+      memory_at=memory > 0 and {x=math.floor(mx/memory+0.5), y=math.floor(my/memory+0.5)} or nil, buildings=counts, details=A.details and details or nil}`,
 
   // Маршрут конвейера или трубы от клетки (A.fx, A.fy) до (A.tx, A.ty): только расчёт по тому, что игрок видит на
   // экране и карте (как area_map), ничего не ставит. A* по клеткам, состояние — клетка, направление прихода и признак
@@ -2108,7 +2131,7 @@ const FOLLOW = (`
 // Персонажа могут вести сразу несколько источников: главная сессия, саб-агент, собственные скрипты бота через fx.
 // Одновременные действия рвут его в разные стороны, поэтому действие, которое двигает персонажа, для каждого
 // персонажа выполняется только одно; второму вызову отвечаем отказом с объяснением, а не ставим его в очередь.
-const READ_ONLY = new Set(['status', 'look_around', 'find', 'inspect', 'research', 'power', 'belt', 'alerts', 'pollution',
+const READ_ONLY = new Set(['status', 'look_around', 'find', 'inspect', 'inspect_many', 'research', 'power', 'belt', 'alerts', 'pollution',
   'area_map', 'route', 'where_items', 'production', 'recipe_info', 'say', 'wait', 'feedback', 'feedback_status', 'read_chat',
   'craft', 'template_save', 'template_cost', 'template_delete', 'ghost_place', 'ghost_list', 'ghost_clear', 'stop']);
 const busy = new Map(); // персонаж -> { tool, since }
@@ -2550,6 +2573,10 @@ export function createFactorioServer(botName, hooks) {
 
     def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with). Труп персонажа (character-corpse, координаты даёт find) — что в нём лежит (items).', coords, (a) => run('inspect', a)),
 
+    def('inspect_many', 'Осмотреть список точек одним вызовом вместо серии inspect: проверка турелей и печей, сверка построенного с планом. points — до 50 точек {x, y}; results — ответы в том же порядке, у каждого x, y запрошенной точки и те же поля, что у inspect (name, pos, status, items, direction, recipe, health, fuel_left, ...). В точке ничего нет — {x, y, empty: true}: это обычный ответ, не ошибка. found и empty — сколько точек с объектом и сколько пустых. Только чтение, персонажа не двигает.',
+      { points: z.array(z.object(coords)).min(1).max(50).describe('точки для осмотра') },
+      (a) => run('inspect_many', a)),
+
     def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Дальний переход (через всю базу) планируется целиком до первого шага, по открытой карте: промежуточные точки вручную не нужны. Если дойти не удалось — not_reached с причиной и distance_left; когда пути нет вовсе, персонаж остаётся на месте и говорит, докуда дойти можно и что мешает дальше (постройка или вода и её координаты). Если встал вплотную (до 4 клеток), а в саму точку прохода нет — это note, а не not_reached. Обход ограничен: если идти больше чем вчетверо дальше прямой (и больше 60 клеток), персонаж не идёт и отвечает not_reached «обход слишком длинный» с длиной пути (route_len) — тогда повтори с long_way=true или сделай проход. walked — сколько клеток пройдено, straight — сколько было по прямой. Враги: маршрут обходит в 30 клетках гнёзда и червей, которых видно (60 клеток от персонажа, радар), а если обойти нельзя или цель рядом с ними — not_reached «на пути враги»; если по дороге в 20 клетках появились кусаки — персонаж останавливается (not_reached «рядом появились враги», в enemies — сколько и где), следующий вызов уже идёт, чтобы можно было уйти. Так же ходят все инструменты, которые подходят сами (take_items, gather, place и другие). Трубы, как и для игрока, непроходимы (конвейеры проходимы): проход через линию труб — подземная труба. До трёх минут ходьбы на вызов.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio'),
         long_way: z.boolean().default(false).describe('true — идти, даже если обход намного длиннее прямой (вокруг озера, длинной стены); путь ищется шире'),
@@ -2962,7 +2989,7 @@ export function createFactorioServer(botName, hooks) {
         return r;
       }),
 
-    def('area_map', 'Карта области одним вызовом вместо десятков inspect: прямоугольник (x, y)–(x2, y2) до 64×64 клеток, символ — клетка. rows[j][i] — клетка с x = x0+i, y = y0+j (её центр — +0.5), строки идут с севера на юг. «.» — пусто, можно строить; «~» вода; «*» дерево; «@» камень или обломки; «%» скала; строчные буквы — руда (на руде строить можно); «^ > v <» — конвейер, везёт в эту сторону; «=» труба; заглавные буквы — постройки (большая занимает несколько клеток); «+» призрак постройки (ghost_place); «!» вражеская постройка; «#» какая-то постройка (вид отсюда не видно); «?» карта не открыта. Какие буквы что значат в этой области — в legend, сколько каких построек — buildings. С details=true — ещё и список построек (кроме лент и труб) с точным центром, направлением, рецептом, входом/выходом подземного конвейера (до 200). Вид построек и направление лент видно в 60 клетках от персонажа и под радаром; на остальной открытой карте — только вода, руда, деревья, камни и «#» (тогда в ответе note). Идти никуда не нужно.',
+    def('area_map', 'Карта области одним вызовом вместо десятков inspect: прямоугольник (x, y)–(x2, y2) до 64×64 клеток, символ — клетка. rows[j][i] — клетка с x = x0+i, y = y0+j (её центр — +0.5), строки идут с севера на юг. «.» — пусто, можно строить; «,» — пусто по памяти карты, вживую отсюда не видно; «~» вода; «*» дерево; «@» камень или обломки; «%» скала; строчные буквы — руда (на руде строить можно); «^ > v <» — конвейер, везёт в эту сторону; «=» труба; заглавные буквы — постройки (большая занимает несколько клеток); «+» призрак постройки (ghost_place); «!» вражеская постройка; «#» какая-то постройка (вид отсюда не видно); «?» карта не открыта. Какие буквы что значат в этой области — в legend, сколько каких построек — buildings. С details=true — ещё и список построек (кроме лент и труб) с точным центром, направлением, рецептом, входом/выходом подземного конвейера (до 200). Вид построек и направление лент видно в 60 клетках от персонажа и под радаром; остальная открытая карта — по памяти, как на карте в игре: вода, руда, деревья, камни, «#» на месте построек и «,» вместо «.» (это не «пусто наверняка» и не ошибка карты). Тогда в ответе from_memory: cells — сколько клеток показано по памяти, center — куда подойти или где поставить радар за точной картиной; free считает только точно пустые клетки. Идти никуда не нужно.',
       { ...coords, x2: z.number().describe('x противоположного угла'), y2: z.number().describe('y противоположного угла'),
         details: z.boolean().default(false).describe('приложить список построек с направлением и рецептом') },
       async (a) => {
@@ -2970,7 +2997,7 @@ export function createFactorioServer(botName, hooks) {
         if (sel.x2 - sel.x1 > 64 || sel.y2 - sel.y1 > 64) throw new Error('область больше 64×64 клеток: раздели её на части');
         const r = await run('area_map', { ...sel, details: a.details });
         const FIXED = { '.': 'пусто', '~': 'вода', '*': 'дерево', '@': 'камень или обломки', '%': 'скала', '+': 'призрак постройки', '!': 'вражеская постройка',
-          '#': 'постройка, вид не виден', '?': 'карта не открыта', '^': 'конвейер на север', '>': 'конвейер на восток', v: 'конвейер на юг', '<': 'конвейер на запад' };
+          '#': 'постройка, вид не виден', ',': 'по памяти карты построек нет (вживую отсюда не видно)', '?': 'карта не открыта', '^': 'конвейер на север', '>': 'конвейер на восток', v: 'конвейер на юг', '<': 'конвейер на запад' };
         const legend = {};
         const rows = Array.isArray(r.rows) ? r.rows : [];
         const text = rows.join('');
@@ -2979,7 +3006,8 @@ export function createFactorioServer(botName, hooks) {
         return { x0: r.x0, y0: r.y0, w: r.w, h: r.h, rows, legend, free: r.free, unexplored: r.unexplored || undefined,
           buildings: r.buildings && !Array.isArray(r.buildings) ? r.buildings : undefined,
           details: a.details ? (Array.isArray(r.details) ? r.details : []) : undefined,
-          note: r.coarse ? 'часть области дальше 60 клеток от персонажа и не под радаром: там постройки показаны как «#», без вида и направления, а враги не показаны — подойди ближе за точной картой' : undefined };
+          from_memory: r.memory ? { cells: r.memory, of: r.w * r.h, center: r.memory_at, age: 'неизвестен: игра не показывает, когда клетку видели в последний раз' } : undefined,
+          note: r.memory ? `${r.memory} из ${r.w * r.h} клеток дальше 60 клеток от персонажа и не под радаром — они показаны по памяти карты, как на карте в игре: «,» — построек там не видно (вживую не проверено), «#» — какая-то постройка без вида и направления, враги не показаны; вода, руда и деревья верны. Остальные клетки точные. Это не ошибка карты, и перепроверять её по одной точке (inspect) не нужно: за точной картиной подойди к (${r.memory_at?.x}, ${r.memory_at?.y}) — видно на 60 клеток вокруг персонажа — или поставь там радар с электричеством` : undefined };
       }),
 
     def('route', 'Маршрут конвейера или трубы от клетки (x, y) до (x2, y2): находит путь в обход построек, деревьев, камней, скал, воды и призраков, а где обойти нельзя или далеко — проходит под землёй (подземный конвейер того же вида или pipe-to-ground, в пределах их дальности). Ничего не ставит и не тратит — это расчёт по тому, что видно на карте; идти никуда не нужно. Чужое не задевает: труба не ложится в клетку, где соединилась бы с чужой трубой или входом машины; лента не ложится туда, куда высыпает чужая лента; подземный участок не путается с чужими подземными концами на той же линии. Начало и конец от этих запретов свободны (там ты и подключаешься), обе клетки должны быть свободны. Ответ: items — список {item, x, y, direction, underground} по порядку от начала к концу, его можно целиком передать в ghost_place или place_many (по 50 штук); segments — то же коротко, прямыми участками; cost / have / missing — сколько чего нужно и чего не хватает. С ghost=имя плана маршрут сразу размечается призраками (как ghost_place), а вместо items приходит только сводка — потом ghost_build. Лента: каждая клетка везёт к следующей, последняя — по ходу или в end_direction. Точно видно в 60 клетках от персонажа и под радаром; дальше постройки — просто препятствия (тогда в ответе note).',
