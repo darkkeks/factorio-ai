@@ -61,6 +61,10 @@ function auth(req) {
   return typeof v === 'string' ? { agent: v } : v;
 }
 
+// Очередь заявок общая с обработчиком (src/feedback-worker.mjs); на тестовом стенде — свой каталог.
+if (conf.feedbackDir) process.env.FEEDBACK_DIR = resolve(conf.feedbackDir);
+const FB = await import('../../src/feedback.mjs');
+
 const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, holdMs: conf.holdMs ?? 90000, log });
 
 // ── Ожидание завершения действий ──
@@ -236,13 +240,22 @@ const special = {
     return out;
   },
 
-  // Замечание о работе интерфейса: дописывается в файл, читают разработчики.
+  // Заявка разработчикам: встаёт в очередь (feedback/queue.jsonl), её разбирает обработчик заявок.
   async feedback(who, body) {
     const text = String(body.text ?? '').trim();
-    if (!text) throw new GameError('bad_request', 'text: что не так или чего не хватает');
+    if (!text) throw new GameError('bad_request', 'text: что делал, что получил, чего ожидал');
     if (text.length > 8000) throw new GameError('bad_request', 'текст длиннее 8000 символов');
-    fs.appendFileSync(path.join(LOG_DIR, 'feedback.jsonl'), JSON.stringify({ t: stamp(), from: who.agent || '(admin)', text }) + '\n');
-    return { saved: true };
+    try { return FB.submitFeedback(who.agent || '(admin)', text); } catch (e) { throw new GameError('busy', e.message); }
+  },
+
+  // Что стало с заявками: свои (или все, all: true) со статусом и ответом разработчиков.
+  async feedback_status(who, body) {
+    const limit = Math.min(Number(body.limit) || 15, 100);
+    let items = FB.readItems();
+    if (!body.all) items = items.filter((i) => i.from === who.agent);
+    const view = (i) => ({ id: i.id, from: i.from, at: i.at, text: i.text.length > 400 ? i.text.slice(0, 400) + '…' : i.text,
+      status: i.status, answer: i.note, released: i.status === 'done' ? i.released !== false : undefined });
+    return { feedback: items.slice(-limit).map(view), waiting: items.filter((i) => i.status === 'new').length };
   },
 
   async metrics(who) {
@@ -320,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     else throw new GameError('bad_request', 'метод: POST (или GET для запросов без тела)');
     if (req.headers['x-forwarded-for']) body[EXTERNAL] = true;
     // Сервер игры перезапускается: запрос ждёт его возвращения (снаружи — меньше, под таймауты nginx), а не отклоняется.
-    if (!game.ready && op !== 'metrics' && op !== 'feedback' && op !== 'help') {
+    if (!game.ready && !['metrics', 'feedback', 'feedback_status', 'help'].includes(op)) {
       const t1 = performance.now();
       const back = await game.whenReady(body[EXTERNAL] ? 40000 : undefined);
       if (!back) throw new GameError(game.lastError?.includes('несовместим') ? 'incompatible' : 'game_unavailable', `игра недоступна: ${game.lastError || 'нет связи'}`);

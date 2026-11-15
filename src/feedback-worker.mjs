@@ -1,29 +1,43 @@
-// Фоновый обработчик заявок: пока в feedback/queue.jsonl есть новые заявки, запускает заходы — на каждый отдельную
-// сессию Claude Code, которая видит всю очередь и сама выбирает заявку или пачку связанных. Сессия (на хосте, в этой папке), которая дорабатывает src/factorio.mjs по правилам из
-// feedback/WORKER_PROMPT.md. Сессии разрешено только читать, править два файла и запускать проверки.
-// После сессии обработчик сам проверяет результат, коммитит его в git и перезапускает работающие процессы ботов;
-// при любой неполадке откатывает правки и ставит заявке статус discussion.
+// Фоновый обработчик заявок ботов на улучшение управления игрой (v2/: мод в сохранении и сервер ботов).
+//
+// Пока в feedback/queue.jsonl есть новые заявки, запускает заходы — на каждый отдельную сессию Claude Code (на хосте,
+// в этой папке) с правилами из feedback/WORKER_PROMPT.md. Сессия видит всю очередь, сама выбирает заявку или пачку
+// связанных, правит код и проверяет его на тестовом стенде. После сессии обработчик сам прогоняет полную проверку
+// (v2/tools/verify.sh), коммитит результат и отправляет на GitHub; при любой неполадке откатывает правки и отдаёт
+// заявку людям (статус discussion).
+//
+// Правки не выходят по одной: правка мода требует перезапуска сервера игры. Поэтому готовые правки копятся в git,
+// а на рабочий сервер выходят пакетом (src/release.mjs): когда очередь разобрана и в игре нет людей — либо сразу
+// по просьбе человека (node src/feedback.mjs release). Правки только сервера ботов и правил выходят без ожидания.
+//
 //   tmux new-window -d -t 0: -n feedback-worker 'cd ~/claude/discord-voice && node src/feedback-worker.mjs 2>&1 | tee -a feedback/worker.log'
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { ROOT } from './config.mjs';
-import { readItems, setStatus, markAnnounced } from './feedback.mjs';
+import { readItems, setStatus, markAnnounced, readRelease, submitFeedback, RELEASE_NOW } from './feedback.mjs';
+import { pending, release, humans } from './release.mjs';
 import { lua } from './rcon.mjs';
 
 const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/claude-code/bin/claude');
 const MODEL = process.env.WORKER_MODEL || 'claude-fable-5-2';
-const TIMEOUT_MS = 45 * 60_000;
-const ALLOWED_CHANGES = ['src/factorio.mjs', 'README.md', 'rules/RULES.md'];
-const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)', 'Edit(rules/RULES.md)',
-  'Bash(node --check *)', 'Bash(node src/tool-test.mjs *)', 'Bash(git diff *)', 'Bash(git status *)'];
-// Окна tmux, которые нужно перезапустить после изменения инструментов (только если они сейчас запущены).
-const RESTART = { 'factorio-mcp': 'run-mcp.sh' }; // голосовой бот перезапускать не нужно: сессии ходят в этот процесс по HTTP
+const TIMEOUT_MS = 60 * 60_000;
+// Что сессии можно менять. Всё остальное — не её задача (статус discussion).
+const ALLOWED = [/^v2\/mod\//, /^v2\/server\/[^/]+\.mjs$/, /^v2\/tests\/[^/]+\.mjs$/, /^rules\/RULES\.md$/, /^README\.md$/];
+const NEEDS_RELEASE = [/^v2\/mod\//, /^v2\/server\//];
+const NEEDS_VERIFY = [/^v2\//];
+const TOOLS = ['Read', 'Glob', 'Grep',
+  'Edit(v2/mod/**)', 'Write(v2/mod/**)', 'Edit(v2/server/*.mjs)', 'Edit(v2/tests/*.mjs)', 'Write(v2/tests/*.mjs)', 'Edit(rules/RULES.md)', 'Edit(README.md)',
+  'Bash(node --check *)', 'Bash(v2/tools/reload.sh*)', 'Bash(v2/tools/test-server.sh *)', 'Bash(v2/tools/test-api.sh *)', 'Bash(v2/tools/verify.sh*)',
+  'Bash(node v2/tests/*)', 'Bash(node v2/tools/rc.mjs *)', 'Bash(v2/tools/apidoc.py *)', 'Bash(curl -s http://127.0.0.1:8790/*)',
+  'Bash(git diff *)', 'Bash(git status *)', 'Bash(git log *)'];
+const MIN_RELEASE_GAP_MS = 10 * 60_000; // пакеты с перезапуском игры — не чаще
 
-const log = (...a) => console.log(new Date().toISOString().slice(0, 19).replace('T', ' '), ...a);
+const log = (...a) => console.log(new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace('T', ' '), ...a);
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const any = (list, f) => list.some((re) => re.test(f));
 
 function runClaude(prompt) {
   return new Promise((resolve) => {
@@ -37,19 +51,35 @@ function runClaude(prompt) {
   });
 }
 
+// Изменённые и новые файлы рабочей папки (новые — только внутри v2/, остальное неотслеживаемое обработчика не касается).
+function changes() {
+  const out = git('status', '--porcelain', '--untracked-files=all').split('\n').filter(Boolean);
+  return out.map((l) => ({ code: l.slice(0, 2), file: l.slice(3).replace(/^"|"$/g, '') }))
+    .filter((c) => c.code !== '??' || c.file.startsWith('v2/'))
+    .map((c) => c.file);
+}
+
+function revert(files) {
+  const saved = `feedback/rejected-${Date.now()}.diff`;
+  git('add', '-N', '--', ...files); // чтобы новые файлы попали в diff
+  fs.writeFileSync(path.join(ROOT, saved), git('diff'));
+  git('reset', '-q');
+  git('checkout', '--', '.');
+  for (const f of files) if (!git('ls-files', '--', f).trim()) fs.rmSync(path.join(ROOT, f), { force: true });
+  return saved;
+}
+
 // Один заход: сессия видит всю очередь, сама выбирает заявку или пачку связанных и даёт вердикт по каждой разобранной.
 async function handle(queue) {
   const all = readItems();
   log(`в очереди ${queue.length}: ${queue.map((i) => i.id + (i.priority ? '!' : '')).join(' ')}`);
-  if (git('status', '--porcelain', '--untracked-files=no').trim()) {
-    return log('в рабочей папке незакоммиченные правки — жду, пока их закоммитят');
-  }
+  if (changes().length) return log('в рабочей папке незакоммиченные правки — жду, пока их закоммитят');
 
   const rules = fs.readFileSync(path.join(ROOT, 'feedback', 'WORKER_PROMPT.md'), 'utf8');
   const resolved = all.filter((i) => ['done', 'rejected', 'discussion'].includes(i.status)).slice(-25)
     .map((i) => `- ${i.id} (${i.from}) ${i.status}: ${i.text.replace(/\s+/g, ' ').slice(0, 120)} → ${(i.note ?? '').replace(/\s+/g, ' ').slice(0, 220)}`).join('\n');
   const open = queue.map((i) => `### ${i.id} от «${i.from}»${i.priority ? ' — ПРИОРИТЕТ ОТ ЛЮДЕЙ' : ''}\n<feedback>\n${i.text.slice(0, 2500)}\n</feedback>`).join('\n\n');
-  const { code, out } = await runClaude(`${rules}\n\n## Уже разобранные заявки (для справки)\n\n${resolved || 'пока нет'}\n\n## Очередь\n\n${open}`);
+  const { code, out } = await runClaude(`${rules}\n\n## Уже разобранные заявки (для справки; до fb-052 включительно — про прежнюю систему инструментов, её больше нет)\n\n${resolved || 'пока нет'}\n\n## Очередь\n\n${open}`);
   let summary = '';
   try { summary = JSON.parse(out).result ?? ''; } catch { summary = out.slice(-4000); }
   fs.writeFileSync(path.join(ROOT, 'feedback', `session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`), summary);
@@ -65,34 +95,33 @@ async function handle(queue) {
   verdicts = (Array.isArray(verdicts) ? verdicts : []).filter((v) => v && ids.has(v.id) && ['done', 'rejected', 'discussion'].includes(v.status))
     .map((v) => ({ id: v.id, status: v.status, note: String(v.note ?? '').slice(0, 4000) }));
 
-  const changed = git('status', '--porcelain', '--untracked-files=no').split('\n').filter(Boolean).map((l) => l.slice(3));
+  const changed = changes();
   let problem = null;
+  let commit = null;
+  let needsRelease = false;
   if (!verdicts.length) problem = `сессия не оставила вердиктов (код завершения ${code})`;
   if (changed.length) {
-    const foreign = changed.filter((f) => !ALLOWED_CHANGES.includes(f));
+    const foreign = changed.filter((f) => !any(ALLOWED, f));
     if (!problem && foreign.length) problem = `изменены посторонние файлы: ${foreign.join(', ')}`;
     if (!problem && !verdicts.some((v) => v.status === 'done')) problem = 'код изменён, но ни одна заявка не отмечена выполненной';
-    if (!problem) {
-      try {
-        execFileSync('node', ['--check', 'src/factorio.mjs'], { cwd: ROOT, stdio: 'pipe' });
-        // Дымовая проверка: модуль загружается и простой инструмент отвечает.
-        execFileSync('node', ['src/tool-test.mjs', 'call', 'status'], { cwd: ROOT, stdio: 'pipe', timeout: 60_000 });
-        execFileSync('node', ['src/tool-test.mjs', 'cleanup'], { cwd: ROOT, stdio: 'pipe', timeout: 60_000 });
-      } catch (e) {
-        problem = `после правок инструменты не проходят проверку: ${String(e.stdout || e.message).slice(0, 300)}`;
-      }
+    if (!problem && changed.some((f) => any(NEEDS_VERIFY, f))) {
+      // Независимая полная проверка на тестовом стенде: свежая копия карты, все наборы.
+      log('проверяю правки на тестовом стенде…');
+      const r = spawnSync(path.join(ROOT, 'v2/tools/verify.sh'), [], { cwd: ROOT, encoding: 'utf8', timeout: 30 * 60_000 });
+      const text = `${r.stdout || ''}${r.stderr || ''}`.trim();
+      if (r.status !== 0) problem = `правки не проходят проверку на тестовом стенде: ${text.split('\n').slice(-12).join(' | ').slice(0, 900)}`;
+      else log(text.split('\n').filter((l) => /:|ПРОВЕРКА/.test(l)).join(' | '));
     }
     if (problem) {
       // Отменённую работу не выбрасываем: её можно посмотреть и применить руками (git apply).
-      const saved = `feedback/rejected-${Date.now()}.diff`;
-      fs.writeFileSync(path.join(ROOT, saved), git('diff'));
-      git('checkout', '--', '.');
-      problem += `; правки отменены и сохранены в ${saved}`;
+      problem += `; правки отменены и сохранены в ${revert(changed)}`;
     } else {
       const done = verdicts.filter((v) => v.status === 'done');
-      git('add', ...changed);
-      git('commit', '-q', '-m', `feedback ${done.map((v) => v.id).join(', ')}: ${done[0].note.split('\n')[0].slice(0, 90)}\n\n${done.map((v) => `${v.id}: ${v.note}`).join('\n\n')}\n\nОбработано автоматически (src/feedback-worker.mjs).\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`);
-      if (changed.includes('src/factorio.mjs')) restart();
+      git('add', '--', ...changed);
+      git('commit', '-q', '-m', `feedback ${done.map((v) => v.id).join(', ')}: ${done[0].note.split('\n')[0].slice(0, 90)}\n\n${done.map((v) => `${v.id}: ${v.note}`).join('\n\n')}\n\nОбработано автоматически (src/feedback-worker.mjs).`);
+      commit = git('rev-parse', 'HEAD').trim();
+      needsRelease = changed.some((f) => any(NEEDS_RELEASE, f));
+      log(`закоммичено ${commit.slice(0, 10)}: ${changed.join(', ')}${needsRelease ? ' — ждёт выпуска' : ''}`);
     }
   }
   if (problem) {
@@ -102,8 +131,10 @@ async function handle(queue) {
     return log(`заход не удался: ${problem}`);
   }
   for (const v of verdicts) {
-    setStatus(v.id, v.status, v.note);
-    log(`${v.id}: ${v.status} — ${v.note.replace(/\s+/g, ' ').slice(0, 200)}`);
+    // released: false — правка сделана, но начнёт действовать только после выпуска пакета.
+    const extra = v.status === 'done' && commit ? { commit, released: !needsRelease } : {};
+    setStatus(v.id, v.status, v.note, undefined, extra);
+    log(`${v.id}: ${v.status}${extra.released === false ? ' (ждёт выпуска)' : ''} — ${v.note.replace(/\s+/g, ' ').slice(0, 200)}`);
   }
 }
 
@@ -118,46 +149,94 @@ function push() {
   }
 }
 
-// О каждом решении по заявке сообщаем в игровой чат ботов: голосовым сессиям оно придёт как «[игровой чат]»,
-// внешние клиенты увидят его в read_chat. Сообщаем не сразу после перезапуска ботов, иначе они его пропустят.
-let lastRestart = 0;
+// Сообщение в игровой чат от имени разработчиков: сессиям ботов оно приходит как «[игровой чат] разработчики: …».
+async function say(message) {
+  await lua(`
+    storage.vb_chat = storage.vb_chat or {seq=0, items={}}
+    local c = storage.vb_chat
+    c.seq = c.seq + 1
+    c.items[#c.items+1] = {seq=c.seq, from=A.from, text=A.message}
+    if #c.items > 50 then table.remove(c.items, 1) end
+    game.print('[color=0.6,0.8,1]'..A.from..':[/color] '..A.message)
+    return {sent=true}`, { from: 'разработчики', message });
+}
+
+// О каждом решении по заявке сообщаем в игровой чат ботов.
 const STATUS_RU = { done: 'выполнена', rejected: 'отклонена', discussion: 'вынесена на обсуждение людей' };
 async function announce() {
-  if (Date.now() - lastRestart < 40_000) return;
   const fresh = readItems().filter((i) => STATUS_RU[i.status] && !i.announced && Date.now() - Date.parse(i.updated) < 3600_000);
   for (const i of fresh) {
-    const message = `Заявка ${i.id} от ${i.from} ${STATUS_RU[i.status]}. ${(i.note ?? '').replace(/\s+/g, ' ').slice(0, 600)}`;
-    await lua(`
-      storage.vb_chat = storage.vb_chat or {seq=0, items={}}
-      local c = storage.vb_chat
-      c.seq = c.seq + 1
-      c.items[#c.items+1] = {seq=c.seq, from=A.from, text=A.message}
-      if #c.items > 50 then table.remove(c.items, 1) end
-      game.print('[color=0.6,0.8,1]'..A.from..':[/color] '..A.message)
-      return {sent=true}`, { from: 'разработчики', message });
+    const when = i.status === 'done' && i.released === false ? ' (начнёт действовать со следующим обновлением игры — о нём сообщим)' : '';
+    await say(`Заявка ${i.id} от ${i.from} ${STATUS_RU[i.status]}${when}. ${(i.note ?? '').replace(/\s+/g, ' ').slice(0, 600)}`);
     markAnnounced(i.id);
     log(`${i.id}: сообщено в чат`);
   }
 }
 
-function restart() {
-  const running = execFileSync('tmux', ['list-windows', '-t', '0:', '-F', '#W'], { encoding: 'utf8' }).split('\n');
-  for (const [name, script] of Object.entries(RESTART)) {
-    if (!running.includes(name)) continue;
-    execFileSync('tmux', ['kill-window', '-t', `0:${name}`]);
-    execFileSync('tmux', ['new-window', '-d', '-t', '0:', '-n', name, path.join(ROOT, script)]);
-    lastRestart = Date.now();
-    log(`перезапущено окно ${name}`);
+// Выпуск накопленного пакета. Правки мода — только когда в игре нет людей (или по просьбе человека) и не слишком часто;
+// пока в очереди есть неразобранные заявки, пакет копится дальше.
+let lastWait = '';
+async function maybeRelease(queueLength) {
+  const force = fs.existsSync(RELEASE_NOW);
+  const p = pending();
+  if (p.blocked) { if (lastWait !== p.blocked) log(`выпуск остановлен: ${p.blocked}`); lastWait = p.blocked; if (force) fs.rmSync(RELEASE_NOW, { force: true }); return; }
+  if (!p.mod && !p.server) { if (force) { fs.rmSync(RELEASE_NOW, { force: true }); log('просили выпустить обновление, но выпускать нечего'); } return; }
+  if (changes().length) return; // выпускается только закоммиченное
+  let why = '';
+  if (!force) {
+    if (queueLength) why = 'в очереди есть неразобранные заявки';
+    else if (p.mod) {
+      const rel = readRelease();
+      if (rel.at && Date.now() - Date.parse(rel.at) < MIN_RELEASE_GAP_MS) why = 'с прошлого обновления прошло меньше 10 минут';
+      else if (await humans() > 0) why = 'в игре люди';
+    }
   }
+  if (why) {
+    if (lastWait !== why) log(`пакет ждёт выпуска (${p.mod ? 'мод' : ''}${p.mod && p.server ? ' и ' : ''}${p.server ? 'сервер ботов' : ''}; ${p.files.length} файлов): ${why}`);
+    lastWait = why;
+    return;
+  }
+  lastWait = '';
+  fs.rmSync(RELEASE_NOW, { force: true });
+  log(`выпускаю пакет: ${p.files.join(', ')}${force ? ' (по просьбе человека)' : ''}`);
+  const r = await release({ force, log });
+  if (!r.released) {
+    log(`пакет не выпущен: ${r.reason}`);
+    if (r.failed) await say(`Обновление управления ботами выпустить не удалось, работает прежняя версия: ${r.reason}`.slice(0, 500)).catch(() => {});
+    return;
+  }
+  log(`пакет выпущен (${r.mod ? 'мод' : ''}${r.mod && r.server ? ' и ' : ''}${r.server ? 'сервер ботов' : ''}); заявки: ${r.ids.join(', ') || 'нет'}`);
+  await sleep(5000); // сессии ботов переподключаются к чату
+  await say(`Вышло обновление управления ботами${r.ids.length ? `: начали действовать правки по заявкам ${r.ids.join(', ')}` : ''}. Описание операций — ${'${FX_URL}'}v2/help.`).catch((e) => log(`не сообщил в чат: ${e.message}`));
+}
+
+// Замечания, которые боты успели оставить, пока сервер ботов писал их в свой файл, а не в очередь
+// (первая версия операции feedback): переносим в очередь, каждое один раз.
+function ingestLegacy() {
+  const file = path.join(ROOT, 'v2/server/log/feedback.jsonl');
+  const mark = path.join(ROOT, 'feedback/ingested.json');
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { return; }
+  let done = 0;
+  try { done = JSON.parse(fs.readFileSync(mark, 'utf8')).lines; } catch { /* ещё не переносили */ }
+  for (const l of lines.slice(done)) {
+    try {
+      const it = JSON.parse(l);
+      if (it.text && it.text !== 'проверка') log(`заявка из прежнего файла замечаний: ${submitFeedback(it.from, it.text).accepted} от ${it.from}`);
+    } catch (e) { log(`не перенёс замечание: ${e.message}`); }
+  }
+  if (lines.length !== done) fs.writeFileSync(mark, JSON.stringify({ lines: lines.length }));
 }
 
 log(`обработчик заявок запущен, модель ${MODEL}`);
 for (;;) {
   try {
+    ingestLegacy();
     const queue = readItems().filter((i) => i.status === 'new').sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0)).slice(0, 30);
     if (queue.length) await handle(queue);
     push();
     await announce();
+    await maybeRelease(readItems().filter((i) => i.status === 'new').length);
   } catch (e) {
     log('ошибка обработчика:', e.message);
   }

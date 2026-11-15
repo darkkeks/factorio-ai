@@ -7,7 +7,7 @@ cd "$T" || exit 1
 case "$1" in
   start)
     [ -f server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null && { echo "уже запущен: $(cat server.pid)"; exit 1; }
-    SAVE=${2:-test.zip}
+    SAVE=${2:-test.zip}; case "$SAVE" in *.zip) ;; *) SAVE=test.zip;; esac
     setsid nohup ./factorio/bin/x64/factorio --start-server "$SAVE" --server-settings server-settings.json \
       --port "$PORT" --rcon-bind 127.0.0.1:"$RCON_PORT" --rcon-password "$RCON_PW" > server.log 2>&1 &
     echo $! > server.pid

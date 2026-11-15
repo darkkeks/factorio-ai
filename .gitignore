@@ -13,3 +13,6 @@ feedback/session-*.txt
 v2/server/config.json
 v2/server/tokens.json
 v2/server/log/
+feedback/release.json
+feedback/release-now
+feedback/ingested.json
