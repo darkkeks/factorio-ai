@@ -3,10 +3,10 @@ import { Agent } from './agent.mjs';
 import { createFactorioServer } from './factorio.mjs';
 const [human, ...lines] = process.argv.slice(2);
 const bot = `${human}-бот`;
-const fx = createFactorioServer(bot, { log: (l) => console.log(l), aborted: () => false });
+const fx = createFactorioServer(bot, { log: () => {}, aborted: () => false }); // вызовы инструментов сессии видны в mcp.log
 // Игра должна идти: нужен игрок на сервере или свежий ~/robot/voice-active (см. pause-guard).
 console.log('персонаж:', await fx.ensure());
-const a = new Agent(`test-${human}`, human, bot, fx.server);
+const a = new Agent(`test-${human}`, human, bot);
 const t0 = Date.now();
 a.on('text', (t) => console.log(`🤖 ${bot}: ${t}`));
 a.on('error', (e) => console.log('[error]', e.message));

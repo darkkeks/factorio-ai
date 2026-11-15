@@ -29,14 +29,17 @@ http.createServer(async (req, res) => {
   if (!bot) { res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}'); return; }
   if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }).end(); return; }
   const started = Date.now();
+  // Снаружи запросы приходят через nginx (он добавляет X-Forwarded-For); сессии голосового бота ходят напрямую.
+  const external = Boolean(req.headers['x-forwarded-for']);
   // Пока внешний бот действует, игра не должна стоять на паузе (см. pause-guard в контейнере robot).
   const activity = () => { try { fs.writeFileSync(VOICE_HEARTBEAT, new Date().toISOString()); } catch { /* не критично */ } };
   // Один экземпляр инструментов на персонажа, чтобы read_chat помнил, что уже прочитано.
   const fx = createFactorioServer(bot, {
     log: (line) => console.log(stamp(), line),
-    aborted: () => Date.now() - started > MAX_CALL_MS,
+    aborted: () => external && Date.now() - started > MAX_CALL_MS,
     activity,
-    chatTool: chatSeen.get(bot) || chatSeen.set(bot, { seq: 0 }).get(bot),
+    // Голосовым сессиям чат доставляет сам голосовой бот; чтение чата инструментом — только внешним клиентам.
+    chatTool: external ? (chatSeen.get(bot) || chatSeen.set(bot, { seq: 0 }).get(bot)) : undefined,
   });
   try {
     let body = '';

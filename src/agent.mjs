@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { CLAUDE_BIN, CLAUDE_MODEL, STATE_FILE, ROBOT_CONTAINER } from './config.mjs';
+import crypto from 'node:crypto';
+import { CLAUDE_BIN, CLAUDE_MODEL, STATE_FILE, ROBOT_CONTAINER, MCP_URL, MCP_TOKENS_FILE } from './config.mjs';
 
 const systemPrompt = (human, bot) => `
 Ты — игровой помощник в Factorio. Ты управляешь персонажем по имени «${bot}» на общем сервере; твой хозяин —
@@ -43,6 +44,21 @@ const systemPrompt = (human, bot) => `
   «Стоп», «хватит», «отмена» — TaskStop и строка хозяину.
 - Когда саб-агент закончит, тебе придёт его отчёт: перескажи хозяину итог одной-двумя строками.
 
+Твоё окружение. Кроме игры у тебя есть собственная Linux-машина (контейнер): инструменты Bash, Read, Write, Edit,
+Glob, Grep. Она нужна, чтобы автоматизировать свою работу: писать скрипты и свои инструменты, запускать их, хранить
+заметки и планы. Делай там что угодно для этой цели.
+- Твоя папка — $FX_HOME (${'`'}~/bots/...${'`'}), создай её при первой надобности и держи всё своё там; она переживает перезапуски.
+  Заметки о базе и о том, что ты узнал, веди в файле $FX_HOME/notes.md — контекст разговора не вечен.
+- Из скриптов инструменты игры вызываются командой ${'`'}fx <инструмент> '<json-аргументы>'${'`'} (например ${'`'}fx status${'`'},
+  ${'`'}fx move_to '{"x":10,"y":5}'${'`'}); она печатает JSON-ответ и действует от имени твоего персонажа. Так можно собрать
+  свой цикл или сценарий на shell, Python или Node и запустить его в фоне. Список инструментов: ${'`'}fx --list${'`'}.
+- Новые инструменты игры появляются по заявкам (feedback). Если инструмента ещё нет в твоём списке, но о нём сообщили
+  в чате, он уже доступен через fx.
+- Долгие скрипты запускай в фоне и следи за ними; у персонажа одно тело — не запускай два сценария, которые ведут его
+  одновременно, и останавливай сценарий, когда хозяин меняет задачу.
+- Границы: не трогай сервер игры и его файлы (~/factorio, ~/services, ~/logs), папки других помощников, ~/.claude.
+  В игру — только через инструменты factorio и fx: никакого RCON, консоли и прямых правок сохранений, это читерство.
+
 Как действовать:
 - Приняв реплику на свой счёт, первым делом напиши одну короткую строку: что понял и что сейчас сделаешь. Хозяин видит
   твой текст в чате, и молчание для него выглядит так, будто ты не услышал.
@@ -62,13 +78,31 @@ const systemPrompt = (human, bot) => `
 
 // Саб-агенты: главная сессия остаётся на связи, а работу руками ведёт фоновый саб-агент с теми же инструментами factorio.
 const SUBAGENT_TOOLS = ['Task', 'SendMessage', 'TaskList', 'TaskStop'];
+// Собственное окружение бота в контейнере: оболочка и файлы, чтобы писать и запускать свою автоматизацию.
+const ENV_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
+
+/** Токен персонажа для MCP по HTTP; если его ещё нет — выдаём. */
+export function tokenFor(bot) {
+  let tokens = {};
+  try { tokens = JSON.parse(fs.readFileSync(MCP_TOKENS_FILE, 'utf8')); } catch { /* файла ещё нет */ }
+  let token = Object.keys(tokens).find((t) => tokens[t] === bot);
+  if (!token) {
+    token = crypto.randomBytes(18).toString('base64url');
+    tokens[token] = bot;
+    fs.writeFileSync(MCP_TOKENS_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  }
+  return token;
+}
+
+const slug = (name) => name.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'bot';
 
 // Сессии живут долго и привыкают работать по-старому, поэтому о смене правил возобновлённой сессии сообщаем отдельно.
-const RULES_VERSION = 2;
-const RULES_NOTICE = `[система]: правила работы изменились, перечитай их в системных инструкциях. Главное: у тебя появился
-инструмент Agent. Теперь ты диспетчер: работу руками (идти, добывать, крафтить, строить, носить, ждать) поручай фоновому
-саб-агенту (run_in_background=true) с полным заданием, а сам сразу отвечай хозяину и оставайся на связи. Сам вызывай
-инструменты factorio только для быстрых справок. На это сообщение отвечать не нужно — ответь точкой.`;
+const RULES_VERSION = 3;
+const RULES_NOTICE = `[система]: правила работы изменились, перечитай их в системных инструкциях. Главное:
+1) Ты диспетчер: работу руками поручай фоновому саб-агенту (инструмент Agent, run_in_background=true), сам отвечай
+хозяину и оставайся на связи. 2) У тебя появилось собственное окружение: Bash и файлы в папке $FX_HOME, команда fx
+для вызова инструментов игры из скриптов — можешь писать и запускать свою автоматизацию.
+На это сообщение отвечать не нужно — ответь точкой.`;
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
@@ -86,11 +120,10 @@ export class Agent extends EventEmitter {
    * @param key   постоянный идентификатор человека (discord id) — по нему возобновляется сессия
    * @param human имя человека
    * @param bot   имя его персонажа
-   * @param mcp   MCP-сервер factorio этого персонажа
    */
-  constructor(key, human, bot, mcp) {
+  constructor(key, human, bot) {
     super();
-    Object.assign(this, { key, human, bot, mcp, busy: false, stopped: false });
+    Object.assign(this, { key, human, bot, token: tokenFor(bot), busy: false, stopped: false });
     const state = loadState();
     this.#run(state[key]);
     if (state[key] && state[`${key}:rules`] !== RULES_VERSION) this.send(RULES_NOTICE);
@@ -134,18 +167,21 @@ export class Agent extends EventEmitter {
               spawnClaudeCodeProcess: ({ args, env, signal }) => {
                 const pass = ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION'].filter((k) => env[k]).flatMap((k) => ['-e', `${k}=${env[k]}`]);
                 pass.push('-e', 'ENABLE_CLAUDEAI_MCP_SERVERS=false');
+                // Для собственных скриптов бота: команда fx и прямые запросы к MCP от имени его персонажа.
+                pass.push('-e', `FX_URL=${MCP_URL}`, '-e', `FX_TOKEN=${this.token}`, '-e', `FX_BOT=${this.bot}`, '-e', `FX_HOME=/home/robot/bots/${slug(this.bot)}`);
                 return spawn('docker', ['exec', '-i', '-w', '/home/robot', ...pass, ROBOT_CONTAINER, 'claude', ...args], { stdio: ['pipe', 'pipe', 'inherit'], signal });
               },
             } : { pathToClaudeCodeExecutable: CLAUDE_BIN }),
             model: CLAUDE_MODEL,
             resume,
             systemPrompt: systemPrompt(this.human, this.bot),
-            // Никаких настроек с диска; из встроенных инструментов — только запуск саб-агентов и управление ими.
-            tools: SUBAGENT_TOOLS,
+            // Никаких настроек с диска. Встроенные инструменты: саб-агенты и собственное окружение бота в контейнере.
+            tools: [...SUBAGENT_TOOLS, ...ENV_TOOLS],
             settingSources: [],
-            mcpServers: { factorio: this.mcp },
+            // Инструменты живут в отдельном процессе: их обновление не требует перезапуска сессий.
+            mcpServers: { factorio: { type: 'http', url: MCP_URL, headers: { Authorization: `Bearer ${this.token}` } } },
             strictMcpConfig: true, // никаких коннекторов аккаунта (Docs, почта и т. п.)
-            allowedTools: ['mcp__factorio', ...SUBAGENT_TOOLS],
+            allowedTools: ['mcp__factorio', ...SUBAGENT_TOOLS, ...ENV_TOOLS],
             permissionMode: 'dontAsk',
           },
         });

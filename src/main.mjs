@@ -41,11 +41,9 @@ function join(connection, member) {
   const p = { name, bot: `${name}-бот`, utt: new Utterances(), decoder: new OpusScript(48000, 2), lastPacket: 0, silenceFed: Infinity, gone: false };
   people.set(member.id, p);
 
-  const fx = createFactorioServer(p.bot, {
-    log: (line) => console.log(stamp(), line), // вызовы инструментов — только в bot.log, в чат идёт текст Claude
-    aborted: () => false,
-  });
-  p.agent = new Agent(member.id, name, p.bot, fx.server);
+  // Здесь экземпляр инструментов нужен только чтобы создать персонажа; сессия ходит за ними в отдельный процесс MCP.
+  const fx = createFactorioServer(p.bot, { log: () => {}, aborted: () => false });
+  p.agent = new Agent(member.id, name, p.bot);
   p.agent.on('text', (text) => log(`🤖 ${p.bot}: ${text}`));
   p.agent.on('error', (e) => log(`⚠️ ${p.bot}: ${e.message}`));
   fx.ensure().then(

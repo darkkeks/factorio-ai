@@ -34,3 +34,7 @@ export const STATE_FILE = path.join(ROOT, 'state-factorio.json');
 // Речь
 export const MODELS = path.join(ROOT, 'models');
 export const VAD_SILENCE_S = Number(env.VAD_SILENCE_S || 0.55);
+
+// MCP Factorio — отдельный процесс (src/mcp-http.mjs). Сессии в контейнере ходят к нему по этому адресу.
+export const MCP_URL = env.MCP_URL || 'http://172.25.0.1:8765/';
+export const MCP_TOKENS_FILE = path.join(ROOT, 'mcp-tokens.json');

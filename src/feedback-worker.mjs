@@ -19,7 +19,7 @@ const ALLOWED_CHANGES = ['src/factorio.mjs', 'README.md'];
 const TOOLS = ['Read', 'Glob', 'Grep', 'Edit(src/factorio.mjs)', 'Edit(README.md)',
   'Bash(node --check *)', 'Bash(node src/tool-test.mjs *)', 'Bash(git diff *)', 'Bash(git status *)'];
 // Окна tmux, которые нужно перезапустить после изменения инструментов (только если они сейчас запущены).
-const RESTART = { 'discord-voice': 'run.sh', 'factorio-mcp': 'run-mcp.sh' };
+const RESTART = { 'factorio-mcp': 'run-mcp.sh' }; // голосовой бот перезапускать не нужно: сессии ходят в этот процесс по HTTP
 
 const log = (...a) => console.log(new Date().toISOString().slice(0, 19).replace('T', ' '), ...a);
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' });
