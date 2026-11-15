@@ -481,6 +481,7 @@ function stopCamera(why, retryIn = 0) {
   try { process.kill(-camera.pid, 'SIGTERM'); } catch { /* уже нет */ }
   dying = { pid: camera.pid, at: Date.now() };
   camera = null;
+  live.camera = false; failures = 0;
   nextStart = Date.now() + retryIn;
 }
 
@@ -500,7 +501,7 @@ async function cameraLoop() {
   // Клиент мог остаться от прошлого запуска сервиса — подхватываем его.
   try {
     const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
-    if (pid && alive(pid)) { camera = { pid, since: Date.now(), joined: false, logPos: fs.statSync(CAMERA_LOG).size }; log(`подхватил работающий клиент-камеру (${pid})`); }
+    if (pid && alive(pid)) { camera = { pid, since: Date.now(), joined: false, adopted: true, logPos: fs.statSync(CAMERA_LOG).size }; log(`подхватил работающий клиент-камеру (${pid})`); }
   } catch { /* нет файла */ }
   for (;;) {
     await sleep(1000);
@@ -512,18 +513,20 @@ async function cameraLoop() {
     }
     if (camera && !alive(camera.pid)) { log('клиент-камера больше не работает'); camera = null; }
     if (camera) {
+      // О входе и обрыве судим по логу самого клиента: ответ сервера по RCON в момент перезапуска бывает устаревшим.
       const news = cameraLogNews();
-      const inGame = live.ok && live.camera;
-      if (inGame) { cameraSeen = now; if (!camera.joined) { camera.joined = true; quickFails = 0; log(`камера в игре через ${Math.round((now - camera.since) / 1000)} с после запуска клиента`); } }
+      if (!camera.joined && /to\(InGame\)/.test(news)) { camera.joined = true; cameraSeen = now; quickFails = 0; log(`камера в игре через ${Math.round((now - camera.since) / 1000)} с после запуска клиента`); }
+      if (camera.adopted && !camera.joined && live.ok && live.camera) { camera.joined = true; cameraSeen = now; } // подхваченный клиент вошёл ещё до нас
+      if (camera.joined && live.ok && live.camera) cameraSeen = now;
       if (/from\(InGame\) to\(/.test(news)) stopCamera('сервер разорвал связь');                       // сервер перезапускают
-      else if (/to\(InitializationFailed\)|Connection refused|to\(Disconnected\)/.test(news) && !inGame) {
+      else if (!camera.joined && /to\(InitializationFailed\)|Connection refused|to\(Disconnected\)/.test(news)) {
         // Не вошёл. Первый раз — сервер, скорее всего, ещё поднимается: повторим, как только он ответит по RCON.
         quickFails++;
         stopCamera(`не вошёл на сервер (подряд: ${quickFails})`, quickFails >= 3 ? CAMERA_RETRY_MS : 0);
         waitServer = true;
-      } else if (camera.joined && !inGame && now - cameraSeen > 15_000) stopCamera(live.ok ? 'отключился от сервера' : 'сервер игры не отвечает');
+      } else if (camera.joined && live.ok && !live.camera && now - cameraSeen > 15_000) stopCamera('сервер не видит камеру среди игроков');
       else if (!camera.joined && now - camera.since > CAMERA_START_MS) stopCamera('не подключился за отведённое время', CAMERA_RETRY_MS);
-      else if (inGame && failures >= 5) { failures = 0; stopCamera('не отдаёт снимки'); }
+      else if (camera.joined && failures >= 5) { failures = 0; stopCamera('не отдаёт снимки'); }
     } else if (now >= nextStart && (!waitServer || live.ok)) {
       waitServer = false;
       try { if (ensureXvfb()) await sleep(1000); startCamera(); } catch (e) { log('не смог запустить клиент-камеру:', e.message); nextStart = now + 60_000; }
