@@ -29,7 +29,7 @@ const CAMERA_WINDOW = '1280x720';                          // окно клие�
 const CAMERA_DISPLAY = process.env.CAMERA_DISPLAY || ':96'; // дисплей Xvfb клиента
 const CAMERA_DATA = process.env.CAMERA_DATA || path.join(CAMERA_DIR, 'factorio'); // папка данных клиента (config, script-output)
 const CAMERA_ZOOM = 0.75;                                  // масштаб живого окна: 24 пикселя на клетку, 53×30 клеток в кадре
-const CAMERA_START_MS = 240_000;                           // сколько ждать подключения после запуска
+const CAMERA_START_MS = 180_000;                           // сколько ждать подключения после запуска
 const CAMERA_RETRY_MS = 900_000;                           // пауза после неудачного запуска (сервер не пускает); перезапуск сервера её сбрасывает
 const SHOT_DIR = 'map-shots';                              // подпапка script-output клиента
 const SHOTS = path.join(CAMERA_DATA, 'script-output', SHOT_DIR);
@@ -200,7 +200,7 @@ async function liveLoop() {
     try {
       const r = await lua(LUA.live, { camera: CAMERA, since: chatSeq });
       const here = (a) => list(a).filter((p) => p.surface === SURFACE).map((p) => ({ name: p.name, x: +p.x.toFixed(2), y: +p.y.toFixed(2) }));
-      if (!live.ok) nextStart = 0; // сервер игры снова отвечает — камеру можно пробовать сразу
+      if (!live.ok && quickFails < 3) nextStart = 0; // сервер игры снова отвечает — камеру можно пробовать сразу
       if (r.paused && !pausedAt) pausedAt = Date.now();
       if (!r.paused) pausedAt = 0;
       if (r.camera?.connected && !r.camera.spectator) { await lua(LUA.spectate, { camera: CAMERA }); log('камера переведена в режим зрителя'); }
@@ -429,68 +429,108 @@ async function renderLoop() {
 
 // ---------- клиент-камера ----------
 // Полный клиент игры под Xvfb, подключённый к серверу зрителем. Сам он после обрыва связи не переподключается
-// (остаётся в меню), поэтому сервис следит за ним через RCON и перезапускает.
+// (остаётся в меню), поэтому сервис следит за ним и перезапускает. Сервер игры перезапускают часто, так что
+// возвращаться надо быстро: обрыв видим сразу по логу клиента, новый клиент запускаем, не дожидаясь сервера
+// (с кешем спрайтов он грузится секунд за двенадцать и ещё десять сам ждёт ответа сервера), Xvfb не трогаем.
 
-let camera = null;          // { pid, since }
+let camera = null;          // { pid, since, joined, logPos }
 let cameraSeen = 0;         // когда камера последний раз была в игре
 let nextStart = 0;
+let dying = null;           // { pid, at } — прежний клиент ещё завершается
+let quickFails = 0;         // неудачные входы подряд
+const CAMERA_LOG = path.join(CAMERA_DIR, 'camera.log');
 
 function gamePassword() {
   if (process.env.GAME_PASSWORD !== undefined) return process.env.GAME_PASSWORD;
   try { return JSON.parse(fs.readFileSync(SERVER_SETTINGS, 'utf8')).game_password ?? ''; } catch { return ''; }
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const cleanEnv = () => { const env = { ...process.env }; delete env.LD_LIBRARY_PATH; return env; }; // чужие библиотеки из окружения ломают системный Mesa
+
+// Xvfb живёт дольше клиента: его не нужно ждать при перезапуске, и видеокодер не теряет дисплей.
+function xvfbPid() { try { const pid = Number(fs.readFileSync(`/tmp/.X${CAMERA_DISPLAY.slice(1)}-lock`, 'utf8')); return pid && alive(pid) ? pid : 0; } catch { return 0; } }
+function ensureXvfb() {
+  if (xvfbPid()) return false;
+  const out = fs.openSync(CAMERA_LOG, 'a');
+  spawn('Xvfb', [CAMERA_DISPLAY, '-screen', '0', `${CAMERA_WINDOW}x24`, '-nolisten', 'tcp'], { env: cleanEnv(), detached: true, stdio: ['ignore', out, out] }).unref();
+  fs.closeSync(out);
+  return true;
+}
 
 function startCamera() {
   fs.rmSync(SHOTS, { recursive: true, force: true });
-  const bin = path.join(CAMERA_DIR, 'factorio/bin/x64/factorio');
-  const args = [bin, '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
+  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, path.join(CAMERA_DIR, 'factorio/bin/x64/factorio'), '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
   if (process.env.CAMERA_CONFIG) args.push('--config', process.env.CAMERA_CONFIG);
   const pw = gamePassword();
   if (pw) args.push('--password', pw);
-  // Xvfb и клиент — в одной группе процессов, чтобы останавливать их вместе. Дисплей фиксированный: с него же берётся видео.
-  const script = `Xvfb ${CAMERA_DISPLAY} -screen 0 ${CAMERA_WINDOW}x24 -nolisten tcp & X=$!; sleep 1; DISPLAY=${CAMERA_DISPLAY} nice -n 10 taskset -c ${CAMERA_CPUS} "$@"; kill $X`;
-  const env = { ...process.env };
-  delete env.LD_LIBRARY_PATH; // чужие библиотеки из окружения ломают системный Mesa
-  const out = fs.openSync(path.join(CAMERA_DIR, 'camera.log'), 'a');
-  const child = spawn('sh', ['-c', script, 'camera', ...args], { cwd: CAMERA_DIR, env, detached: true, stdio: ['ignore', out, out] });
+  let logPos = 0;
+  try { logPos = fs.statSync(CAMERA_LOG).size; } catch { /* лога ещё нет */ }
+  const out = fs.openSync(CAMERA_LOG, 'a');
+  const child = spawn('nice', args, { cwd: CAMERA_DIR, env: { ...cleanEnv(), DISPLAY: CAMERA_DISPLAY }, detached: true, stdio: ['ignore', out, out] });
   fs.closeSync(out);
   child.unref();
-  child.on('exit', (code) => { if (camera?.pid === child.pid) { log(`клиент-камера завершился (код ${code})`); camera = null; nextStart = Date.now() + 20_000; } });
-  camera = { pid: child.pid, since: Date.now() };
+  child.on('exit', (code) => { if (camera?.pid === child.pid) { log(`клиент-камера завершился (код ${code})`); camera = null; nextStart = Date.now() + 3000; } });
+  camera = { pid: child.pid, since: Date.now(), joined: false, logPos };
   fs.writeFileSync(PID_FILE, String(child.pid));
   log(`клиент-камера запущен (группа процессов ${child.pid})`);
 }
 
-function stopCamera(why) {
+function stopCamera(why, retryIn = 0) {
   if (!camera) return;
   log(`останавливаю клиент-камеру: ${why}`);
   try { process.kill(-camera.pid, 'SIGTERM'); } catch { /* уже нет */ }
-  const pid = camera.pid;
-  setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* уже нет */ } }, 10_000).unref();
+  dying = { pid: camera.pid, at: Date.now() };
   camera = null;
-  nextStart = Date.now() + 20_000;
+  nextStart = Date.now() + retryIn;
+}
+
+// Что клиент написал в лог с прошлой проверки: обрыв связи и неудачный вход видны там сразу.
+function cameraLogNews() {
+  try {
+    const size = fs.statSync(CAMERA_LOG).size;
+    if (size <= camera.logPos) return '';
+    const text = readRange(CAMERA_LOG, camera.logPos, size).toString('utf8');
+    camera.logPos = size;
+    return text;
+  } catch { return ''; }
 }
 
 async function cameraLoop() {
   if (!CAMERA_MANAGE) return;
   // Клиент мог остаться от прошлого запуска сервиса — подхватываем его.
-  try { const pid = Number(fs.readFileSync(PID_FILE, 'utf8')); if (pid && alive(pid)) { camera = { pid, since: Date.now() }; log(`подхватил работающий клиент-камеру (${pid})`); } } catch { /* нет файла */ }
+  try {
+    const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
+    if (pid && alive(pid)) { camera = { pid, since: Date.now(), joined: false, logPos: fs.statSync(CAMERA_LOG).size }; log(`подхватил работающий клиент-камеру (${pid})`); }
+  } catch { /* нет файла */ }
   for (;;) {
-    await sleep(5000);
+    await sleep(1000);
     const now = Date.now();
+    if (dying) {
+      if (!alive(dying.pid)) dying = null;
+      else if (now - dying.at > 5000) { try { process.kill(-dying.pid, 'SIGKILL'); } catch { /* уже нет */ } }
+      if (dying) continue; // новый клиент — только когда прежний ушёл
+    }
     if (camera && !alive(camera.pid)) { log('клиент-камера больше не работает'); camera = null; }
-    if (live.ok && live.camera) {
-      cameraSeen = now;
-      if (failures >= 5) { failures = 0; stopCamera('не отдаёт снимки'); }
-    } else if (camera) {
-      if (cameraSeen > camera.since && now - cameraSeen > 30_000) stopCamera(live.ok ? 'отключился от сервера' : 'сервер игры не отвечает');
-      else if (now - camera.since > CAMERA_START_MS) { stopCamera('не подключился за отведённое время'); nextStart = now + CAMERA_RETRY_MS; }
-    } else if (live.ok && now >= nextStart) {
-      try { startCamera(); } catch (e) { log('не смог запустить клиент-камеру:', e.message); nextStart = now + 60_000; }
+    if (camera) {
+      const news = cameraLogNews();
+      const inGame = live.ok && live.camera;
+      if (inGame) { cameraSeen = now; if (!camera.joined) { camera.joined = true; quickFails = 0; log(`камера в игре через ${Math.round((now - camera.since) / 1000)} с после запуска клиента`); } }
+      if (/from\(InGame\) to\(/.test(news)) stopCamera('сервер разорвал связь');                       // сервер перезапускают
+      else if (/to\(InitializationFailed\)|Connection refused|to\(Disconnected\)/.test(news) && !inGame) {
+        // Не вошёл. Первый раз — сервер, скорее всего, ещё поднимается: повторим, как только он ответит по RCON.
+        quickFails++;
+        stopCamera(`не вошёл на сервер (подряд: ${quickFails})`, quickFails >= 3 ? CAMERA_RETRY_MS : 0);
+        waitServer = true;
+      } else if (camera.joined && !inGame && now - cameraSeen > 15_000) stopCamera(live.ok ? 'отключился от сервера' : 'сервер игры не отвечает');
+      else if (!camera.joined && now - camera.since > CAMERA_START_MS) stopCamera('не подключился за отведённое время', CAMERA_RETRY_MS);
+      else if (inGame && failures >= 5) { failures = 0; stopCamera('не отдаёт снимки'); }
+    } else if (now >= nextStart && (!waitServer || live.ok)) {
+      waitServer = false;
+      try { if (ensureXvfb()) await sleep(1000); startCamera(); } catch (e) { log('не смог запустить клиент-камеру:', e.message); nextStart = now + 60_000; }
     }
   }
 }
+let waitServer = false; // после неудачного входа ждём, пока сервер ответит по RCON
 
 // ---------- живое окно: видео из окна клиента-камеры ----------
 // ffmpeg снимает дисплей клиента и отдаёт H.264 во фрагментированном MP4; каждый фрагмент начинается с ключевого кадра,
@@ -887,6 +927,8 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
     if (encoder) encoder.kill('SIGTERM');
     if (camera) { try { process.kill(-camera.pid, 'SIGTERM'); } catch { /* уже нет */ } fs.rmSync(PID_FILE, { force: true }); }
+    const x = xvfbPid();
+    if (x) { try { process.kill(x, 'SIGTERM'); } catch { /* уже нет */ } }
     process.exit(0);
   });
 }
