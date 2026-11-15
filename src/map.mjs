@@ -907,10 +907,72 @@ const NAMES = JSON.stringify({ ru: loadNames('ru'), en: loadNames('en') });
 // Транскрипты лежат в SESSIONS: <id>.jsonl — главная сессия, <id>/subagents/agent-<agentId>.jsonl (+ .meta.json) — субагенты.
 // Какая сессия чьего бота — из строк «[agent Имя] сессия <id>» в bot.log. Реплики людей не отдаём (страница публичная).
 
-const botSessions = new Map(); // бот -> Set(id сессии)
+// Чья сессия — выясняем тремя независимыми способами и запоминаем навсегда (state-map.json), чтобы сессия
+// не пропадала из списка, когда один из источников меняется:
+//   1) запущенные процессы claude: имя бота в переменной FX_BOT, id сессии в --resume (самый надёжный, но только для живых);
+//   2) сам транскрипт: в записи с системным промптом сказано «персонажем по имени «…»» (берём последнюю такую запись);
+//   3) строки «[agent Имя] сессия <id>» в bot.log и sessions.log (только если других сведений нет).
+const owners = new Map();      // id сессии -> { bot, rank } — rank: 3 процесс, 2 транскрипт, 1 лог
+const scanned = new Map();     // id сессии -> сколько байт транскрипта уже просмотрено
 const logPos = new Map();      // файл лога -> сколько уже прочитано
-// Сессии запускает то голосовой бот (bot.log), то отдельный хозяин сессий (sessions.log) — читаем оба.
-function scanBotLog() {
+const botSessions = new Map(); // бот -> Set(id сессии), строится из owners
+const running = new Set();     // сессии, у которых сейчас есть процесс claude
+let ownersChanged = false, lastScan = 0;
+
+function learn(id, bot, rank) {
+  const cur = owners.get(id);
+  if (cur && (cur.rank > rank || (cur.bot === bot && cur.rank === rank))) return;
+  if (cur?.bot !== bot) log(`сессия ${id} — ${bot}${cur ? ` (было: ${cur.bot})` : ''}, источник: ${['', 'лог', 'транскрипт', 'процесс'][rank]}`);
+  owners.set(id, { bot, rank });
+  ownersChanged = true;
+  botSessions.clear();
+  for (const [sid, o] of owners) { if (!botSessions.has(o.bot)) botSessions.set(o.bot, new Set()); botSessions.get(o.bot).add(sid); }
+}
+
+function scanProcesses() {
+  running.clear();
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch { return; }
+  for (const pid of pids) {
+    try {
+      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+      if (!cmd.startsWith('claude\0')) continue;
+      const id = cmd.match(/--resume[=\0]([0-9a-f-]{36})/)?.[1], bot = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').match(/(?:^|\0)FX_BOT=([^\0]+)/)?.[1];
+      if (id && bot) { learn(id, bot, 3); running.add(id); }
+    } catch { /* процесс завершился или чужой */ }
+  }
+}
+
+function scanTranscripts() {
+  let files = [];
+  try { files = fs.readdirSync(SESSIONS).filter((f) => f.endsWith('.jsonl')); } catch { return; }
+  for (const f of files) {
+    const id = f.slice(0, -6), file = path.join(SESSIONS, f);
+    try {
+      const size = fs.statSync(file).size;
+      let pos = scanned.get(id) ?? 0, bot = null, tail = '';
+      if (size < pos) pos = 0;
+      if (size === pos) continue;
+      // Читаем кусками; незаконченную строку дочитаем в следующий раз.
+      while (pos < size) {
+        const buf = readRange(file, pos, Math.min(size, pos + 8_000_000)), text = tail + buf.toString('latin1');
+        const cut = text.lastIndexOf('\n') + 1;
+        for (const line of text.slice(0, cut).split('\n')) {
+          if (!line.includes('"type":"api-request-shape"')) continue;
+          const m = Buffer.from(line, 'latin1').toString('utf8').match(/персонажем по имени «([^»"\\]{1,60})»/);
+          if (m) bot = m[1];
+        }
+        tail = text.slice(cut);
+        pos += buf.length;
+      }
+      scanned.set(id, size - Buffer.byteLength(tail, 'latin1'));
+      ownersChanged = true;
+      if (bot) learn(id, bot, 2);
+    } catch { /* файл исчез */ }
+  }
+}
+
+function scanLogs() {
   for (const name of ['bot.log', 'sessions.log']) {
     try {
       const file = path.join(ROOT, name), size = fs.statSync(file).size;
@@ -919,22 +981,38 @@ function scanBotLog() {
       if (size === pos) continue;
       const text = readRange(file, pos, size).toString('utf8');
       logPos.set(name, size);
-      for (const m of text.matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) {
-        if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
-        botSessions.get(m[1]).add(m[2]);
-      }
+      for (const m of text.matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) learn(m[2], m[1], 1);
     } catch { /* лога нет */ }
   }
 }
 
-// Архив: сессии и субагенты, которые зрители убрали с глаз. Общий для всех, хранится в state-map.json.
+function scanBotLog() { // историческое имя: обновить сведения о сессиях (не чаще раза в 2 секунды)
+  if (Date.now() - lastScan < 2000) return;
+  lastScan = Date.now();
+  scanLogs(); scanTranscripts(); scanProcesses();
+  if (ownersChanged) saveMapState();
+}
+
+// Архив: сессии и субагенты, которые зрители убрали с глаз. Общий для всех. Вместе с реестром сессий — в state-map.json.
 const MAP_STATE = path.join(ROOT, 'state-map.json');
 let archived = new Set(); // "id сессии" | "id сессии/id субагента"
-try { archived = new Set(JSON.parse(fs.readFileSync(MAP_STATE, 'utf8')).archived ?? []); } catch { /* файла ещё нет */ }
+try {
+  const st = JSON.parse(fs.readFileSync(MAP_STATE, 'utf8'));
+  archived = new Set(st.archived ?? []);
+  for (const [id, o] of Object.entries(st.sessions ?? {})) owners.set(id, { bot: o[0], rank: o[1] });
+  for (const [id, n] of Object.entries(st.scanned ?? {})) scanned.set(id, n);
+  for (const [sid, o] of owners) { if (!botSessions.has(o.bot)) botSessions.set(o.bot, new Set()); botSessions.get(o.bot).add(sid); }
+} catch { /* файла ещё нет */ }
+function saveMapState() {
+  const sessions = {};
+  for (const [id, o] of owners) sessions[id] = [o.bot, o.rank];
+  fs.writeFileSync(MAP_STATE + '.tmp', JSON.stringify({ archived: [...archived], sessions, scanned: Object.fromEntries(scanned) }, null, 1));
+  fs.renameSync(MAP_STATE + '.tmp', MAP_STATE);
+  ownersChanged = false;
+}
 function setArchived(key, on) {
   if (on) archived.add(key); else archived.delete(key);
-  fs.writeFileSync(MAP_STATE + '.tmp', JSON.stringify({ archived: [...archived] }, null, 1));
-  fs.renameSync(MAP_STATE + '.tmp', MAP_STATE);
+  saveMapState();
 }
 
 let secrets = null;
@@ -1065,9 +1143,11 @@ function sessionList(bot) {
     try { st = fs.statSync(sessionFile(id)); } catch { continue; }
     let title = '';
     try { const tail = readRange(sessionFile(id), Math.max(0, st.size - 300_000), st.size).toString('utf8'); const m = [...tail.matchAll(/"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"/g)].pop(); if (m) title = JSON.parse(`"${m[1]}"`); } catch { /* без названия */ }
-    out.push({ id, archived: archived.has(id), title: clip(title, 120), mtime: Math.floor(st.mtimeMs), created: Math.floor(st.birthtimeMs), current: current.has(id), active: Date.now() - st.mtimeMs < 120_000 });
+    out.push({ id, archived: archived.has(id), title: clip(title, 120), mtime: Math.floor(st.mtimeMs), created: Math.floor(st.birthtimeMs), current: current.has(id) || running.has(id), active: Date.now() - st.mtimeMs < 120_000 });
   }
-  return out.sort((a, b) => b.mtime - a.mtime);
+  out.sort((a, b) => b.mtime - a.mtime);
+  if (out.length && !out.some((x) => x.current)) out[0].current = true;
+  return out;
 }
 
 // ---------- иконки предметов из файлов игры ----------
