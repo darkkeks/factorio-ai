@@ -61,7 +61,7 @@ function auth(req) {
   return typeof v === 'string' ? { agent: v } : v;
 }
 
-const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, log });
+const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, holdMs: conf.holdMs ?? 90000, log });
 
 // ── Ожидание завершения действий ──
 const mine = (agent) => (ev) => ev.agent === agent || ev.agent == null;
@@ -113,14 +113,14 @@ function touch(agent) { // бот жив, хотя его запрос до мо
   const now = Date.now();
   if (now - (lastTouch.get(agent) || 0) < 2000) return;
   lastTouch.set(agent, now);
-  game.call({ agent, op: 'touch' }).catch(() => {});
+  game.once({ agent, op: 'touch' }).catch(() => {});
 }
 
 async function runAct(who, body) {
   const waitS = waitSeconds(body);
   const since = game.seq ?? 0;
   const params = stripControl(body);
-  const r = await game.write({ agent: who.agent, op: 'act', params, id: body.id ?? `s-${crypto.randomUUID()}` });
+  const r = await game.write({ agent: who.agent, op: 'act', params, id: body.id ?? `s-${crypto.randomUUID()}` }, body[EXTERNAL] ? 40000 : undefined);
   const ids = r.actions.map((a) => a.action_id);
   // Повтор запроса с тем же id: мод вернул только номера действий, итоги ищем во всём буфере журнала.
   const res = await settle(who.agent, ids, r.finished, r.replayed ? 0 : since, waitS);
@@ -319,7 +319,13 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'GET') for (const [k, v] of url.searchParams) { try { body[k] = JSON.parse(v); } catch { body[k] = v; } }
     else throw new GameError('bad_request', 'метод: POST (или GET для запросов без тела)');
     if (req.headers['x-forwarded-for']) body[EXTERNAL] = true;
-    if (!game.ready && op !== 'metrics') throw new GameError(game.lastError?.includes('несовместим') ? 'incompatible' : 'game_unavailable', `игра недоступна: ${game.lastError || 'нет связи'}`);
+    // Сервер игры перезапускается: запрос ждёт его возвращения (снаружи — меньше, под таймауты nginx), а не отклоняется.
+    if (!game.ready && op !== 'metrics' && op !== 'feedback' && op !== 'help') {
+      const t1 = performance.now();
+      const back = await game.whenReady(body[EXTERNAL] ? 40000 : undefined);
+      if (!back) throw new GameError(game.lastError?.includes('несовместим') ? 'incompatible' : 'game_unavailable', `игра недоступна: ${game.lastError || 'нет связи'}`);
+      log(`${who.agent || '(admin)'} ${op}: ждал возвращения сервера игры ${((performance.now() - t1) / 1000).toFixed(1)} с`);
+    }
     const result = await dispatch(who, op, body);
     out = { ok: true, ...result };
   } catch (e) {

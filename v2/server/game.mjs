@@ -16,8 +16,9 @@ export class GameError extends Error {
 }
 
 export class Game {
-  constructor({ rcon, pollMs = 100, bufferSize = 20000, log = () => {} }) {
+  constructor({ rcon, pollMs = 100, bufferSize = 20000, holdMs = 90000, log = () => {} }) {
     this.conf = rcon;
+    this.holdMs = holdMs; // сколько запросы ждут возвращения сервера игры
     this.pollMs = pollMs;
     this.bufferSize = bufferSize;
     this.log = log;
@@ -38,8 +39,8 @@ export class Game {
     return c;
   }
 
-  /** Запрос к моду. Возвращает result; ошибка мода — GameError(code, message, data). */
-  async call(req, connName = req.agent ? `a:${req.agent}` : 'admin') {
+  /** Один запрос к моду без повторов. Возвращает result; ошибка мода — GameError(code, message, data). */
+  async once(req, connName = req.agent ? `a:${req.agent}` : 'admin') {
     let raw;
     try {
       raw = await this.conn(connName).command('/agent ' + JSON.stringify(req));
@@ -55,15 +56,35 @@ export class Game {
     return fixEmpty(r.result);
   }
 
-  /** Запрос, меняющий мир: с идентификатором, чтобы повтор после обрыва связи не исполнил действие дважды. */
-  async write(req) {
-    try {
-      return await this.call(req);
-    } catch (e) {
-      if (e.code !== 'game_unavailable' || req.id == null) throw e;
-      await new Promise((r) => setTimeout(r, 300));
-      return this.call(req);
+  /**
+   * Запрос к моду. Если сервер игры недоступен (перезапуск, обновление мода), запрос не отклоняется, а ждёт его
+   * возвращения до holdMs и исполняется: для бота перезапуск игры выглядит как один медленный ответ.
+   * Повтор безопасен: чтение ничего не меняет, а у пишущих запросов есть идентификатор — мод не исполнит их дважды.
+   */
+  async call(req, connName, holdMs = this.holdMs) {
+    const deadline = Date.now() + holdMs;
+    for (;;) {
+      try {
+        return await this.once(req, connName);
+      } catch (e) {
+        if (e.code !== 'game_unavailable' || Date.now() >= deadline || this.stopped) throw e;
+        this.held = (this.held || 0) + 1;
+        await new Promise((r) => setTimeout(r, 500));
+      }
     }
+  }
+
+  /** Запрос, меняющий мир: обязательно с идентификатором (см. call). */
+  write(req, holdMs) {
+    if (req.id == null) throw new Error('пишущий запрос без идентификатора');
+    return this.call(req, undefined, holdMs);
+  }
+
+  /** Дождаться связи с игрой (до holdMs). */
+  async whenReady(holdMs = this.holdMs) {
+    const deadline = Date.now() + holdMs;
+    while (!this.ready && Date.now() < deadline && !this.stopped) await new Promise((r) => setTimeout(r, 200));
+    return this.ready;
   }
 
   // ── Журнал событий ──
@@ -81,7 +102,7 @@ export class Game {
     const run = async () => {
       let more = true;
       while (more && !this.stopped) {
-        const r = await this.call({ op: 'journal', admin: true, params: { since: this.seq ?? 0, limit: 1000 } }, 'poll');
+        const r = await this.once({ op: 'journal', admin: true, params: { since: this.seq ?? 0, limit: 1000 } }, 'poll');
         if (this.seq !== null && r.seq < this.seq) { // карту откатили: журнал начался заново
           this.log(`журнал мода откатился (${this.seq} → ${r.seq}), буфер сброшен`);
           this.events = [];
@@ -93,7 +114,7 @@ export class Game {
           for (const ev of r.events) this.events.push(ev);
           this.seq = r.events[r.events.length - 1].seq;
           if (this.events.length > this.bufferSize) this.events.splice(0, this.events.length - this.bufferSize);
-          if (this.ready) this.notify(r.events);
+          this.notify(r.events);
         } else if (this.seq === null) {
           this.seq = r.seq;
         }
@@ -108,7 +129,7 @@ export class Game {
     while (!this.stopped) {
       try {
         if (!this.ready) {
-          this.info = await this.call({ op: 'ping' }, 'poll');
+          this.info = await this.once({ op: 'ping' }, 'poll');
           if (this.info.api !== 2) throw new GameError('incompatible', `несовместимая версия мода: api ${this.info.api}, нужен 2`);
         }
         await this.pull();

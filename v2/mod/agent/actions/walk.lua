@@ -12,6 +12,7 @@ local WAYPOINT = 0.25      -- на таком расстоянии точка п
 local STUCK_TICKS = 60     -- нет продвижения к точке пути дольше секунды — упёрся
 local OFF_PATH = 2         -- отклонение от пути в клетках
 local PATH_RADIUS = 1      -- наименьший радиус цели для поисковика пути
+local PATH_WAIT = 300      -- тиков ждём ответа поисковика, прежде чем спросить заново
 local BUSY_RETRIES = 5     -- поисковик занят (это не «пути нет»): повторить запрос
 W.ARRIVE = ARRIVE
 
@@ -33,6 +34,7 @@ local function request(A, act, w)
     -- cache = false: с кэшем движок отдаёт «дойти до недавнего чужого маршрута и идти по нему» — путь длиннее.
     pathfind_flags = {cache = false, prefer_straight_paths = true, no_break = false},
   }
+  w.req_tick = game.tick
   storage.agent.path_requests[w.req] = {agent = A.name, action = act.id}
 end
 
@@ -136,6 +138,13 @@ function W.step(A, act, w)
   if not path then
     if w.retry_at and game.tick >= w.retry_at then
       w.retry_at = nil
+      request(A, act, w)
+    elseif w.req and game.tick - (w.req_tick or 0) > PATH_WAIT then
+      -- Ответ поисковика не пришёл (так бывает, если игру сохранили и загрузили, пока он считал): спрашиваем заново.
+      storage.agent.path_requests[w.req] = nil
+      w.req = nil
+      w.tries = w.tries + 1
+      if w.tries > BUSY_RETRIES then U.fail('busy', 'поисковик пути игры не отвечает, повтори позже', W.report(A, w)) end
       request(A, act, w)
     end
     return nil
