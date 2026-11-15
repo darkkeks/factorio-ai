@@ -190,24 +190,8 @@ function refreshTile(k) {
   pre.src = url;
 }
 
-// Туман войны: снимок захватывает и неразведанную местность, поэтому всё вне разведанных чанков закрашиваем.
-const charted = new Set(); // "cx,cy"
-const Fog = L.GridLayer.extend({
-  createTile(c) {
-    const cv = document.createElement('canvas');
-    const n = Math.max(1, span(c.z) / 32), cell = Math.min(TILE, TILE * 32 / span(c.z)), per = Math.max(1, 32 / span(c.z));
-    cv.width = cv.height = TILE;
-    const g = cv.getContext('2d');
-    g.fillStyle = '#000';
-    // Тайл подробнее чанка лежит в одном чанке целиком; тайл крупнее — сетка из n×n чанков.
-    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
-      const cx = Math.floor(c.x * span(c.z) / 32) + i, cy = Math.floor(c.y * span(c.z) / 32) + j;
-      if (!charted.has(`${cx},${cy}`)) g.fillRect(Math.floor(i * cell), Math.floor(j * cell), Math.ceil(cell * per), Math.ceil(cell * per));
-    }
-    return cv;
-  },
-});
-const fog = new Fog({ ...grid, zIndex: 2 }).addTo(map);
+const fogTiles = new Set(); // тайлы целиком в тумане войны: они не устаревают, пока чанк снова не увидят
+function setTile(z, x, y, ts, fog) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); if (fog) fogTiles.add(k); else fogTiles.delete(k); return k; }
 
 // ---------- свежесть ----------
 let offset = 0, sweepMs = 600000, paused = false;
@@ -219,13 +203,14 @@ function updateFresh() {
   const b = map.getBounds(), z = viewZ(), s = span(z);
   const x1 = Math.floor(Math.min(b.getWest(), b.getEast()) / s), x2 = Math.floor(Math.max(b.getWest(), b.getEast()) / s);
   const y1 = Math.floor(Math.min(b.getSouth(), b.getNorth()) / s), y2 = Math.floor(Math.max(b.getSouth(), b.getNorth()) / s);
-  let oldest = 0, n = 0, missing = 0;
+  let oldest = 0, n = 0, missing = 0, foggy = 0;
   staleLayer.clearLayers();
   const limit = sweepMs * 1.5;
   for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) {
     const ts = tiles.get(`${z}/${x}/${y}`);
     if (ts === undefined) continue;
     n++;
+    if (fogTiles.has(`${z}/${x}/${y}`)) { foggy++; continue; }
     if (!ts) { missing++; continue; }
     const a = now() - ts;
     if (a > oldest) oldest = a;
@@ -234,7 +219,8 @@ function updateFresh() {
   }
   const el = $('st-fresh');
   if (!n) { el.textContent = 'здесь не разведано'; el.className = ''; return; }
-  el.textContent = missing === n ? 'этот участок ещё не снят' : (missing ? 'часть вида ещё не снята; ' : '') + (paused ? 'картинка на момент паузы' : `картинка не старше ${age(oldest)}`);
+  if (foggy === n) { el.textContent = 'туман войны: этот участок сейчас никто не видит'; el.className = ''; return; }
+  el.textContent = missing + foggy === n ? 'этот участок ещё не снят' : (missing ? 'часть вида ещё не снята; ' : '') + (paused ? 'картинка на момент паузы' : `картинка не старше ${age(oldest)}`);
   el.className = paused ? '' : oldest > limit ? 'bad' : oldest > 30000 || missing ? 'warn' : '';
 }
 setInterval(updateFresh, 1000);
@@ -620,18 +606,6 @@ map.on('moveend', () => {
   sendView();
   updateFresh();
 });
-function setCharted(flat) {
-  charted.clear();
-  for (let i = 0; i < flat.length; i += 2) {
-    charted.add(`${flat[i]},${flat[i + 1]}`);
-    // Новые тайлы появляются вместе с разведкой; пока не сняты — помечаем нулём.
-    for (let dx = 0; dx < 2; dx++) for (let dy = 0; dy < 2; dy++) {
-      let x = flat[i] * 2 + dx, y = flat[i + 1] * 2 + dy;
-      for (let z = ZMAX; z >= 0; z--) { const k = `${z}/${x}/${y}`; if (!tiles.has(k)) tiles.set(k, 0); x >>= 1; y >>= 1; }
-    }
-  }
-  fog.redraw();
-}
 function connect() {
   ws = new WebSocket(new URL('ws', location.href.split('#')[0]).href.replace(/^http/, 'ws'));
   ws.onopen = sendView;
@@ -642,16 +616,14 @@ function connect() {
       sweepMs = m.sweep_ms;
       if (m.cam) camSize = m.cam;
       tiles.clear();
-      for (const [z, x, y, ts] of m.tiles) tiles.set(`${z}/${x}/${y}`, ts);
-      setCharted(m.chunks);
+      fogTiles.clear();
+      for (const [z, x, y, ts, fog] of m.tiles) setTile(z, x, y, ts, fog);
       for (const k of shown.keys()) refreshTile(k);
       summary = m.summary; events = m.events || [];
       renderSummary(); renderEvents(); onLive(m.live);
     } else if (m.t === 'live') onLive(m);
     else if (m.t === 'tiles') {
-      for (const [z, x, y, ts] of m.up) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); refreshTile(k); }
-    } else if (m.t === 'chunks') {
-      setCharted(m.chunks);
+      for (const [z, x, y, ts, fog] of m.up) refreshTile(setTile(z, x, y, ts, fog));
     } else if (m.t === 'summary') { summary = m.summary; renderSummary(); }
     else if (m.t === 'events') { events = events.concat(m.items).slice(-100); renderEvents(); }
   };
