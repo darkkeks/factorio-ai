@@ -2,6 +2,7 @@
 // привязанный к одному персонажу. Всё делается Lua-командами через RCON; модов на сервере нет.
 import { z } from 'zod';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { lua } from './rcon.mjs';
 import { submitFeedback, readItems } from './feedback.mjs';
 
@@ -1823,7 +1824,39 @@ const FOLLOW = (`
   local function bot() local e = storage.vb and storage.vb[A.bot] if e and e.valid and storage.vb_path and storage.vb_path[A.bot] then return e end error('нет пути', 0) end
 ` + BODY.follow).split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
 
+// ── Одно тело — один исполнитель ──
+// Персонажа могут вести сразу несколько источников: главная сессия, саб-агент, собственные скрипты бота через fx.
+// Одновременные действия рвут его в разные стороны, поэтому действие, которое двигает персонажа, для каждого
+// персонажа выполняется только одно; второму вызову отвечаем отказом с объяснением, а не ставим его в очередь.
+const READ_ONLY = new Set(['status', 'look_around', 'find', 'inspect', 'research', 'power', 'belt', 'alerts', 'pollution',
+  'area_map', 'route', 'where_items', 'production', 'recipe_info', 'say', 'wait', 'feedback', 'feedback_status', 'read_chat',
+  'craft', 'template_save', 'template_cost', 'template_delete', 'ghost_place', 'ghost_list', 'ghost_clear', 'stop']);
+const busy = new Map(); // персонаж -> { tool, since }
+const stopAsked = new Map(); // персонаж -> когда попросили остановиться
+const inBodyAction = new AsyncLocalStorage(); // шаги plan и вложенные вызовы идут под блокировкой внешнего вызова
+
+/** Какие персонажи сейчас выполняют действие в этом процессе. */
+export const busyBots = () => [...busy.keys()];
+
+/** Остановить персонажей, которые идут, хотя их никто не ведёт (вызов оборвался, процесс перезапустили). */
+export async function stopOrphans() {
+  return lua(`
+    local stopped = {}
+    local keep = {['mcp-test']=true}
+    for _, n in pairs(A.busy) do keep[n] = true end
+    for n, e in pairs(storage.vb or {}) do
+      if e.valid and not keep[n] and e.walking_state.walking then
+        e.walking_state = {walking=false, direction=e.walking_state.direction}
+        stopped[#stopped+1] = n
+      end
+    end
+    return stopped`, { busy: busyBots() });
+}
+
 export function createFactorioServer(botName, hooks) {
+  const hostAborted = hooks.aborted;
+  // Действие сворачивается, если так решил владелец вызова (клиент отключился и т. п.) или персонажа попросили остановиться.
+  hooks = { ...hooks, aborted: () => hostAborted() || stopAsked.has(botName) };
   const run = (body, args = {}) => lua(body === 'follow' ? FOLLOW : PRELUDE + BODY[body], { bot: botName, ...args });
 
   // Чат для внешних клиентов (hooks.chatTool): новые сообщения сами прикладываются к ответу любого инструмента
@@ -2020,7 +2053,18 @@ export function createFactorioServer(botName, hooks) {
     try {
       chatBase = null; chatNew = false; chatChecked = 0;
       await chatWaiting();
-      const value = await handler(args);
+      let value;
+      if (READ_ONLY.has(name) || inBodyAction.getStore()) {
+        value = await handler(args);
+      } else {
+        const cur = busy.get(botName);
+        if (cur) {
+          throw new Error(`персонаж занят: его уже ведёт другой вызов (${cur.tool}, идёт ${Math.round((Date.now() - cur.since) / 1000)} с). У персонажа одно тело — два действия сразу не выполняются. Дождись конца, либо останови его инструментом stop и вызови заново. Если это неожиданно — значит, персонажа одновременно ведут саб-агент и скрипт: оставь кого-то одного.`);
+        }
+        busy.set(botName, { tool: name, since: Date.now() });
+        stopAsked.delete(botName);
+        try { value = await inBodyAction.run(true, () => handler(args)); } finally { busy.delete(botName); stopAsked.delete(botName); }
+      }
       if (memo && name !== 'read_chat' && value && typeof value === 'object' && !Array.isArray(value)) {
         const messages = await takeChat().catch(() => []);
         if (messages.length) value.chat = messages;
@@ -2037,6 +2081,18 @@ export function createFactorioServer(botName, hooks) {
   });
 
   const tools = [
+    def('stop', 'Остановить персонажа: прервать действие, которое он сейчас выполняет (ходьбу, добычу, стройку, план), кто бы его ни запустил — ты, саб-агент или твой скрипт. Прерванный вызов вернёт то, что успел. Используй по команде «стоп» и перед тем, как перехватить управление персонажем.', {},
+      async () => {
+        const cur = busy.get(botName);
+        if (cur) {
+          stopAsked.set(botName, Date.now());
+          for (let i = 0; i < 40 && busy.has(botName); i++) await sleep(250);
+        }
+        const at = await run('stop');
+        stopAsked.delete(botName);
+        return { stopped: cur ? cur.tool : 'ничего не выполнялось', still_running: busy.has(botName) || undefined, pos: { x: Math.round(at.x * 10) / 10, y: Math.round(at.y * 10) / 10 } };
+      }),
+
     def('status', 'Состояние твоего персонажа: позиция, здоровье, инвентарь, очередь крафта, люди в игре и другие боты с координатами.', {}, () => run('status')),
 
     def('look_around', 'Что находится вокруг персонажа: объекты сгруппированы по типу, с количеством, расстоянием и координатами ближайшего. Для руды — суммарный запас.',
