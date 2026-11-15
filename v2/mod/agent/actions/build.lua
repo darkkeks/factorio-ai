@@ -49,7 +49,7 @@ local function describe(n, extra)
   if n.supports_direction then r.direction = U.dirname(n.direction) end
   if n.type == 'underground-belt' then
     r.underground = n.belt_to_ground_type
-    local o = n.neighbours
+    local o = n.underground_belt_neighbour
     if o then r.paired_with = U.pos(o.position) end
   end
   if n.type == 'inserter' then

@@ -71,10 +71,19 @@ local function handle(raw)
 end
 
 -- Каждый обработчик сначала приводит состояние к текущей версии (см. state.lua).
+-- Ошибка в обработчике события остановила бы сервер игры целиком, поэтому она ловится и пишется в журнал
+-- (первые случаи подробно, дальше — изредка: обработчик тика может падать 60 раз в секунду).
+local failures = {}
 local function guarded(fn)
   return function(ev)
     S.ensure()
-    fn(ev)
+    local ok, err = xpcall(fn, debug.traceback, ev)
+    if not ok then
+      local key = tostring(err):sub(1, 120)
+      local n = (failures[key] or 0) + 1
+      failures[key] = n
+      if n <= 5 or n % 3600 == 0 then log('agent: ошибка в обработчике события (' .. n .. '-й раз): ' .. tostring(err)) end
+    end
   end
 end
 

@@ -137,7 +137,7 @@ local function full(e, force)
     r.lanes = lanes
     if e.type == 'underground-belt' then
       r.underground = e.belt_to_ground_type
-      local o = e.neighbours
+      local o = e.underground_belt_neighbour
       r.paired_with = o and U.pos(o.position) or nil
     end
     if e.type == 'splitter' then
