@@ -761,6 +761,137 @@ const BODY = {
     if hidden > 0 then r.not_visible = hidden end
     return r`,
 
+  // Загрязнение, как слой загрязнения на карте: игрок видит облако на всей открытой карте, а гнёзда и кусак — только там,
+  // где карта показывается вживую (рядом с собой, под радаром). Поэтому гнёзда и враги вне такой видимости не выдаются
+  // вовсе, даже числом. Один чанк — 32×32 клетки, уровень у чанка один.
+  pollution: `
+    local e = bot()
+    local f, s = e.force, e.surface
+    local c = {x=A.x or e.position.x, y=A.y or e.position.y}
+    local R = A.radius
+    local function mid(cx, cy) return {x=cx*32+16, y=cy*32+16} end
+    local vis = {}
+    local function chunk_visible(cx, cy)
+      local k = cx..','..cy
+      if vis[k] == nil then vis[k] = f.is_chunk_visible(s, {cx, cy}) end
+      return vis[k]
+    end
+    local function visible(p) return dist(p, e.position) <= 60 or chunk_visible(math.floor(p.x/32), math.floor(p.y/32)) end
+    local cx0, cx1, cy0, cy1 = math.floor((c.x-R)/32), math.floor((c.x+R)/32), math.floor((c.y-R)/32), math.floor((c.y+R)/32)
+    local area = {{cx0*32, cy0*32}, {cx1*32+32, cy1*32+32}}
+    -- Гнёзда и кусаки, которых сейчас видно, по чанкам.
+    local function seen(type)
+      local groups, list = {}, {}
+      for _, t in pairs(s.find_entities_filtered{area=area, type=type, force='enemy'}) do
+        if visible(t.position) then
+          local cx, cy = math.floor(t.position.x/32), math.floor(t.position.y/32)
+          local k = cx..','..cy
+          local g = groups[k]
+          if not g then g = {count=0, sx=0, sy=0} groups[k] = g list[#list+1] = g end
+          g.count = g.count + 1 g.sx = g.sx + t.position.x g.sy = g.sy + t.position.y
+        end
+      end
+      for _, g in pairs(list) do g.pos = {x=g.sx/g.count, y=g.sy/g.count} end
+      return list, groups
+    end
+    local nests, nest_at = seen('unit-spawner')
+    local dirty, charted, unseen, unknown, total, max = {}, 0, 0, 0, 0, nil
+    local rows = {}
+    for cy = cy0, cy1 do
+      local row = {}
+      for cx = cx0, cx1 do
+        local ch = '?'
+        if f.is_chunk_charted(s, {cx, cy}) then
+          charted = charted + 1
+          local m = mid(cx, cy)
+          if not (dist(m, e.position) <= 60 or chunk_visible(cx, cy)) then unseen = unseen + 1 end
+          local v = s.get_pollution(m)
+          ch = '.'
+          if v >= 1 then
+            dirty[#dirty+1] = {cx=cx, cy=cy, v=v}
+            total = total + v
+            if not max or v > max.v then max = {cx=cx, cy=cy, v=v} end
+            ch = tostring(math.min(9, math.floor(math.log(v)/math.log(2)) + 1))
+          end
+          if nest_at[cx..','..cy] then ch = 'N' end
+        else unknown = unknown + 1 end
+        row[#row+1] = ch
+      end
+      rows[#rows+1] = table.concat(row)
+    end
+    -- Расстояние от точки до ближайшего загрязнённого чанка (0 — точка внутри облака).
+    local function gap(p)
+      local best
+      for _, d in pairs(dirty) do
+        local dx = math.max(d.cx*32 - p.x, 0, p.x - (d.cx*32+32))
+        local dy = math.max(d.cy*32 - p.y, 0, p.y - (d.cy*32+32))
+        local g = (dx*dx+dy*dy)^0.5
+        if not best or g < best then best = g end
+      end
+      return best
+    end
+    local r = {center=P(c), radius=R, chunks_charted=charted}
+    if f.is_chunk_charted(s, {math.floor(c.x/32), math.floor(c.y/32)}) then r.here = math.floor(s.get_pollution(c)+0.5) end
+    local cloud = {chunks=#dirty, total=math.floor(total+0.5)}
+    if max then
+      cloud.max = {pollution=math.floor(max.v+0.5), pos=mid(max.cx, max.cy)}
+      local x0, x1, y0, y1
+      for _, d in pairs(dirty) do
+        x0 = math.min(x0 or d.cx, d.cx) x1 = math.max(x1 or d.cx, d.cx) y0 = math.min(y0 or d.cy, d.cy) y1 = math.max(y1 or d.cy, d.cy)
+      end
+      cloud.x_from, cloud.x_to, cloud.y_from, cloud.y_to = x0*32, x1*32+32, y0*32, y1*32+32
+    end
+    r.cloud = cloud
+    local inside, nearest = 0, nil
+    for _, g in pairs(nests) do
+      g.pollution = math.floor(s.get_pollution(g.pos)+0.5)
+      g.cloud_dist = gap(g.pos)
+      if g.cloud_dist == 0 then inside = inside + 1 end
+      if g.cloud_dist and (not nearest or g.cloud_dist < nearest) then nearest = g.cloud_dist end
+    end
+    table.sort(nests, function(a, b)
+      local da, db = a.cloud_dist or 1e9, b.cloud_dist or 1e9
+      if da ~= db then return da < db end
+      if a.pollution ~= b.pollution then return a.pollution > b.pollution end
+      return dist(a.pos, c) < dist(b.pos, c)
+    end)
+    local out = {}
+    for i = 1, math.min(#nests, 15) do
+      local g = nests[i]
+      out[i] = {pos=P(g.pos), spawners=g.count, in_cloud=g.cloud_dist == 0, pollution=g.pollution,
+        cloud_dist=g.cloud_dist and math.floor(g.cloud_dist+0.5) or nil, dist=math.floor(dist(g.pos, c)+0.5)}
+    end
+    r.nests_seen = #nests
+    r.nests_in_cloud = inside
+    if nearest then r.nearest_nest_to_cloud = math.floor(nearest+0.5) end
+    r.nests = out
+    local units = seen('unit')
+    table.sort(units, function(a, b) return dist(a.pos, c) < dist(b.pos, c) end)
+    local en, ecount = {}, 0
+    for i, g in ipairs(units) do
+      ecount = ecount + g.count
+      if i <= 10 then en[#en+1] = {pos=P(g.pos), count=g.count, dist=math.floor(dist(g.pos, c)+0.5)} end
+    end
+    r.enemies_seen = ecount
+    r.enemies = en
+    r.chunks_not_visible = unseen
+    r.chunks_unexplored = unknown
+    pcall(function() r.evolution_percent = r1(game.forces.enemy.get_evolution_factor(s)*100) end)
+    pcall(function()
+      local st = game.get_pollution_statistics(s)
+      local list = {}
+      for name in pairs(st.input_counts) do
+        local v = st.get_flow_count{name=name, category='input', precision_index=defines.flow_precision_index.one_minute, count=true}
+        if v >= 0.05 then list[#list+1] = {name=name, per_minute=r1(v)} end
+      end
+      table.sort(list, function(a, b) return a.per_minute > b.per_minute end)
+      local top = {}
+      for i = 1, math.min(#list, 10) do top[i] = list[i] end
+      r.sources_per_minute = top
+    end)
+    if A.map then r.map = {rows=rows, x0=cx0*32, y0=cy0*32} end
+    return r`,
+
   recipe: `
     local f = bot().force
     local function info(rc)
@@ -1146,6 +1277,18 @@ export function createFactorioServer(botName, hooks) {
       async (a) => {
         const r = await run('alerts', a);
         if (r.not_visible) r.note = 'часть машин в радиусе не видна (нет радара): подойди ближе или поставь радар';
+        return r;
+      }),
+
+    def('pollution', 'Загрязнение, как слой загрязнения на карте, в квадрате вокруг точки (без координат — вокруг персонажа): дошло ли облако до гнёзд врагов. Уровень считается по чанкам 32×32 клетки. here — уровень в самой точке; cloud — облако: сколько чанков загрязнено, где максимум, границы по x и y. nests — гнёзда, которые сейчас видно, сгруппированы по чанкам, самые угрожаемые сверху: in_cloud — облако уже накрыло (гнездо впитывает загрязнение и шлёт атаки), cloud_dist — сколько клеток от гнезда до края облака, pollution — уровень на гнезде; nearest_nest_to_cloud — наименьший такой зазор (0 — уже накрыло). enemies — кусаки, которых сейчас видно, кучками. sources_per_minute — кто сколько загрязняет за последнюю минуту (как вкладка загрязнения в окне производства), evolution_percent — эволюция врагов. Облако видно на всей открытой карте, а гнёзда и кусаки — только в 60 клетках от персонажа и там, где карта показывается вживую (радар, игроки): chunks_not_visible — сколько чанков квадрата так не видно, гнёзда в них не показаны. Куда идёт отряд кусак и какая у него цель, игрок не видит — этого здесь нет.',
+      { x: z.number().optional().describe('x центра; по умолчанию — персонаж'), y: z.number().optional().describe('y центра; по умолчанию — персонаж'),
+        radius: z.number().min(32).max(500).default(200).describe('полусторона квадрата в клетках'),
+        map: z.boolean().default(false).describe('приложить карту: строка — ряд чанков с севера на юг, символ — чанк') },
+      async (a) => {
+        if ((a.x === undefined) !== (a.y === undefined)) throw new Error('укажи и x, и y либо ни одного');
+        const r = await run('pollution', a);
+        if (r.map) r.map.legend = 'символ — чанк 32×32; первая строка — y от y0, первый символ — x от x0, дальше на восток и на юг. «.» чисто; 1–9 загрязнение (1 — от 1, каждая ступень вдвое больше, 9 — от 256); N — чанк с видимым гнездом; ? — карта не открыта';
+        if (r.chunks_not_visible) r.note = 'гнёзда и кусаки показаны только там, где карту видно вживую; в остальных чанках они могут быть — подойди ближе или поставь радар';
         return r;
       }),
 
