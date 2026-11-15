@@ -272,18 +272,13 @@ async function summaryLoop() {
 
 // Строки бота из логов: вызовы инструментов и его собственный текст. Реплики людей (🎤) не отдаём.
 function botLog(name) {
-  let best = [], bestTime = 0;
-  for (const file of ['bot.log', 'api.log']) {
-    let text, mtime;
+  // Вызовы инструментов пишет сервер ботов (api.log), раньше — mcp.log и bot.log; текст бота — bot.log.
+  const read = (file, want) => {
+    let text;
     try {
-      const fd = fs.openSync(path.join(ROOT, file), 'r');
-      const st = fs.fstatSync(fd);
-      const buf = Buffer.alloc(Math.min(st.size, 400_000));
-      fs.readSync(fd, buf, 0, buf.length, st.size - buf.length);
-      fs.closeSync(fd);
-      text = buf.toString('utf8');
-      mtime = st.mtimeMs;
-    } catch { continue; }
+      const full = path.join(ROOT, file), size = fs.statSync(full).size;
+      text = readRange(full, Math.max(0, size - 400_000), size).toString('utf8');
+    } catch { return []; }
     const entries = [];
     let cur = null;
     for (const line of text.split('\n').slice(1)) {
@@ -291,13 +286,18 @@ function botLog(name) {
       if (m) {
         cur = null;
         const tool = m[2] === '🔧' && m[3].startsWith(name + ' '), said = m[2] === '🤖' && m[3].startsWith(name + ': ');
-        if (tool || said) { cur = { time: m[1], kind: tool ? 'tool' : 'text', text: m[3].slice(name.length + (tool ? 1 : 2)) }; entries.push(cur); }
+        if ((tool && want.tool) || (said && want.text)) { cur = { time: m[1], kind: tool ? 'tool' : 'text', text: m[3].slice(name.length + (tool ? 1 : 2)) }; entries.push(cur); }
       } else if (cur && cur.kind === 'text') cur.text += '\n' + line;
     }
-    // Бот пишет либо в один лог, либо в другой; если есть в обоих — берём тот, что свежее.
-    if (entries.length && mtime > bestTime) { best = entries; bestTime = mtime; }
-  }
-  return best.slice(-12).map((e) => ({ time: e.time, kind: e.kind, text: e.text.trim().slice(0, 400) }));
+    return entries.slice(-12);
+  };
+  let tools = [];
+  for (const file of ['api.log', 'mcp.log', 'bot.log']) { tools = read(file, { tool: true }); if (tools.length) break; }
+  // В логах только время суток: сортируем по нему, а записи «из будущего» (вчерашние, до полуночи) ставим первыми.
+  const nowT = new Date().toISOString().slice(11, 19);
+  const order = (e) => (e.time > nowT ? '0' : '1') + e.time;
+  return [...tools, ...read('bot.log', { text: true })].sort((x, y) => (order(x) < order(y) ? -1 : 1)).slice(-12)
+    .map((e) => ({ time: e.time, kind: e.kind, text: e.text.trim().slice(0, 400) }));
 }
 
 async function botInfo(name) {
@@ -577,36 +577,22 @@ const NAMES = JSON.stringify(loadNames());
 // Какая сессия чьего бота — из строк «[agent Имя] сессия <id>» в bot.log. Реплики людей не отдаём (страница публичная).
 
 const botSessions = new Map(); // бот -> Set(id сессии)
-const sessionOwner = new Map(); // id сессии -> бот (null — определить не удалось)
-let botLogPos = 0;
+const logPos = new Map();      // файл лога -> сколько уже прочитано
+// Сессии запускает то голосовой бот (bot.log), то отдельный хозяин сессий (sessions.log) — читаем оба.
 function scanBotLog() {
-  try {
-    const file = path.join(ROOT, 'bot.log'), size = fs.statSync(file).size;
-    if (size < botLogPos) { botLogPos = 0; }
-    const fd = fs.openSync(file, 'r'), buf = Buffer.alloc(size - botLogPos);
-    fs.readSync(fd, buf, 0, buf.length, botLogPos);
-    fs.closeSync(fd);
-    botLogPos = size;
-    for (const m of buf.toString('utf8').matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) {
-      if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
-      botSessions.get(m[1]).add(m[2]);
-    }
-  } catch { /* лога нет — сессий нет */ }
-  // В bot.log попадают не все сессии, поэтому смотрим и в сами транскрипты: каждый бот начинает с инструмента status,
-  // а тот отвечает {"me":"<имя персонажа>", …}.
-  let files = [];
-  try { files = fs.readdirSync(SESSIONS).filter((f) => f.endsWith('.jsonl')); } catch { return; }
-  for (const f of files) {
-    const id = f.slice(0, -6);
-    if (sessionOwner.has(id)) continue;
+  for (const name of ['bot.log', 'sessions.log']) {
     try {
-      const size = fs.statSync(path.join(SESSIONS, f)).size;
-      const m = readRange(path.join(SESSIONS, f), 0, Math.min(size, 3_000_000)).toString('utf8').match(/\\"me\\":\\"([^"\\]{1,60})\\"/);
-      if (!m) { if (size > 3_000_000) sessionOwner.set(id, null); continue; } // маленький файл проверим ещё раз позже
-      sessionOwner.set(id, m[1]);
-      if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
-      botSessions.get(m[1]).add(id);
-    } catch { /* файл исчез */ }
+      const file = path.join(ROOT, name), size = fs.statSync(file).size;
+      let pos = logPos.get(name) ?? 0;
+      if (size < pos) pos = 0;
+      if (size === pos) continue;
+      const text = readRange(file, pos, size).toString('utf8');
+      logPos.set(name, size);
+      for (const m of text.matchAll(/\[agent ([^\]\n]+)\] сессия ([0-9a-f-]{36})/g)) {
+        if (!botSessions.has(m[1])) botSessions.set(m[1], new Set());
+        botSessions.get(m[1]).add(m[2]);
+      }
+    } catch { /* лога нет */ }
   }
 }
 
