@@ -273,4 +273,28 @@ test('замена поверх лент (подземный конвейер, �
   eq(left.total, 0, 'план выполнен');
 });
 
+test('рельсы в списке: призраки встают точно в заданные координаты при любой чётности угла и размера', async () => {
+  // Рельс стоит на сетке 2×2; сдвига остальных построек из-за него быть не должно.
+  const cases = [
+    [{ name: 'straight-rail', ...P(21, 11), direction: 'north' }, { name: 'inserter', ...P(24.5, 11.5), direction: 'north' }],
+    [{ name: 'inserter', ...P(22.5, 11.5), direction: 'north' }, { name: 'straight-rail', ...P(25, 11), direction: 'north' }, { name: 'straight-rail', ...P(25, 13), direction: 'north' }],
+    [{ name: 'wooden-chest', ...P(21.5, 12.5) }, { name: 'straight-rail', ...P(25, 11), direction: 'east' }, { name: 'straight-rail', ...P(27, 11), direction: 'east' }, { name: 'inserter', ...P(28.5, 13.5), direction: 'north' }],
+    [{ name: 'straight-rail', ...P(23, 13), direction: 'north' }],
+    [{ name: 'wooden-chest', ...P(22.5, 10.5) }, { name: 'straight-rail', ...P(23, 13), direction: 'north' }, { name: 'wooden-chest', ...P(24.5, 15.5) }],
+  ];
+  for (const [i, items] of cases.entries()) {
+    await reset({}, 2.5, 2.5);
+    const chk = await call(A, 'blueprint_check', { items });
+    ok(chk.ok && chk.will_place === items.length, `случай ${i}: ` + JSON.stringify(chk));
+    const r = await call(A, 'ghost_place', { plan: 'rails-' + i, items });
+    ok(r.ok && r.placed === items.length, `случай ${i}: ` + JSON.stringify(r));
+    const got = await world(`local out = {}
+      for _, g in pairs(game.surfaces.nauvis.find_entities_filtered{area = {{A.ox - 2, A.oy - 2}, {A.ox + 62, A.oy + 32}}, type = 'entity-ghost'}) do
+        out[#out + 1] = g.ghost_name .. ' ' .. g.position.x .. ' ' .. g.position.y
+      end
+      table.sort(out) return {list = out}`);
+    eq(got.list, items.map((e) => `${e.name} ${e.x} ${e.y}`).sort(), `случай ${i}: призраки стоят там, где заданы`);
+  }
+});
+
 run(async () => { admin.close(); });

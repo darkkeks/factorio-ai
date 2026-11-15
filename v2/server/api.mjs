@@ -168,7 +168,8 @@ export const API = {
       'Исполняет план build_ghosts (и mine для прочего помеченного на снос).',
     params: {
       plan: 'имя плана — метка на поставленных призраках и пометках (по ней ghosts, build_ghosts, ghost_clear, mine)',
-      items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (filters, control_behavior, items)}',
+      items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (filters, control_behavior, items)}; ' +
+        'рельсы стоят на сетке 2×2 — центр прямого рельса в нечётных x и y, как у уже построенных',
       tiles: 'список плитки {name: stone-path | concrete | landfill | …, x, y}',
       blueprint: 'или имя сохранённого чертежа', string: 'или строка чертежа в формате игры',
       x: 'клетка северо-западного угла чертежа', y: '',

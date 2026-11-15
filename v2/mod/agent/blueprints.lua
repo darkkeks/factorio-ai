@@ -225,6 +225,10 @@ function BP.build(stack, surface, force, ox, oy, w, h, mode)
   -- Привязка к абсолютной сетке размером с чертёж: ячейка сетки, в которую попадает точка постановки, и есть место чертежа.
   stack.blueprint_snap_to_grid = {x = w, y = h}
   stack.blueprint_absolute_snapping = true
+  -- С рельсами в чертеже игра сама округляет сетку до чётной: дальше считаем от той сетки, что получилась на деле,
+  -- иначе чертёж уезжает на клетку-две.
+  local grid = stack.blueprint_snap_to_grid
+  if grid then w, h = grid.x or grid[1] or w, grid.y or grid[2] or h end
   stack.blueprint_position_relative_to_grid = {x = ox % w, y = oy % h}
   return stack.build_blueprint{surface = surface, force = force, position = {ox + w / 2, oy + h / 2},
     build_mode = defines.build_mode[mode or 'forced'], skip_fog_of_war = false, raise_built = true}
