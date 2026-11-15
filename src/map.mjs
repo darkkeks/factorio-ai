@@ -571,6 +571,34 @@ function loadNames() {
 }
 const NAMES = JSON.stringify(loadNames());
 
+// ---------- иконки предметов из файлов игры ----------
+// В прототипах игры ищем пары «name = …, icon = …»; чего там нет — по имени файла в graphics/icons.
+
+function loadIcons() {
+  const out = new Map();
+  const data = path.join(CAMERA_DIR, 'factorio/data');
+  const walk = (dir, fn) => { let ents = []; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; } for (const e of ents) { const f = path.join(dir, e.name); if (e.isDirectory()) walk(f, fn); else fn(f); } };
+  let mods = [];
+  try { mods = fs.readdirSync(data); } catch { return out; }
+  const byFile = new Map();
+  for (const mod of mods) {
+    walk(path.join(data, mod, 'graphics/icons'), (f) => { if (f.endsWith('.png')) { const n = path.basename(f, '.png'); if (!byFile.has(n) || mod === 'base') byFile.set(n, f); } });
+    walk(path.join(data, mod, 'prototypes'), (f) => {
+      if (!f.endsWith('.lua')) return;
+      const isItem = /item/.test(path.relative(data, f));
+      const re = /name\s*=\s*"([a-z0-9-]+)"\s*,([\s\S]{0,400}?)\bicon\s*=\s*"__([a-z-]+)__\/(graphics\/icons\/[^"]+\.png)"/g;
+      for (const m of fs.readFileSync(f, 'utf8').matchAll(re)) {
+        if (/\bname\s*=/.test(m[2])) continue; // иконка уже другого прототипа
+        const file = path.join(data, m[3], m[4]);
+        if ((!out.has(m[1]) || isItem) && fs.existsSync(file)) out.set(m[1], file);
+      }
+    });
+  }
+  for (const [n, f] of byFile) if (!out.has(n)) out.set(n, f);
+  return out;
+}
+const ICONS = loadIcons();
+
 // ---------- HTTP и WebSocket ----------
 
 const server = http.createServer(async (req, res) => {
@@ -579,6 +607,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method !== 'GET' && req.method !== 'HEAD') return reply(405, 'text/plain', '');
     if (url.pathname === '/') return reply(200, 'text/html; charset=utf-8', fs.readFileSync(path.join(WEB, 'index.html')));
+    const ic = url.pathname.match(/^\/icon\/([a-z0-9-]{1,80})\.png$/);
+    if (ic) {
+      const file = ICONS.get(ic[1]);
+      return file ? reply(200, 'image/png', fs.readFileSync(file), 'public, max-age=604800') : reply(404, 'text/plain', '', 'max-age=3600');
+    }
     if (url.pathname === '/names.json') return reply(200, 'application/json', NAMES, 'max-age=3600');
     const t = url.pathname.match(/^\/tiles\/(\d)\/(-?\d{1,6})\/(-?\d{1,6})\.jpg$/);
     if (t) {
@@ -663,5 +696,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.exit(0);
   });
 }
+// Перезапуск сервиса без остановки камеры (после правок кода): kill -USR2 <pid>; новый процесс подхватит её по camera.pid.
+process.on('SIGUSR2', () => { if (encoder) encoder.kill('SIGTERM'); process.exit(0); });
 fs.mkdirSync(TILES, { recursive: true });
 liveLoop(); chunkListLoop(); summaryLoop(); renderLoop(); cameraLoop();

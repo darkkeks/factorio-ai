@@ -44,7 +44,16 @@
 
   #bot { position: absolute; z-index: 1000; left: 10px; bottom: 26px; width: 380px; max-width: calc(100vw - 20px); max-height: 55%; overflow-y: auto; padding: 10px 12px; box-sizing: border-box; }
   #live { position: absolute; z-index: 1000; left: 10px; top: 84px; width: 480px; max-width: calc(100vw - 20px); padding: 6px; box-sizing: border-box; }
-  #live.big { width: 960px; }
+  /* Во всё окно браузера: карта остаётся под видео, сводка и панель бота — поверх. */
+  #live.big { inset: 0; width: auto; max-width: none; z-index: 1002; border-radius: 0; border: 0; padding: 0; background: #000; display: flex; flex-direction: column; }
+  #live.big video { flex: 1; min-height: 0; width: 100%; aspect-ratio: auto; object-fit: contain; border-radius: 0; }
+  #live.big header { padding: 6px 54px 6px 8px; background: rgba(24, 24, 24, .92); }
+  body.livebig #side, body.livebig #bot, body.livebig #toggle { z-index: 1003; }
+  /* Маленькое живое окно и панель бота стоят слева друг над другом — панель не должна на него наезжать. */
+  body.liveopen:not(.livebig) #bot { max-height: max(180px, calc(100% - 130px - min(480px, 100vw - 20px) * 9 / 16 - 50px)); }
+  #live select { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 6px; font: inherit; max-width: 45%; }
+  #live:fullscreen { inset: 0; width: auto; max-width: none; padding: 0; border: 0; background: #000; display: flex; flex-direction: column; }
+  #live:fullscreen video { flex: 1; min-height: 0; aspect-ratio: auto; object-fit: contain; }
   #live.hidden { display: none; }
   #live video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 3px; }
   #live header { display: flex; align-items: center; gap: 8px; padding: 0 2px 5px; }
@@ -55,7 +64,12 @@
   button { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
   button.on { background: #7a5c00; border-color: #c79400; }
   .items { display: flex; flex-wrap: wrap; gap: 4px; }
-  .items span { background: #2c2c2c; border-radius: 3px; padding: 1px 6px; }
+  .items .slot { position: relative; width: 40px; height: 40px; background: #2c2c2c; border: 1px solid #444; border-radius: 3px; overflow: hidden; }
+  /* Файл иконки — 64×64 и следом уменьшенные копии; показываем только первую. */
+  .items .slot img { position: absolute; left: 3px; top: 3px; width: 34px; height: 34px; object-fit: cover; object-position: left center; }
+  .items .slot img + small { display: none; }
+  .items .slot b { position: absolute; right: 2px; bottom: 0; font-size: 12px; font-weight: 700; color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000, 1px 1px 1px #000; }
+  .items .slot small { position: absolute; inset: 2px; font-size: 8px; line-height: 1.1; overflow: hidden; overflow-wrap: anywhere; color: #ccc; }
   .log div { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
   .log .tool { font-family: ui-monospace, monospace; font-size: 12px; color: #b9c7d6; }
   .log time { color: #9a968c; margin-right: 6px; }
@@ -75,7 +89,7 @@
 </div>
 <button id="live-btn" class="box">▶ живое окно</button>
 <div id="live" class="box hidden">
-  <header><span id="live-cap" class="muted">подключение…</span><button id="live-auto" title="Камера сама выбирает, за кем следить">авто</button><button id="live-size">⤢</button><button id="live-close">✕</button></header>
+  <header><span id="live-cap" class="muted">подключение…</span><select id="live-target" title="За кем следит камера"></select><button id="live-size" title="Во всё окно">⤢</button><button id="live-full" title="На весь экран">⛶</button><button id="live-close">✕</button></header>
   <video id="live-video" muted autoplay playsinline></video>
 </div>
 <div id="bot" class="box hidden">
@@ -231,7 +245,26 @@ function showTarget(m) {
     if (camFrame) camFrame.setBounds(b); else camFrame = L.rectangle(b, { color: '#ffcc33', weight: 1.5, fill: false, dashArray: '6 4', interactive: false }).addTo(map);
   }
   if (!liveBroken) $('live-cap').textContent = !m.ok ? 'сервер игры не отвечает' : !m.camera ? 'камера не в игре' : t ? `камера следит за: ${t.name}${t.manual ? '' : ' (сама выбрала)'}` : 'камере не за кем следить';
-  $('live-auto').classList.toggle('on', !!t && !t.manual);
+  syncTargets(m, t);
+}
+// Список «за кем следить» — чтобы выбирать, не закрывая видео во всё окно.
+let targetsKey = '';
+function syncTargets(m, t) {
+  const sel = $('live-target');
+  const opts = [['', 'авто'], ...m.bots.map((a) => [`bot:${a.name}`, a.name]), ...m.players.map((a) => [`player:${a.name}`, `${a.name} (игрок)`])];
+  const k = opts.map((o) => o[0]).join('|');
+  if (k !== targetsKey) { targetsKey = k; sel.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join(''); }
+  if (document.activeElement !== sel) sel.value = t && t.manual ? `${t.kind}:${t.name}` : '';
+}
+$('live-target').onchange = (e) => {
+  const v = e.target.value, i = v.indexOf(':');
+  wsSend(v ? { t: 'follow', kind: v.slice(0, i), name: v.slice(i + 1) } : { t: 'follow', name: null });
+  e.target.blur();
+};
+function setBig(on) {
+  $('live').classList.toggle('big', on);
+  document.body.classList.toggle('livebig', on);
+  if (on) $('side').classList.add('hidden'); // сводка закрыла бы треть кадра; вернуть — кнопкой ☰
 }
 function liveStart() {
   const video = $('live-video');
@@ -275,10 +308,10 @@ function liveStop() {
   const v = $('live-video');
   if (v.src) { URL.revokeObjectURL(v.src); v.removeAttribute('src'); v.load(); }
 }
-$('live-btn').onclick = () => { $('live').classList.remove('hidden'); $('live-btn').style.display = 'none'; liveStart(); };
-$('live-close').onclick = () => { $('live').classList.add('hidden'); $('live-btn').style.display = ''; liveStop(); if (camFrame) { camFrame.remove(); camFrame = null; } };
-$('live-size').onclick = () => $('live').classList.toggle('big');
-$('live-auto').onclick = () => wsSend({ t: 'follow', name: null });
+$('live-btn').onclick = () => { document.body.classList.add('liveopen'); $('live').classList.remove('hidden'); $('live-btn').style.display = 'none'; liveStart(); };
+$('live-close').onclick = () => { document.body.classList.remove('liveopen'); setBig(false); $('live').classList.add('hidden'); $('live-btn').style.display = ''; liveStop(); if (camFrame) { camFrame.remove(); camFrame = null; } };
+$('live-size').onclick = () => setBig(!$('live').classList.contains('big'));
+$('live-full').onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); else if ($('live').requestFullscreen) $('live').requestFullscreen().catch(() => {}); else if ($('live-video').webkitEnterFullscreen) $('live-video').webkitEnterFullscreen(); };
 if (new URLSearchParams(location.search).has('live')) $('live-btn').onclick(); // ссылка сразу с живым окном: ?live
 
 // ---------- панель бота ----------
@@ -294,6 +327,7 @@ function openBot(name) {
   $('bot').classList.remove('hidden');
   $('bot-name').textContent = name;
   $('bot-body').innerHTML = '<div class="muted">загрузка…</div>';
+  lastBotHtml = '';
   clearInterval(botTimer);
   loadBot();
   botTimer = setInterval(loadBot, 2000);
@@ -306,6 +340,10 @@ $('bot-follow').onclick = () => {
   if (b) map.panTo(ll(b.x, b.y));
 };
 const utcTime = (t) => { const d = new Date(); const [h, mi, s] = t.split(':').map(Number); d.setUTCHours(h, mi, s); return d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
+// Ячейка как в игре: иконка и количество; название — во всплывающей подсказке. Нет иконки — показываем название.
+const count = (v) => (v >= 10000 ? `${Math.round(v / 1000)}k` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v);
+const slot = (name, n) => `<div class="slot" title="${esc(nm(name))} × ${n}"><img src="icon/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()"><small>${esc(nm(name))}</small><b>${count(n)}</b></div>`;
+let lastBotHtml = '';
 async function loadBot() {
   const name = selected;
   try {
@@ -316,12 +354,15 @@ async function loadBot() {
     const inv = Object.entries(b.inventory).sort((x, y) => y[1] - x[1]);
     const doing = b.mining ? 'копает' : b.walking ? 'идёт' : b.queue.length ? 'крафтит' : 'стоит';
     const body = $('bot-body'), keep = body.scrollTop;
-    body.innerHTML = `
+    const html = `
       <div class="muted">${doing} · (${b.x.toFixed(0)}, ${b.y.toFixed(0)}) · здоровье ${b.health} из ${b.max_health}</div>
       <div class="bar"><b style="width:${Math.min(100, 100 * b.health / b.max_health)}%"></b></div>
-      <h3>Чем занят</h3><div class="log">${b.log.length ? b.log.slice().reverse().map((l) => `<div class="${l.kind}"><time>${utcTime(l.time)}</time>${esc(l.text)}</div>`).join('') : '<span class="muted">записей нет</span>'}</div>
-      <h3>Очередь крафта</h3><div class="items">${b.queue.length ? b.queue.map((q) => `<span>${esc(nm(q.recipe))} × ${q.count}</span>`).join('') : '<span class="muted">пусто</span>'}</div>
-      <h3>Инвентарь</h3><div class="items">${inv.length ? inv.map(([k, v]) => `<span>${esc(nm(k))} × ${v}</span>`).join('') : '<span class="muted">пусто</span>'}</div>`;
+      <h3>Очередь крафта</h3><div class="items">${b.queue.length ? b.queue.map((q) => slot(q.recipe, q.count)).join('') : '<span class="muted">пусто</span>'}</div>
+      <h3>Инвентарь</h3><div class="items">${inv.length ? inv.map(([k, v]) => slot(k, v)).join('') : '<span class="muted">пусто</span>'}</div>
+      <h3>Чем занят</h3><div class="log">${b.log.length ? b.log.slice().reverse().map((l) => `<div class="${l.kind}"><time>${utcTime(l.time)}</time>${esc(l.text)}</div>`).join('') : '<span class="muted">записей нет</span>'}</div>`;
+    if (html === lastBotHtml) return; // не перерисовываем без изменений: иконки не мигают, прокрутка не сбивается
+    lastBotHtml = html;
+    body.innerHTML = html;
     body.scrollTop = keep;
   } catch { /* следующая попытка через 2 секунды */ }
 }
