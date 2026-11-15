@@ -11,7 +11,7 @@ local BELT = {['transport-belt'] = true, ['underground-belt'] = true, splitter =
 --- Инвентарь объекта по имени: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory.
 local function inventory(ent, name)
   local inv, unknown = Inv.named(ent, name)
-  if unknown then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory') end
+  if unknown then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt, rocket или имя из defines.inventory') end
   return inv
 end
 

@@ -47,6 +47,9 @@ local function brief(e, force)
 end
 Obs.brief = brief
 
+local SILO_STATUS = {}
+for name, v in pairs(defines.rocket_silo_status) do SILO_STATUS[v] = name end
+
 --- Полное описание объекта — окно объекта в игре.
 local function full(e, force)
   local r = brief(e, force)
@@ -84,6 +87,19 @@ local function full(e, force)
   if e.type == 'assembling-machine' or e.type == 'furnace' or e.type == 'rocket-silo' then
     r.crafting_progress = try(function() return U.r2(e.crafting_progress) end)
     r.products_finished = try(function() return e.products_finished end)
+  end
+  if e.type == 'rocket-silo' then
+    -- Окно шахты: стадия ракеты, собранные детали, вес груза и галочка автозапросов для платформ.
+    r.rocket = try(function()
+      local out = {status = SILO_STATUS[e.rocket_silo_status], parts = e.rocket_parts, parts_required = e.prototype.rocket_parts_required,
+        platform_requests = e.use_transitional_requests}
+      local cargo = e.get_inventory(defines.inventory.rocket_silo_rocket)
+      if cargo then
+        out.cargo_weight = cargo.weight
+        out.cargo_max_weight = cargo.max_weight
+      end
+      return out
+    end)
   end
   if e.type == 'mining-drill' then
     r.mining_target = try(function() return e.mining_target and e.mining_target.name end)

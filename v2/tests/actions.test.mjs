@@ -24,7 +24,7 @@ const reset = (items = {}, dx = 30.5, dy = 15.5) => lua(`
   local A_ = storage.agent.agents[A.name]
   local e = A_.entity
   for _, x in pairs(s.find_entities_filtered{area = {{A.x - 2, A.y - 2}, {A.x + 62, A.y + 32}}}) do
-    if x ~= e and x.type ~= 'character' then x.destroy() end
+    if x.valid and x ~= e and x.type ~= 'character' then x.destroy() end
   end
   e.teleport({A.x + A.dx, A.y + A.dy})
   e.clear_items_inside()
@@ -324,6 +324,78 @@ test('configure: рецепт, поворот, копирование настр
   ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
   r = await call(A, 'configure', { target: P(34.5, 15.5), recipe: false });
   ok(r.ok, JSON.stringify(r));
+});
+
+test('configure: ракетная шахта — груз в ракету, запуск, автозапросы', async () => {
+  await reset({ 'space-platform-starter-pack': 1, 'wooden-chest': 1 });
+  const silo = { ...P(38.5, 15.5), name: 'rocket-silo' };
+  await world(`for _, p in pairs(game.forces.player.platforms) do p.destroy(1) end
+    local s = game.surfaces.nauvis.create_entity{name = 'rocket-silo', position = {A.ox + 38.5, A.oy + 15.5}, force = 'player'}
+    s.rocket_parts = s.prototype.rocket_parts_required
+    s.surface.create_entity{name = 'medium-electric-pole', position = {A.ox + 33.5, A.oy + 12.5}, force = 'player'}
+    s.surface.create_entity{name = 'electric-energy-interface', position = {A.ox + 32, A.oy + 11}, force = 'player'}
+    return true`);
+  let r = await call(A, 'configure', { target: silo, launch: true });
+  ok(!r.ok && r.error.code === 'not_allowed', 'ракета не готова: ' + JSON.stringify(r));
+  r = await call(A, 'configure', { target: silo, platform_requests: true });
+  ok(r.ok && r.rocket && r.platform_requests === true, JSON.stringify(r));
+  r = await call(A, 'configure', { target: silo, platform_requests: false });
+  ok(r.ok && r.platform_requests === false, JSON.stringify(r));
+  let info;
+  for (let i = 0; i < 90; i++) {
+    info = (await call(A, 'inspect', { target: silo }));
+    if (info.rocket?.status === 'rocket_ready') break;
+    await sleep(1000);
+  }
+  eq(info.rocket.status, 'rocket_ready', JSON.stringify(info));
+  eq(info.rocket.parts_required, 50);
+  r = await call(A, 'transfer', { target: silo, direction: 'put', item: 'space-platform-starter-pack', inventory: 'rocket' });
+  ok(r.ok && r.moved === 1, JSON.stringify(r));
+  info = await call(A, 'inspect', { target: silo });
+  eq(info.inventory.rocket['space-platform-starter-pack'], 1, JSON.stringify(info));
+  ok(info.rocket.cargo_weight > 0 && info.rocket.cargo_max_weight >= info.rocket.cargo_weight, JSON.stringify(info.rocket));
+  r = await call(A, 'transfer', { target: silo, direction: 'take', inventory: 'rocket' });
+  ok(r.ok && r.moved === 1, 'груз можно забрать обратно: ' + JSON.stringify(r));
+  await call(A, 'transfer', { target: silo, direction: 'put', item: 'space-platform-starter-pack', inventory: 'rocket' });
+  r = await call(A, 'configure', { target: silo, launch: true });
+  ok(r.ok && r.launched && r.cargo['space-platform-starter-pack'] === 1 && r.rocket !== 'rocket_ready', JSON.stringify(r));
+  ok(r.platform && r.platform.created && r.platform.name, 'стартовый набор становится новой платформой: ' + JSON.stringify(r));
+  const pl = await world(`for _, p in pairs(game.forces.player.platforms) do if p.name == A.pname then
+      local on_way = p.state == defines.space_platform_state.starter_pack_on_the_way p.destroy(1) return {on_way = on_way} end end return {}`, { pname: r.platform.name });
+  ok(pl.on_way, 'набор летит к платформе: ' + JSON.stringify(pl));
+  // Вторая ракета: платформа, созданная человеком и ждущая набор, получает его — новая не создаётся.
+  await world(`game.forces.player.create_space_platform{name = 't-wait', planet = 'nauvis', starter_pack = 'space-platform-starter-pack'}
+    A_ = storage.agent.agents[A.bot].entity.insert{name = 'space-platform-starter-pack', count = 1} return true`, { bot: NAME });
+  const seen = [];
+  let refilled = false;
+  for (let i = 0; i < 120; i++) {
+    info = await call(A, 'inspect', { target: silo });
+    if (seen[seen.length - 1] !== info.rocket?.status) seen.push(info.rocket?.status);
+    if (info.rocket?.status === 'building_rocket' && !refilled) {
+      refilled = true;
+      await world(`local s = game.surfaces.nauvis.find_entity('rocket-silo', {A.ox + 38.5, A.oy + 15.5}) s.rocket_parts = 50 return true`);
+    }
+    if (refilled && info.rocket?.status === 'rocket_ready') break;
+    await sleep(1000);
+  }
+  eq(info.rocket.status, 'rocket_ready', JSON.stringify(info));
+  // Игра сама запускает ракету, как только в неё положен набор, которого ждёт платформа: кнопка не нужна.
+  r = await call(A, 'transfer', { target: silo, direction: 'put', item: 'space-platform-starter-pack', inventory: 'rocket' });
+  ok(r.ok && r.moved === 1, JSON.stringify(r));
+  let st;
+  for (let i = 0; i < 20; i++) {
+    st = await world(`for _, p in pairs(game.forces.player.platforms) do if p.name == 't-wait' then
+      return {on_way = p.state == defines.space_platform_state.starter_pack_on_the_way, n = table_size(game.forces.player.platforms)} end end return {}`);
+    if (st.on_way) break;
+    await sleep(500);
+  }
+  ok(st.on_way && st.n === 1, 'набор ушёл к ждущей платформе, новая не создана: ' + JSON.stringify(st) + ' ' + seen.join(','));
+  await world(`for _, p in pairs(game.forces.player.platforms) do p.destroy(1) end return true`);
+  r = await call(A, 'configure', { target: silo, launch: true });
+  ok(!r.ok && r.error.code === 'not_allowed', 'повторный запуск: ' + JSON.stringify(r));
+  await call(A, 'place', { item: 'wooden-chest', ...P(30.5, 18.5) });
+  r = await call(A, 'configure', { target: P(30.5, 18.5), launch: true });
+  ok(!r.ok && r.error.code === 'bad_request', 'не шахта: ' + JSON.stringify(r));
 });
 
 test('research: добавить в очередь и убрать', async () => {

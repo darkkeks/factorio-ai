@@ -37,6 +37,9 @@ local WAIT_HELP = 'time | inactivity (ticks или seconds), full, empty, not_em
 local TRAIN_STATE = {}
 for name, v in pairs(defines.train_state) do TRAIN_STATE[v] = name end
 
+local SILO_STATUS = {}
+for name, v in pairs(defines.rocket_silo_status) do SILO_STATUS[v] = name end
+
 local function schedule_records(e, list)
   if type(list) ~= 'table' then U.fail('bad_request', 'schedule: список {station, wait: [...]} или false — очистить') end
   if #list > 50 then U.fail('bad_request', 'schedule: не больше 50 остановок') end
@@ -179,6 +182,60 @@ local function configure_one(A, it)
     done.train = {id = train.id, manual = train.manual_mode, state = TRAIN_STATE[train.state], schedule = U.list(U.schedule(train))}
   end
 
+  -- Ракетная шахта: галочка автозапросов для платформ и кнопка запуска готовой ракеты. Груз кладётся transfer-ом
+  -- (inventory: rocket); куда полетит груз, решает игра, как при нажатии кнопки в окне шахты.
+  if p.platform_requests ~= nil or p.launch ~= nil then
+    if ent.type ~= 'rocket-silo' then U.fail('bad_request', 'launch, platform_requests: цель — ракетная шахта') end
+    if p.platform_requests ~= nil then
+      if type(p.platform_requests) ~= 'boolean' then U.fail('bad_request', 'platform_requests: true | false') end
+      try('platform_requests', function() ent.use_transitional_requests = p.platform_requests end)
+    end
+    if p.launch ~= nil then
+      if p.launch ~= true then U.fail('bad_request', 'launch: true') end
+      local st = ent.rocket_silo_status
+      if st ~= defines.rocket_silo_status.rocket_ready then
+        U.fail('not_allowed','ракета не готова к запуску: ' .. (SILO_STATUS[st] or tostring(st))
+          .. ', деталей ракеты ' .. ent.rocket_parts .. '/' .. ent.prototype.rocket_parts_required, {rocket = SILO_STATUS[st]})
+      end
+      local cargo = ent.get_inventory(defines.inventory.rocket_silo_rocket)
+      local items = cargo and U.contents(cargo) or {}
+      -- Стартовый набор платформы: как при запуске из окна шахты, он летит к платформе, ждущей такой набор на орбите
+      -- этой планеты, а если такой нет — становится новой платформой. Без этого адреса игра вернула бы набор на землю.
+      local dest, platform, created
+      local planet = ent.surface.planet
+      local pack
+      for _, s in pairs(cargo and cargo.get_contents() or {}) do
+        if prototypes.item[s.name].type == 'space-platform-starter-pack' then pack = s end
+      end
+      if pack and planet then
+        for _, pl in pairs(e.force.platforms) do
+          local sp, loc = pl.starter_pack, pl.space_location
+          if not platform and pl.state == defines.space_platform_state.waiting_for_starter_pack and loc and loc.name == planet.name
+            and sp and sp.name.name == pack.name and sp.quality.name == (pack.quality or 'normal') then
+            platform = pl
+          end
+        end
+        if not platform then
+          try('launch', function()
+            platform = e.force.create_space_platform{planet = planet.name, starter_pack = {name = pack.name, quality = pack.quality}}
+          end)
+          created = platform ~= nil
+        end
+        if platform then dest = {type = defines.cargo_destination.space_platform, space_platform = platform} end
+      end
+      local okl, err = pcall(function() if dest then ent.launch_rocket(dest) else ent.launch_rocket() end end)
+      if not okl or ent.rocket_silo_status == defines.rocket_silo_status.rocket_ready then
+        if created then platform.destroy(1) end
+        U.fail('blocked', 'игра не дала запустить ракету' .. (okl and '' or ': ' .. tostring(err)), {rocket = SILO_STATUS[ent.rocket_silo_status]})
+      end
+      done.launched = true
+      if platform then done.platform = {name = platform.name, created = created or nil} end
+      done.cargo = U.list(items)
+    end
+    done.rocket = SILO_STATUS[ent.rocket_silo_status]
+    done.platform_requests = ent.use_transitional_requests
+  end
+
   -- Настройки логики: поля управляющего поведения постройки (то, что игрок задаёт в её окне логической сети).
   if p.control ~= nil then
     if type(p.control) ~= 'table' then U.fail('bad_request', 'control: объект с полями управляющего поведения') end
@@ -212,7 +269,7 @@ local function configure_one(A, it)
 end
 
 local SETTINGS = {'copy_from', 'recipe', 'recipe_quality', 'direction', 'rotate', 'filters', 'filter_mode', 'input_priority',
-  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'control', 'wire'}
+  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'platform_requests', 'launch', 'control', 'wire'}
 
 local function check_one(it, where)
   if type(it) ~= 'table' or type(it.target) ~= 'table' then U.fail('bad_request', where .. ': нужен target — {unit} или {x, y, name?}') end
