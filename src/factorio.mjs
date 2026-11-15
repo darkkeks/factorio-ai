@@ -107,6 +107,10 @@ local function place_one(e, a)
   local n = s.create_entity{name=pr.name, position={a.x, a.y}, direction=dir, force=e.force, raise_built=true, type=kind}
   if not n then fail('сюда поставить нельзя') end
   e.remove_item{name=a.item, count=1}
+  -- Как в игре: постройка, поставленная поверх своего призрака, его заменяет.
+  for _, g in pairs(s.find_entities_filtered{type='entity-ghost', area={{n.position.x-0.1, n.position.y-0.1}, {n.position.x+0.1, n.position.y+0.1}}, force=e.force}) do
+    if g.valid and g.ghost_name == pr.name and dist(g.position, n.position) < 0.1 then g.destroy() end
+  end
   local r = {placed=n.name, pos=P(n.position), direction=a.direction, left=e.get_item_count(a.item)}
   if n.type == 'underground-belt' then
     r.underground = n.belt_to_ground_type == 'input' and 'вход под землю' or 'выход из-под земли'
@@ -659,6 +663,153 @@ const BODY = {
     if t.by ~= A.bot then fail('шаблон '..A.name..' сохранил '..t.by..': удалить его может только он') end
     storage.vb_tpl[A.name] = nil
     return {deleted=A.name}`,
+
+  // План-призраки: призраки построек на карте, как от чертежа в игре (игрок ставит их где угодно на открытой карте,
+  // без предметов и мгновенно; строить их потом надо руками из инвентаря — ghost_build идёт через place_many).
+  // Планы лежат в storage.vb_ghost[имя] = {by, ents — сами призраки}; дописывать и убирать план может только автор.
+  // A.items — список {item, x, y, direction, underground, recipe}; повторный вызов с теми же клетками ничего не дублирует.
+  ghost_add: `
+    local e = bot()
+    local s, f = e.surface, e.force
+    storage.vb_ghost = storage.vb_ghost or {}
+    local pl = storage.vb_ghost[A.name]
+    if pl and pl.by ~= A.bot then fail('план '..A.name..' уже есть, его ведёт '..pl.by..': выбери другое имя') end
+    local ents = {}
+    if pl then for _, g in pairs(pl.ents) do if g.valid then ents[#ents+1] = g end end end
+    if not pl then
+      local mine = 0
+      for _, p in pairs(storage.vb_ghost) do if p.by == A.bot then mine = mine + 1 end end
+      if mine >= 20 then fail('у тебя уже 20 планов: убери ненужный (ghost_clear)') end
+    end
+    local placed, already, blocked, blocked_count, full = 0, 0, {}, 0, false
+    local function no(it, why) blocked_count = blocked_count + 1 if #blocked < 15 then blocked[#blocked+1] = {item=it.item, x=it.x, y=it.y, why=why} end end
+    for _, it in ipairs(A.items) do
+      local ip = prototypes.item[it.item]
+      local pr = ip and ip.place_result
+      if not pr then no(it, 'нет такого предмета или его нельзя поставить на землю')
+      elseif not f.is_chunk_charted(s, {math.floor(it.x/32), math.floor(it.y/32)}) then no(it, 'карта здесь не открыта')
+      else
+        local dir = defines.direction[it.direction or 'north']
+        local same
+        for _, c in pairs(s.find_entities_filtered{area={{it.x-0.1, it.y-0.1}, {it.x+0.1, it.y+0.1}}, force=f}) do
+          if (c.name == pr.name or (c.type == 'entity-ghost' and c.ghost_name == pr.name)) and dist(c.position, it) < 0.1 then same = c end
+        end
+        if same then already = already + 1
+        elseif #ents >= 5000 then full = true no(it, 'в плане уже 5000 призраков: заведи план с другим именем')
+        elseif not s.can_place_entity{name=pr.name, position={it.x, it.y}, direction=dir, force=f, build_check_type=defines.build_check_type.manual_ghost} then no(it, 'занято или не та поверхность')
+        else
+          local g = s.create_entity{name='entity-ghost', inner_name=pr.name, position={it.x, it.y}, direction=dir, force=f, expires=false, type=it.underground, raise_built=true}
+          if not g then no(it, 'сюда поставить нельзя')
+          else
+            if it.recipe and g.ghost_type == 'assembling-machine' then
+              local rc = f.recipes[it.recipe]
+              if rc and rc.enabled then pcall(function() g.set_recipe(rc) end) end
+            end
+            ents[#ents+1] = g placed = placed + 1
+          end
+        end
+      end
+    end
+    if #ents > 0 then storage.vb_ghost[A.name] = {by=A.bot, ents=ents} else storage.vb_ghost[A.name] = nil end
+    return {placed=placed, already=already, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full}`,
+
+  // Призраки плана A.name и/или в прямоугольнике A.x1..A.y2: сколько чего нужно, что есть в инвентаре, границы;
+  // A.limit — сколько призраков приложить списком (ближайшие к персонажу сверху). Без имени и области — список планов.
+  // Призраки видны на карте всей команде, поэтому расстояние не ограничено. Заодно чистит планы от построенного.
+  ghost_q: `
+    local e = bot()
+    local s, f = e.surface, e.force
+    storage.vb_ghost = storage.vb_ghost or {}
+    local function live(n)
+      local pl, r = storage.vb_ghost[n], {}
+      for _, g in pairs(pl.ents) do if g.valid then r[#r+1] = g end end
+      if #r == 0 then storage.vb_ghost[n] = nil else pl.ents = r end
+      return r
+    end
+    local function box(list)
+      local b
+      for _, g in pairs(list) do
+        local p = g.position
+        if not b then b = {x1=p.x, y1=p.y, x2=p.x, y2=p.y} end
+        b.x1 = math.min(b.x1, p.x) b.y1 = math.min(b.y1, p.y) b.x2 = math.max(b.x2, p.x) b.y2 = math.max(b.y2, p.y)
+      end
+      if b then b.x1 = math.floor(b.x1) b.y1 = math.floor(b.y1) b.x2 = math.ceil(b.x2) b.y2 = math.ceil(b.y2) end
+      return b
+    end
+    local names = {}
+    for n in pairs(storage.vb_ghost) do names[#names+1] = n end
+    table.sort(names)
+    if not A.name and not A.x1 then
+      local list = {}
+      for _, n in ipairs(names) do
+        local by = storage.vb_ghost[n].by
+        local l = live(n)
+        if #l > 0 then list[#list+1] = {name=n, by=by, ghosts=#l, area=box(l)} end
+      end
+      return {plans=list, count=#list}
+    end
+    local list = {}
+    if A.name then
+      if not storage.vb_ghost[A.name] then fail('нет плана '..A.name..' (список планов — ghost_list без аргументов; полностью построенный план исчезает сам)') end
+      for _, g in pairs(live(A.name)) do
+        local p = g.position
+        if not A.x1 or (p.x >= A.x1 and p.x <= A.x2 and p.y >= A.y1 and p.y <= A.y2) then list[#list+1] = g end
+      end
+    else
+      if A.x2 - A.x1 > 1000 or A.y2 - A.y1 > 1000 then fail('область больше 1000×1000 клеток') end
+      list = s.find_entities_filtered{type='entity-ghost', area={{A.x1, A.y1}, {A.x2, A.y2}}, force=f}
+    end
+    local me = e.position
+    local rows, cost, have, missing, enough = {}, {}, {}, {}, true
+    for _, g in pairs(list) do
+      local its = g.ghost_prototype.items_to_place_this
+      local it = its and its[1]
+      if it then
+        cost[it.name] = (cost[it.name] or 0) + 1
+        rows[#rows+1] = {g=g, item=it.name, d=dist(me, g.position)}
+      end
+    end
+    for k, v in pairs(cost) do
+      have[k] = e.get_item_count(k)
+      if have[k] < v then missing[k] = v - have[k] enough = false end
+    end
+    table.sort(rows, function(a, b) if a.d ~= b.d then return a.d < b.d end if a.g.position.y ~= b.g.position.y then return a.g.position.y < b.g.position.y end return a.g.position.x < b.g.position.x end)
+    local items = {}
+    for i = 1, math.min(#rows, A.limit or 0) do
+      local g = rows[i].g
+      local r = {item=rows[i].item, x=g.position.x, y=g.position.y, direction=g.supports_direction and dirname(g.direction) or 'north'}
+      if g.ghost_type == 'underground-belt' then r.underground = g.belt_to_ground_type end
+      if g.ghost_type == 'assembling-machine' then pcall(function() local rc = g.get_recipe() if rc then r.recipe = rc.name end end) end
+      items[i] = r
+    end
+    return {name=A.name, by=A.name and storage.vb_ghost[A.name] and storage.vb_ghost[A.name].by or nil, ghosts=#rows, area=box(list), cost=cost, have=have, missing=missing, enough=enough, items=items}`,
+
+  // Убрать призраки своих планов: план A.name целиком или его часть в области; только область — свои планы в ней.
+  ghost_clear: `
+    bot()
+    storage.vb_ghost = storage.vb_ghost or {}
+    if A.name then
+      local pl = storage.vb_ghost[A.name]
+      if not pl then fail('нет плана '..A.name) end
+      if pl.by ~= A.bot then fail('план '..A.name..' ведёт '..pl.by..': убрать его может только он') end
+    end
+    local removed, plans = 0, {}
+    for n, pl in pairs(storage.vb_ghost) do
+      if pl.by == A.bot and (not A.name or n == A.name) then
+        local keep = {}
+        for _, g in pairs(pl.ents) do
+          if g.valid then
+            local p = g.position
+            if not A.x1 or (p.x >= A.x1 and p.x <= A.x2 and p.y >= A.y1 and p.y <= A.y2) then g.destroy() removed = removed + 1
+            else keep[#keep+1] = g end
+          end
+        end
+        plans[#plans+1] = {name=n, left=#keep}
+        if #keep == 0 then storage.vb_ghost[n] = nil else pl.ents = keep end
+      end
+    end
+    table.sort(plans, function(a, b) return a.name < b.name end)
+    return {removed=removed, plans=plans}`,
 
   targets: `
     local e = bot()
@@ -1385,6 +1536,14 @@ export function createFactorioServer(botName, hooks) {
     return { built, skipped, left, pending: pending.map(({ i, ...it }) => it), stopped: stopped || undefined };
   }
 
+  /** Область из аргументов x, y, x2, y2 (целые клетки, углы в любом порядке) либо пусто, если она не задана. */
+  function ghostArea(a) {
+    const given = [a.x, a.y, a.x2, a.y2].filter((v) => v !== undefined).length;
+    if (given === 0) return {};
+    if (given < 4) throw new Error('область — это все четыре числа: x, y, x2, y2');
+    return { x1: Math.floor(Math.min(a.x, a.x2)), y1: Math.floor(Math.min(a.y, a.y2)), x2: Math.floor(Math.max(a.x, a.x2)) + 1, y2: Math.floor(Math.max(a.y, a.y2)) + 1 };
+  }
+
   const def = (name, description, shape, handler) => tool(name, description, shape, async (args) => {
     const shown = JSON.stringify(args);
     hooks.activity?.();
@@ -1588,6 +1747,105 @@ export function createFactorioServer(botName, hooks) {
 
     def('template_delete', 'Удалить свой шаблон построек (сами постройки на карте не трогает).', { name: z.string() },
       (a) => run('tpl_delete', { name: a.name.trim() })),
+
+    def('ghost_place', 'План-призраки: поставить на карту призраки построек, как чертёж в игре, — план виден всем на карте (и людям, и ботам), стройку можно согласовать до начала. Предметы не нужны и ничего не тратится: призрак — только разметка; строит его потом ghost_build из инвентаря. Призраки добавляются в план с именем name; план можно дописывать частями — сколько угодно вызовов под одним именем (до 500 призраков за вызов, до 5000 в плане), так что одним планом размечается целый район. Что ставить: либо items — список {item, x, y, direction, underground, recipe}, либо template — шаблон (template_save), (x, y) — клетка его северо-западного угла после поворота, rotation — поворот. Ставить можно где угодно на открытой карте, идти туда не нужно. Где уже стоит такая же постройка или такой же призрак — пропускается (already), так что повторять вызов безопасно; занятые клетки — в blocked с причиной. Дописывать и убирать план может только автор.',
+      { name: z.string().min(1).max(40).describe('имя плана'),
+        items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
+          direction: z.enum(DIRECTIONS).default('north').describe('как в place'),
+          underground: z.enum(['input', 'output']).optional().describe('только для подземного конвейера, как в place'),
+          recipe: z.string().optional().describe('только для сборочного автомата: рецепт, он задастся при постройке') })).min(1).max(500).optional(),
+        template: z.string().optional().describe('имя шаблона вместо items'),
+        x: z.number().optional().describe('для template: x клетки северо-западного угла'), y: z.number().optional().describe('для template: y клетки северо-западного угла'),
+        rotation: z.number().default(0).describe('для template: поворот по часовой стрелке — 0, 90, 180 или 270') },
+      async (a) => {
+        let items = a.items;
+        if (a.template) {
+          if (items) throw new Error('укажи либо items, либо template');
+          if (a.x === undefined || a.y === undefined) throw new Error('для template нужны x и y');
+          if (![0, 90, 180, 270].includes(a.rotation)) throw new Error('rotation — 0, 90, 180 или 270');
+          const p = await run('tpl_plan', { name: a.template.trim(), x: a.x, y: a.y, rot: a.rotation / 90, check: false });
+          items = Array.isArray(p.items) ? p.items : [];
+        }
+        if (!items) throw new Error('укажи items или template');
+        const name = a.name.trim();
+        const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
+        // Кусками, чтобы команда оставалась короткой.
+        for (let i = 0; i < items.length; i += 50) {
+          const r = await run('ghost_add', { name, items: items.slice(i, i + 50) });
+          out.placed += r.placed; out.already += r.already; out.blocked_count += r.blocked_count; out.in_plan = r.in_plan;
+          if (Array.isArray(r.blocked)) out.blocked.push(...r.blocked);
+          if (r.full) break;
+        }
+        out.blocked = out.blocked.slice(0, 15);
+        if (!out.blocked_count) { delete out.blocked; delete out.blocked_count; }
+        out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build';
+        return out;
+      }),
+
+    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает.',
+      { name: z.string().optional().describe('имя плана'),
+        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
+        layout: z.boolean().default(false).describe('приложить список призраков (до 100 ближайших)') },
+      async (a) => {
+        const sel = { name: a.name?.trim(), ...ghostArea(a) };
+        const r = await run('ghost_q', { ...sel, limit: a.layout ? 100 : 0 });
+        if (!sel.name && sel.x1 === undefined) { if (!Array.isArray(r.plans)) r.plans = []; return r; }
+        if (!a.layout) delete r.items;
+        else if (!Array.isArray(r.items)) r.items = [];
+        return r;
+      }),
+
+    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов.',
+      { name: z.string().optional().describe('имя плана'),
+        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области') },
+      async (a) => {
+        const sel = { name: a.name?.trim(), ...ghostArea(a) };
+        if (!sel.name && sel.x1 === undefined) throw new Error('укажи name или область (x, y, x2, y2)');
+        const key = (it) => `${it.item}@${it.x},${it.y}`;
+        const tries = new Map(); // призрак → сколько раз не встал; тому, которому мешал сам персонаж, даём вторую попытку
+        const built = [], skipped = new Map(), left = {};
+        const deadline = Date.now() + 180_000;
+        let stopped;
+        for (;;) {
+          const q = await run('ghost_q', { ...sel, limit: 150 });
+          const have = { ...q.have };
+          const todo = [];
+          for (const it of Array.isArray(q.items) ? q.items : []) {
+            if ((tries.get(key(it)) || 0) >= 2 || (have[it.item] || 0) < 1) continue;
+            have[it.item]--;
+            todo.push(it);
+            if (todo.length >= 50) break;
+          }
+          if (!todo.length) break;
+          const r = await placeMany(todo);
+          for (const b of r.built) { built.push(b); const it = todo[b.n - 1]; skipped.delete(key(it)); }
+          Object.assign(left, r.left);
+          for (const s of r.skipped) {
+            const k = key(todo[s.n - 1]);
+            tries.set(k, (tries.get(k) || 0) + (s.self ? 1 : 2));
+            skipped.set(k, { item: s.item, x: s.x, y: s.y, why: s.why });
+          }
+          stopped = r.stopped || (Date.now() > deadline ? 'вышло время на один вызов' : undefined);
+          if (stopped) break;
+        }
+        const q = await run('ghost_q', { ...sel, limit: 0 }).catch(() => null);
+        const by = {};
+        for (const x of built) by[x.placed] = (by[x.placed] || 0) + 1;
+        const miss = q && q.missing && Object.keys(q.missing).length ? q.missing : undefined;
+        const sk = [...skipped.values()];
+        return { plan: sel.name, placed: built.length, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
+          skipped: sk.slice(0, 15), skipped_count: sk.length, stopped, completed: q ? q.ghosts === 0 : undefined,
+          note: q && q.ghosts > 0 && !miss && !sk.length ? 'не всё успел: повтори тот же вызов' : undefined };
+      }),
+
+    def('ghost_clear', 'План-призраки: убрать призраки своих планов с карты (постройки не трогает). С name — план целиком, с name и областью (x, y, x2, y2) — только его часть в области, только с областью — призраки всех твоих планов в ней. Чужие планы и призраки, поставленные людьми, не трогаются.',
+      { name: z.string().optional().describe('имя плана'),
+        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области') },
+      (a) => {
+        const sel = { name: a.name?.trim(), ...ghostArea(a) };
+        if (!sel.name && sel.x1 === undefined) throw new Error('укажи name или область (x, y, x2, y2)');
+        return run('ghost_clear', sel);
+      }),
 
     def('insert_all', 'Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
       { name: z.string().describe('внутреннее имя объектов, например stone-furnace или burner-mining-drill'), item: z.string().describe('что класть, например coal'),
