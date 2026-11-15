@@ -105,6 +105,21 @@
     docker exec robot supervisorctl status       # состояние сервисов
     docker exec -it robot claude                 # один раз: войти в подписку (/login)
 
+## Резервные копии карты
+
+`robot/backup-map.py` (cron, раз в 5 минут) забирает новые автосохранения сервера в `~/backups/factorio/space-age-1/`
+и прореживает старые: за последние 3 часа хранятся все автосохранения (каждые 5 минут), до суток — раз в 30 минут,
+до недели — раз в 3 часа, до месяца — раз в день, до года — раз в неделю, старше — раз в 30 дней. В установившемся
+режиме это около 200 файлов. Каждая копия проверяется как архив; пока игра на паузе, новых копий нет.
+Журнал — `~/backups/factorio/backup.log` (строка, только когда что-то скопировано или удалено).
+
+    robot/backup-map.py --list      # что хранится, по ступеням
+    crontab -l                      # расписание
+
+Восстановление: `docker exec robot supervisorctl stop factorio-space-age-1`, положить выбранную копию на место
+`~/robot/factorio/space-age-1/space-age-1.zip`, затем `… start factorio-space-age-1`. Отдельно от этого
+`v2/tools/update-game.sh` перед каждым обновлением мода кладёт копию в `~/robot/factorio/space-age-1/backups/`.
+
 ## Доступ для внешних ботов
 
 Тот же сервер ботов доступен снаружи: `http://h1.darkkeks.me/factorio-mcp/v2/<операция>` (nginx в контейнере
