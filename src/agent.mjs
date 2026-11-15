@@ -158,8 +158,12 @@ export class Agent extends EventEmitter {
             saveSession(this.key, msg.session_id);
           } else if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
             for (const block of msg.message.content) {
-              // Ответ, начинающийся с точки, — это «реплика не мне»; в лог его не тащим.
-              if (block.type === 'text' && /[\p{L}\p{N}]/u.test(block.text) && !block.text.trim().startsWith('.')) this.emit('text', block.text.trim());
+              // «Точка» — знак «реплика не мне, сказать нечего». Но модель нередко пишет точку и следом содержательный
+              // текст — его показываем, сняв точку; фильтрацию по смыслу, если понадобится, делает голосовой бот.
+              if (block.type === 'text') {
+                const text = block.text.trim().replace(/^[.\s…]+/, '');
+                if (/[\p{L}\p{N}]/u.test(text)) this.emit('text', text);
+              }
             }
           } else if (msg.type === 'result') {
             this.busy = false;
