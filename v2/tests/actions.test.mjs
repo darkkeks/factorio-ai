@@ -10,7 +10,7 @@ const O = await lua(`
   for r = 3, 40 do for _, c in pairs{{r, r}, {-r, r}, {-r, 0}, {r, 0}, {0, r}, {-r, -r}, {r, -r}, {0, -r}} do
     local x, y = c[1] * 16, c[2] * 16
     local area = {{x - 2, y - 2}, {x + 62, y + 32}}
-    if s.count_entities_filtered{area = area} == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0
+    if s.count_entities_filtered{area = area, type = 'character', invert = true} == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0
       and game.forces.player.is_chunk_charted(s, {math.floor(x / 32), math.floor(y / 32)}) then
       return {x = x, y = y}
     end
@@ -172,6 +172,20 @@ test('mine: ресурс по счёту, постройка с содержим
   ok(!r.ok && r.error.code === 'out_of_reach', 'ресурс дальше 2,7 клетки: ' + JSON.stringify(r));
   r = await call(A, 'mine', { target: P(36.5, 15.5), count: 1, approach: true });
   ok(r.ok && r.gained === 1, JSON.stringify(r));
+});
+
+test('mine: деревья и камни — вплотную; помеченные на снос деревья с подходом', async () => {
+  await reset({}, 10.5, 15.5);
+  await world(`local s = game.surfaces.nauvis for i = 0, 2 do s.create_entity{name = 'tree-01', position = {A.ox + 40.5 + i * 3, A.oy + 15.5}} end s.create_entity{name = 'big-rock', position = {A.ox + 30.5, A.oy + 20.5}} return true`);
+  const near = await call(A, 'mine', { target: P(40.5, 15.5) });
+  ok(!near.ok && near.error.code === 'out_of_reach', 'дерево издалека не срубить: ' + JSON.stringify(near));
+  const area = { x1: O.x + 28, y1: O.y + 13, x2: O.x + 50, y2: O.y + 23 };
+  const mk = await call(A, 'mark_deconstruct', { area, nature: true, plan: 'trees' });
+  eq(mk.marked, 4);
+  const r = await call(A, 'mine', { marked: true, plan: 'trees', approach: true, wait_s: 90 });
+  ok(r.ok && r.done === 4 && r.skipped === 0, JSON.stringify(r).slice(0, 500));
+  const i = await inv();
+  ok(i.wood >= 12 && i.stone > 0, JSON.stringify(i));
 });
 
 test('mine: отмена во время пакета возвращает отчёт о сделанном', async () => {

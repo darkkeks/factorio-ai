@@ -16,6 +16,7 @@ ap.add_argument('save')
 ap.add_argument('--out')
 ap.add_argument('--mod', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mod'))
 ap.add_argument('--remove', action='store_true')
+ap.add_argument('--build', help='идентификатор сборки (коммит): попадает в agent/build.lua, его возвращает ping')
 a = ap.parse_args()
 
 src = zipfile.ZipFile(a.save)
@@ -34,6 +35,9 @@ else:
                 rel = os.path.relpath(p, a.mod).replace(os.sep, '/')
                 new[f'{root}/{rel}'] = open(p, 'rb').read()
     assert f'{root}/control.lua' in new, 'в каталоге мода нет control.lua'
+    if a.build:
+        assert all(c.isalnum() or c in '-._' for c in a.build), 'недопустимый идентификатор сборки'
+        new[f'{root}/agent/build.lua'] = f"return '{a.build}'\n".encode()
 
 out = a.out or a.save + '.tmp'
 dst = zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED)

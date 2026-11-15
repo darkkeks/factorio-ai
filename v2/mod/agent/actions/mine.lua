@@ -9,6 +9,8 @@ local B = require('agent.actions.build')
 local E = require('agent.events')
 local J = require('agent.journal')
 
+local in_reach, reach_of -- определены ниже
+
 local IDLE_LIMIT = 90   -- тиков без добычи, после которых разбираемся, почему движок её остановил
 local STALL_LIMIT = 300 -- тиков без единого добытого предмета (ни один ресурс руками не добывается так долго)
 
@@ -81,8 +83,8 @@ local function step(A, it)
     if it.idle > IDLE_LIMIT then
       stop_mining(e)
       local d = U.dist(e.position, ent.position)
-      if it.resource and d > e.resource_reach_distance then
-        U.fail('out_of_reach', 'до ресурса не дотянуться: дальность добычи ' .. U.r2(e.resource_reach_distance), {distance = U.r2(d), gained = gained})
+      if (it.resource and d > e.resource_reach_distance) or not in_reach(A, it) then
+        U.fail('out_of_reach', 'до цели не дотянуться: дальность добычи ' .. U.r2(reach_of(e, ent)), {distance = U.r2(d), gained = gained})
       end
       if e.get_main_inventory().count_empty_stacks() == 0 then
         J.add('inventory_full', A.name, {})
@@ -100,6 +102,14 @@ local function step(A, it)
   return nil
 end
 
+-- Дальность добычи: ресурсы, деревья и камни игрок добывает только вплотную (2,7 клетки), постройки снимает с 10.
+local CLOSE = {resource = true, tree = true, ['simple-entity'] = true, fish = true, plant = true, cliff = true}
+
+reach_of = function(e, ent)
+  if CLOSE[ent.type] then return e.resource_reach_distance end
+  return e.reach_distance
+end
+
 local function point(A, it)
   local e = A.entity
   if not it.entity then it.entity = T.get(e.surface, it.target) end
@@ -107,11 +117,10 @@ local function point(A, it)
     if it.name then return e.position, 1 end -- уже добыт: step вернёт итог
     U.fail('not_found', 'объекта уже нет')
   end
-  if it.entity.type == 'resource' then return it.entity.position, e.resource_reach_distance end
-  return it.entity.position, e.reach_distance
+  return it.entity.position, reach_of(e, it.entity)
 end
 
-local function in_reach(A, it)
+in_reach = function(A, it)
   local e, ent = A.entity, it.entity
   if not ent.valid then return true end
   if ent.type == 'resource' then return U.dist(e.position, ent.position) <= e.resource_reach_distance end

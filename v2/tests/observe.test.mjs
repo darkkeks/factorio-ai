@@ -15,7 +15,7 @@ const F = await lua(`
       local far = true
       for _, p in pairs(bots) do if math.abs(math.floor(p.x / 32) - c.x) <= 3 and math.abs(math.floor(p.y / 32) - c.y) <= 3 then far = false end end
       local area = {{c.x * 32 + 4, c.y * 32 + 4}, {c.x * 32 + 28, c.y * 32 + 28}}
-      if far and s.count_entities_filtered{area = area} == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0 then
+      if far and s.count_entities_filtered{area = area, type = 'character', invert = true} == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0 then
         return {cx = c.x, cy = c.y, x = c.x * 32 + 16, y = c.y * 32 + 16}
       end
     end

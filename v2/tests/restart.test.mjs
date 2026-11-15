@@ -15,7 +15,7 @@ const O = await lua(`
   for r = 2, 30 do for _, c in pairs{{-r, r}, {r, r}, {-r, 0}, {r, 0}, {0, r}, {-r, -r}, {r, -r}, {0, -r}} do
     local x, y = c[1] * 16, c[2] * 16
     local area = {{x - 2, y - 2}, {x + 62, y + 32}}
-    if s.count_entities_filtered{area = area, collision_mask = 'player'} == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0
+    if (s.count_entities_filtered{area = area, collision_mask = 'player'} - s.count_entities_filtered{area = area, type = 'character'}) == 0 and s.count_tiles_filtered{area = area, collision_mask = 'player'} == 0
       and game.forces.player.is_chunk_charted(s, {math.floor(x / 32), math.floor(y / 32)}) then
       return {x = x + 0.5, y = y + 0.5}
     end

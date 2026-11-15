@@ -5,6 +5,7 @@ local J = require('agent.journal')
 local Q = require('agent.queue')
 local S = require('agent.state')
 local Gui = require('agent.gui')
+local BUILD = require('agent.build')
 
 local O = {list = {}}
 
@@ -16,7 +17,7 @@ O.register('ping', {fn = function()
   for name, def in pairs(Q.actions) do actions[#actions + 1] = {name = name, instant = def.instant or false} end
   table.sort(ops)
   table.sort(actions, function(a, b) return a.name < b.name end)
-  return {mod = 'agent', version = S.VERSION, api = 2, tick = game.tick, paused = game.tick_paused, ops = ops, actions = actions}
+  return {mod = 'agent', version = S.VERSION, build = BUILD, api = 2, tick = game.tick, paused = game.tick_paused, ops = ops, actions = actions}
 end})
 
 -- Что перенесено со старой системы при первом запуске (для проверки переноса).

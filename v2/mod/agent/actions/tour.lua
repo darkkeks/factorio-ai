@@ -73,13 +73,16 @@ local function run(spec, A, act)
       settle(it, ok, res)
       st.cur = nil
     end
-    -- 2. идём к очередной цели
+    -- 2. идём к очередной цели; как только до неё можно дотянуться — останавливаемся
     if st.w then
-      local ok, res = xpcall(W.step, Q.on_error, A, act, st.w)
-      if ok and res == nil then return nil end
-      st.walked = (st.walked or 0) + st.w.walked
-      W.halt(A, st.w)
       local it = st.items[st.wi]
+      local reached = false
+      if spec.in_reach and it.entity and it.entity.valid then reached = spec.in_reach(A, it) end
+      local ok, res = true, true
+      if not reached then ok, res = xpcall(W.step, Q.on_error, A, act, st.w) end
+      if ok and res == nil then return nil end
+      st.walked = (st.walked or 0) + st.w.walked + U.dist(e.position, st.w.last)
+      W.halt(A, st.w)
       st.w, st.wi = nil, nil
       if not ok then
         if res.code == 'damaged' then error(res, 0) end -- урон прерывает весь пакет: решать боту
@@ -131,9 +134,15 @@ local function run(spec, A, act)
       end
       return finish(spec, A, act)
     end
-    -- 4. к ближайшей из оставшихся
+    -- 4. к ближайшей из оставшихся. Дальность считается от края цели, а идём к её центру: у крупной цели
+    -- (скала, сборочный автомат) останавливаемся дальше на её полуразмер.
     local it = st.items[nearest]
-    local ok, w = xpcall(W.new, Q.on_error, A, act, npt, math.max(nreach - 1.5, 0.6), {stop_on_damage = act.p.stop_on_damage})
+    local half = 0
+    if it.entity and it.entity.valid then
+      local bb = it.entity.bounding_box
+      half = math.max(bb.right_bottom.x - bb.left_top.x, bb.right_bottom.y - bb.left_top.y) / 2
+    end
+    local ok, w = xpcall(W.new, Q.on_error, A, act, npt, math.max(nreach - 1.5, 0.6) + half, {stop_on_damage = act.p.stop_on_damage})
     if not ok then
       settle(it, false, {code = w.code, message = 'не дошёл до цели: ' .. w.message})
     elseif w.done then
