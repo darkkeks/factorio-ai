@@ -156,6 +156,34 @@ local function place_one(e, a)
 end
 `;
 
+// Метки сноса (fb-049, fb-050). markable — что игрок может пометить планировщиком разборки и потом снять руками:
+// постройки своей команды, деревья и камни. storage.vb_marks — кто из ботов что пометил ({e, by, plan}); сама метка
+// живёт на постройке (to_be_deconstructed), так что метки людей видны так же.
+const MARK_FN = `
+local NO_MARK = {['entity-ghost']=true, ['tile-ghost']=true, resource=true, cliff=true, unit=true, car=true, ['spider-vehicle']=true, ['unit-spawner']=true, turret=true}
+local function markable(c, f)
+  if not c.valid or SKIP[c.type] or NO_MARK[c.type] then return false end
+  if not c.minable or not c.prototype.selectable_in_game then return false end
+  if c.force == f then return true end
+  return c.force.name == 'neutral' and (c.type == 'tree' or c.type == 'simple-entity')
+end
+local NAMES
+if A.names then NAMES = {} for _, n in pairs(A.names) do NAMES[n] = true end end
+local function named(c)
+  if not NAMES then return true end
+  return NAMES[c.name] or (NAMES.tree and c.type == 'tree') or (NAMES.rock and c.type == 'simple-entity') or false
+end
+local function mark_key(c) return c.name..'@'..c.position.x..','..c.position.y end
+local function mark_row(c) return {name=c.name, x=c.position.x, y=c.position.y, close=c.force.name == 'neutral' or nil} end
+-- Учёт меток ботов без того, что уже снято или снесено.
+local function marks()
+  local keep = {}
+  for _, m in pairs(storage.vb_marks or {}) do if m.e.valid and m.e.to_be_deconstructed() then keep[#keep+1] = m end end
+  storage.vb_marks = keep
+  return keep
+end
+`;
+
 // Осмотреть объект в точке (x, y) глазами персонажа e. Общая часть inspect и inspect_many.
 const INSPECT_FN = `
 local function inspect_one(e, x, y)
@@ -169,6 +197,7 @@ local function inspect_one(e, x, y)
   end
   r.direction = t.supports_direction and dirname(t.direction) or nil
   if t.health then r.health = math.floor(t.health) end
+  if t.to_be_deconstructed() then r.marked_for_removal = true end
   pcall(function() local rc = t.get_recipe() if rc then r.recipe = rc.name end end)
   r.status = status_of(t)
   if t.type == 'inserter' then
@@ -940,7 +969,7 @@ const BODY = {
   // без предметов и мгновенно; строить их потом надо руками из инвентаря — ghost_build идёт через place_many).
   // Планы лежат в storage.vb_ghost[имя] = {by, ents — сами призраки}; дописывать и убирать план может только автор.
   // A.items — список {item, x, y, direction, underground, recipe}; повторный вызов с теми же клетками ничего не дублирует.
-  ghost_add: `
+  ghost_add: MARK_FN + `
     local e = bot()
     local s, f = e.surface, e.force
     storage.vb_ghost = storage.vb_ghost or {}
@@ -955,6 +984,34 @@ const BODY = {
     end
     local placed, already, blocked, blocked_count, full = 0, 0, {}, 0, false
     local function no(it, why) blocked_count = blocked_count + 1 if #blocked < 15 then blocked[#blocked+1] = {item=it.item, x=it.x, y=it.y, why=why} end end
+    local M = marks()
+    local marked, marked_count = {}, 0
+    -- Можно ли поставить призрак. С A.replace — как чертёж поверх построек: то, что мешает (постройки своей команды,
+    -- деревья, камни), помечается на снос, и призрак встаёт поверх; если всё равно нельзя — пометки снимаются обратно.
+    local function can_ghost(pr, it, dir)
+      local q = {name=pr.name, position={it.x, it.y}, direction=dir, force=f, build_check_type=defines.build_check_type.manual_ghost}
+      if s.can_place_entity(q) then return true end
+      if not A.replace then return false end
+      local cb = pr.collision_box
+      local w, h = math.max(-cb.left_top.x, cb.right_bottom.x) - 0.02, math.max(-cb.left_top.y, cb.right_bottom.y) - 0.02
+      if dir == defines.direction.east or dir == defines.direction.west then w, h = h, w end
+      local mine = {}
+      for _, c in pairs(s.find_entities_filtered{area={{it.x-w, it.y-h}, {it.x+w, it.y+h}}}) do
+        if markable(c, f) and not c.to_be_deconstructed() and c.order_deconstruction(f) then mine[#mine+1] = c end
+      end
+      if not s.can_place_entity(q) then
+        for _, c in pairs(mine) do if c.valid then c.cancel_deconstruction(f) end end
+        return false
+      end
+      for _, c in pairs(mine) do
+        if c.valid then
+          M[#M+1] = {e=c, by=A.bot, plan=A.name}
+          marked_count = marked_count + 1
+          if #marked < 30 then marked[#marked+1] = {name=c.name, x=c.position.x, y=c.position.y} end
+        end
+      end
+      return true
+    end
     for _, it in ipairs(A.items) do
       local ip = prototypes.item[it.item]
       local pr = ip and ip.place_result
@@ -964,11 +1021,14 @@ const BODY = {
         local dir = defines.direction[it.direction or 'north']
         local same
         for _, c in pairs(s.find_entities_filtered{area={{it.x-0.1, it.y-0.1}, {it.x+0.1, it.y+0.1}}, force=f}) do
-          if (c.name == pr.name or (c.type == 'entity-ghost' and c.ghost_name == pr.name)) and dist(c.position, it) < 0.1 then same = c end
+          if (c.name == pr.name or (c.type == 'entity-ghost' and c.ghost_name == pr.name)) and dist(c.position, it) < 0.1 then
+            -- С replace такая же постройка, но помеченная на снос или повёрнутая иначе, — не «уже стоит»: её заменит призрак.
+            if not (A.replace and c.type ~= 'entity-ghost' and (c.to_be_deconstructed() or (c.supports_direction and c.direction ~= dir))) then same = c end
+          end
         end
         if same then already = already + 1
         elseif #ents >= 5000 then full = true no(it, 'в плане уже 5000 призраков: заведи план с другим именем')
-        elseif not s.can_place_entity{name=pr.name, position={it.x, it.y}, direction=dir, force=f, build_check_type=defines.build_check_type.manual_ghost} then no(it, 'занято или не та поверхность')
+        elseif not can_ghost(pr, it, dir) then no(it, A.replace and 'занято тем, что нельзя пометить на снос (чужой призрак, вода, не та поверхность)' or 'занято или не та поверхность (поверх построек — replace=true)')
         else
           local g = s.create_entity{name='entity-ghost', inner_name=pr.name, position={it.x, it.y}, direction=dir, force=f, expires=false, type=it.underground, raise_built=true}
           if not g then no(it, 'сюда поставить нельзя')
@@ -986,12 +1046,12 @@ const BODY = {
       storage.vb_ghost[A.name] = {by=A.bot, ents=ents}
       if storage.vb_ghost_done then storage.vb_ghost_done[A.name] = nil end
     else storage.vb_ghost[A.name] = nil end
-    return {placed=placed, already=already, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full}`,
+    return {placed=placed, already=already, blocked=blocked, blocked_count=blocked_count, in_plan=#ents, full=full, marked=marked, marked_count=marked_count}`,
 
   // Призраки плана A.name и/или в прямоугольнике A.x1..A.y2: сколько чего нужно, что есть в инвентаре, границы;
   // A.limit — сколько призраков приложить списком (ближайшие к персонажу сверху). Без имени и области — список планов.
   // Призраки видны на карте всей команде, поэтому расстояние не ограничено. Заодно чистит планы от построенного.
-  ghost_q: `
+  ghost_q: MARK_FN + `
     local e = bot()
     local s, f = e.surface, e.force
     storage.vb_ghost = storage.vb_ghost or {}
@@ -1067,10 +1127,25 @@ const BODY = {
       if g.ghost_type == 'assembling-machine' then pcall(function() local rc = g.get_recipe() if rc then r.recipe = rc.name end end) end
       items[i] = r
     end
-    return {name=A.name, by=A.name and storage.vb_ghost[A.name] and storage.vb_ghost[A.name].by or nil, ghosts=#rows, area=box(list), cost=cost, have=have, missing=missing, enough=enough, items=items}`,
+    -- Что помечено на снос под этими призраками: это снимается перед постройкой (ghost_build).
+    local blk, seen = {}, {}
+    for _, g in pairs(list) do
+      local b = g.bounding_box
+      for _, c in pairs(s.find_entities_filtered{area={{b.left_top.x+0.02, b.left_top.y+0.02}, {b.right_bottom.x-0.02, b.right_bottom.y-0.02}}, to_be_deconstructed=true}) do
+        local k = mark_key(c)
+        if not seen[k] and markable(c, f) then seen[k] = true blk[#blk+1] = {c=c, d=dist(me, c.position)} end
+      end
+    end
+    local blockers
+    if A.blockers then
+      table.sort(blk, function(a, b) return a.d < b.d end)
+      blockers = {}
+      for i = 1, math.min(#blk, A.blockers) do blockers[i] = mark_row(blk[i].c) end
+    end
+    return {name=A.name, by=A.name and storage.vb_ghost[A.name] and storage.vb_ghost[A.name].by or nil, ghosts=#rows, to_remove=#blk, area=box(list), cost=cost, have=have, missing=missing, enough=enough, items=items, blockers=blockers}`,
 
   // Убрать призраки своих планов: план A.name целиком или его часть в области; только область — свои планы в ней.
-  ghost_clear: `
+  ghost_clear: MARK_FN + `
     bot()
     storage.vb_ghost = storage.vb_ghost or {}
     if A.name then
@@ -1094,7 +1169,121 @@ const BODY = {
       end
     end
     table.sort(plans, function(a, b) return a.name < b.name end)
-    return {removed=removed, plans=plans}`,
+    -- Пометки сноса, которые эти планы поставили сами (ghost_place с replace), снимаются вместе с призраками.
+    local unmarked = 0
+    for _, m in pairs(marks()) do
+      local p = m.e.position
+      if m.by == A.bot and m.plan and (not A.name or m.plan == A.name) and (not A.x1 or (p.x >= A.x1 and p.x <= A.x2 and p.y >= A.y1 and p.y <= A.y2)) then
+        if m.e.cancel_deconstruction(m.e.force.name == 'neutral' and game.forces.player or m.e.force) ~= false then unmarked = unmarked + 1 end
+      end
+    end
+    return {removed=removed, unmarked=unmarked, plans=plans}`,
+
+  // Метки сноса — как планировщик разборки в игре: видны всем, помеченная постройка перестаёт работать, снимает её потом
+  // персонаж руками (demolish). A.points — список точек, иначе прямоугольник A.x1..A.y2; A.names — только такие объекты
+  // (tree — деревья, rock — камни); без A.names в области помечаются только постройки своей команды. A.unmark — снять метки.
+  mark: MARK_FN + `
+    local e = bot()
+    local s, f = e.surface, e.force
+    local M = marks()
+    local cands = {}
+    if A.points then
+      for _, p in ipairs(A.points) do
+        for _, c in pairs(s.find_entities_filtered{area={{p.x-0.45, p.y-0.45}, {p.x+0.45, p.y+0.45}}}) do cands[#cands+1] = c end
+      end
+    else
+      if A.x2 - A.x1 > 200 or A.y2 - A.y1 > 200 then fail('область больше 200×200 клеток: размечай частями') end
+      cands = s.find_entities_filtered{area={{A.x1, A.y1}, {A.x2, A.y2}}}
+    end
+    local n, already, hidden, by, list = 0, 0, 0, {}, {}
+    for _, c in pairs(cands) do
+      if c.valid and markable(c, f) and named(c) and (A.unmark or A.names or A.points or c.force == f) then
+        local name, row = c.name, mark_row(c)
+        local ok = false
+        if not f.is_chunk_charted(s, {math.floor(c.position.x/32), math.floor(c.position.y/32)}) then hidden = hidden + 1
+        elseif A.unmark then
+          if c.to_be_deconstructed() then c.cancel_deconstruction(f) ok = not c.to_be_deconstructed() end
+        elseif c.to_be_deconstructed() then already = already + 1
+        elseif c.order_deconstruction(f) then ok = true if c.valid then M[#M+1] = {e=c, by=A.bot} end end
+        if ok then
+          n = n + 1
+          by[name] = (by[name] or 0) + 1
+          if #list < 30 then list[#list+1] = row end
+        end
+      end
+    end
+    if A.unmark then return {unmarked=n, by_name=by, list=list} end
+    return {marked=n, already=already, not_charted=hidden, by_name=by, list=list}`,
+
+  // Что помечено на снос: в прямоугольнике A.x1..A.y2 (и людьми тоже) — сколько, каких, A.limit ближайших списком;
+  // без области — сводка по меткам, которые ставили боты.
+  marked_q: MARK_FN + `
+    local e = bot()
+    local s, f = e.surface, e.force
+    local who = {}
+    for _, m in pairs(marks()) do who[mark_key(m.e)] = m end
+    if not A.x1 then
+      local n, by, b = 0, {}, nil
+      for _, m in pairs(who) do
+        local p = m.e.position
+        n = n + 1
+        by[m.by] = (by[m.by] or 0) + 1
+        if not b then b = {x1=p.x, y1=p.y, x2=p.x, y2=p.y} end
+        b.x1 = math.min(b.x1, p.x) b.y1 = math.min(b.y1, p.y) b.x2 = math.max(b.x2, p.x) b.y2 = math.max(b.y2, p.y)
+      end
+      if b then b.x1 = math.floor(b.x1) b.y1 = math.floor(b.y1) b.x2 = math.ceil(b.x2) b.y2 = math.ceil(b.y2) end
+      return {marked=n, by_bot=by, area=b}
+    end
+    if A.x2 - A.x1 > 1000 or A.y2 - A.y1 > 1000 then fail('область больше 1000×1000 клеток') end
+    local rows, by = {}, {}
+    for _, c in pairs(s.find_entities_filtered{area={{A.x1, A.y1}, {A.x2, A.y2}}, to_be_deconstructed=true}) do
+      if markable(c, f) and named(c) then
+        rows[#rows+1] = {c=c, d=dist(e.position, c.position)}
+        by[c.name] = (by[c.name] or 0) + 1
+      end
+    end
+    table.sort(rows, function(a, b) return a.d < b.d end)
+    local items = {}
+    for i = 1, math.min(#rows, A.limit or 0) do
+      local r = mark_row(rows[i].c)
+      local m = who[mark_key(rows[i].c)]
+      if m then r.by = m.by r.plan = m.plan end
+      items[i] = r
+    end
+    return {marked=#rows, by_name=by, items=items}`,
+
+  // Снять руками помеченное на снос из списка A.items ({i, name, x, y}) — только то, до чего персонаж дотягивается
+  // (постройки — 10 клеток, деревья и камни — 4), и в темпе игрока: каждая разборка занимает время добычи этого объекта
+  // (mining_time / скорость добычи персонажа), следующая начнётся, когда оно выйдет (storage.vb_dm — тик, когда руки
+  // освободятся). Содержимое постройки уходит в инвентарь; не влезает — постройка остаётся стоять.
+  demolish: `
+    local e = bot()
+    local s, f = e.surface, e.force
+    storage.vb_dm = storage.vb_dm or {}
+    local free_at = math.max(storage.vb_dm[A.bot] or 0, game.tick - 30)
+    local speed = 0.5
+    pcall(function() speed = e.prototype.mining_speed or 0.5 end)
+    speed = speed * math.max(0.1, 1 + e.character_mining_speed_modifier + f.manual_mining_speed_modifier)
+    local out, far, waiting = {}, 0, 0
+    for _, it in ipairs(A.items) do
+      local t
+      for _, c in pairs(s.find_entities_filtered{name=it.name, area={{it.x-0.1, it.y-0.1}, {it.x+0.1, it.y+0.1}}, to_be_deconstructed=true}) do
+        if dist(c.position, it) < 0.1 then t = c end
+      end
+      if not t then out[#out+1] = {i=it.i, gone=true}
+      elseif dist(e.position, t.position) > (t.force == f and 10 or 4) then far = far + 1
+      elseif free_at > game.tick then waiting = waiting + 1
+      else
+        local mt = 0.5
+        pcall(function() mt = t.prototype.mineable_properties.mining_time or 0.5 end)
+        if e.mine_entity(t, false) then
+          free_at = math.max(free_at, game.tick - 30) + math.max(2, math.ceil(mt*60/speed))
+          out[#out+1] = {i=it.i, ok=true}
+        else out[#out+1] = {i=it.i, ok=false, why='не снимается: в инвентаре нет места'} end
+      end
+    end
+    storage.vb_dm[A.bot] = free_at
+    return {results=out, far=far, waiting=waiting, wait_ticks=math.max(0, free_at - game.tick)}`,
 
   targets: `
     local e = bot()
@@ -2244,7 +2433,7 @@ const EVENTS_PEEK = `local V = storage.vb_ev return {seq=V and V.seq or 0, age=V
 // персонажа выполняется только одно; второму вызову отвечаем отказом с объяснением, а не ставим его в очередь.
 const READ_ONLY = new Set(['status', 'look_around', 'find', 'inspect', 'inspect_many', 'research', 'power', 'belt', 'alerts', 'pollution',
   'area_map', 'route', 'where_items', 'production', 'events', 'recipe_info', 'say', 'wait', 'feedback', 'feedback_status', 'read_chat',
-  'craft', 'template_save', 'template_cost', 'template_delete', 'ghost_place', 'ghost_list', 'ghost_clear', 'stop']);
+  'craft', 'template_save', 'template_cost', 'template_delete', 'ghost_place', 'ghost_list', 'ghost_clear', 'mark_remove', 'unmark_remove', 'marked_list', 'stop']);
 const busy = new Map(); // персонаж -> { tool, since }
 const stopAsked = new Map(); // персонаж -> когда попросили остановиться
 const inBodyAction = new AsyncLocalStorage(); // шаги plan и вложенные вызовы идут под блокировкой внешнего вызова
@@ -2562,18 +2751,57 @@ export function createFactorioServer(botName, hooks) {
   }
 
   /** Добавить призраки items в план name (BODY.ghost_add). Общая часть ghost_place и route. */
-  async function ghostAdd(name, items) {
+  async function ghostAdd(name, items, replace = false) {
     const out = { plan: name, placed: 0, already: 0, blocked: [], blocked_count: 0, in_plan: 0 };
+    const marked = [];
+    let markedCount = 0;
     // Кусками, чтобы команда оставалась короткой.
     for (let i = 0; i < items.length; i += 50) {
-      const r = await run('ghost_add', { name, items: items.slice(i, i + 50) });
+      const r = await run('ghost_add', { name, items: items.slice(i, i + 50), replace: replace || undefined });
       out.placed += r.placed; out.already += r.already; out.blocked_count += r.blocked_count; out.in_plan = r.in_plan;
       if (Array.isArray(r.blocked)) out.blocked.push(...r.blocked);
+      if (Array.isArray(r.marked)) marked.push(...r.marked);
+      markedCount += r.marked_count || 0;
       if (r.full) break;
     }
     out.blocked = out.blocked.slice(0, 15);
     if (!out.blocked_count) { delete out.blocked; delete out.blocked_count; }
+    if (markedCount) { out.marked_for_removal = marked.slice(0, 30); out.marked_count = markedCount; }
     return out;
+  }
+
+  /**
+   * Снять руками помеченное на снос (BODY.demolish): items — {name, x, y} из marked_q или ghost_q. Подходит к первому
+   * неснятому и снимает всё, до чего дотягивается, в темпе игрока. Кончилось место в инвентаре — останавливается (full).
+   */
+  async function demolishMany(items, deadline) {
+    let pending = items.map((it, k) => ({ ...it, i: k + 1 }));
+    const removed = {}, skipped = [];
+    let stopped, full = false, walkedFor = null;
+    while (pending.length) {
+      const r = await run('demolish', { items: pending });
+      const results = Array.isArray(r.results) ? r.results : [];
+      const gone = new Set();
+      for (const x of results) {
+        const it = pending.find((p) => p.i === x.i);
+        gone.add(x.i);
+        if (x.ok) removed[it.name] = (removed[it.name] || 0) + 1;
+        else if (!x.gone) { skipped.push({ name: it.name, x: it.x, y: it.y, why: x.why }); full = true; }
+      }
+      pending = pending.filter((p) => !gone.has(p.i));
+      if (full) { stopped = 'в инвентаре нет места: разгрузись и повтори тот же вызов'; break; }
+      if (!pending.length) break;
+      stopped = await interrupted();
+      if (!stopped && Date.now() > deadline) stopped = 'вышло время на один вызов';
+      if (stopped) break;
+      if (results.length || r.waiting > 0) { await sleep(Math.min(1000, Math.max(50, (r.wait_ticks || 0) * 16))); continue; }
+      // Всё оставшееся далеко: идём к первому. Не дошли — пропускаем его.
+      const t = pending[0];
+      if (walkedFor === t.i) { skipped.push({ name: t.name, x: t.x, y: t.y, why: 'не смог подойти' }); pending.shift(); continue; }
+      walkedFor = t.i;
+      try { await approach(t.x, t.y, t.close ? 2.5 : 8); } catch (e) { if (/враг/.test(e.message)) { stopped = e.message; break; } }
+    }
+    return { removed, skipped, full, stopped: stopped || undefined };
   }
 
   /**
@@ -2869,7 +3097,7 @@ export function createFactorioServer(botName, hooks) {
     def('template_delete', 'Удалить свой шаблон построек (сами постройки на карте не трогает).', { name: z.string() },
       (a) => run('tpl_delete', { name: a.name.trim() })),
 
-    def('ghost_place', 'План-призраки: поставить на карту призраки построек, как чертёж в игре, — план виден всем на карте (и людям, и ботам), стройку можно согласовать до начала. Предметы не нужны и ничего не тратится: призрак — только разметка; строит его потом ghost_build из инвентаря. Призраки добавляются в план с именем name; план можно дописывать частями — сколько угодно вызовов под одним именем (до 500 призраков за вызов, до 5000 в плане), так что одним планом размечается целый район. Что ставить: либо items — список {item, x, y, direction, underground, recipe}, либо template — шаблон (template_save), (x, y) — клетка его северо-западного угла после поворота, rotation — поворот. Ставить можно где угодно на открытой карте, идти туда не нужно. Где уже стоит такая же постройка или такой же призрак — пропускается (already), так что повторять вызов безопасно; занятые клетки — в blocked с причиной. Дописывать и убирать план может только автор.',
+    def('ghost_place', 'План-призраки: поставить на карту призраки построек, как чертёж в игре, — план виден всем на карте (и людям, и ботам), стройку можно согласовать до начала. Предметы не нужны и ничего не тратится: призрак — только разметка; строит его потом ghost_build из инвентаря. Призраки добавляются в план с именем name; план можно дописывать частями — сколько угодно вызовов под одним именем (до 500 призраков за вызов, до 5000 в плане), так что одним планом размечается целый район. Что ставить: либо items — список {item, x, y, direction, underground, recipe}, либо template — шаблон (template_save), (x, y) — клетка его северо-западного угла после поворота, rotation — поворот. Ставить можно где угодно на открытой карте, идти туда не нужно. Где уже стоит такая же постройка или такой же призрак — пропускается (already), так что повторять вызов безопасно; занятые клетки — в blocked с причиной. С replace=true план рисуется поверх существующих построек, как чертёж с заменой: всё, что мешает призраку (постройки своей команды, в том числе такая же, но повёрнутая иначе, деревья, камни), помечается на снос — метка видна всем, помеченная постройка сразу перестаёт работать; что помечено — в marked_for_removal (до 30) и marked_count. ghost_build сначала снимает помеченное, потом строит. Дописывать и убирать план может только автор.',
       { name: z.string().min(1).max(40).describe('имя плана'),
         items: z.array(z.object({ item: z.string().describe('внутреннее имя предмета'), ...coords,
           direction: z.enum(DIRECTIONS).default('north').describe('как в place'),
@@ -2877,7 +3105,8 @@ export function createFactorioServer(botName, hooks) {
           recipe: z.string().optional().describe('только для сборочного автомата: рецепт, он задастся при постройке') })).min(1).max(500).optional(),
         template: z.string().optional().describe('имя шаблона вместо items'),
         x: z.number().optional().describe('для template: x клетки северо-западного угла'), y: z.number().optional().describe('для template: y клетки северо-западного угла'),
-        rotation: z.number().default(0).describe('для template: поворот по часовой стрелке — 0, 90, 180 или 270') },
+        rotation: z.number().default(0).describe('для template: поворот по часовой стрелке — 0, 90, 180 или 270'),
+        replace: z.boolean().default(false).describe('true — ставить призраки и поверх того, что мешает: мешающие постройки своей команды, деревья и камни помечаются на снос') },
       async (a) => {
         let items = a.items;
         if (a.template) {
@@ -2888,12 +3117,12 @@ export function createFactorioServer(botName, hooks) {
           items = Array.isArray(p.items) ? p.items : [];
         }
         if (!items) throw new Error('укажи items или template');
-        const out = await ghostAdd(a.name.trim(), items);
-        out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build';
+        const out = await ghostAdd(a.name.trim(), items, a.replace);
+        out.note = 'что нужно на постройку и чего не хватает — ghost_list; строить — ghost_build' + (out.marked_count ? ' (сначала сам снимет помеченное на снос)' : '');
         return out;
       }),
 
-    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает из списка, а по имени отвечает already_built=true и ghosts=0.',
+    def('ghost_list', 'План-призраки: что размечено и сколько это стоит. Без аргументов — список планов (имя, автор, сколько призраков осталось, границы). С name и/или областью (x, y, x2, y2) — призраки этого плана или все призраки команды в области, в том числе поставленные людьми: сколько осталось (ghosts), сколько каких предметов нужно (cost), сколько есть у тебя (have), чего не хватает (missing), границы (area), сколько построек под этими призраками помечено на снос (to_remove). С layout=true — ещё и сами призраки списком, ближайшие к тебе сверху (до 100). Построенные призраки из плана уходят сами; полностью построенный план исчезает из списка, а по имени отвечает already_built=true и ghosts=0.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
         layout: z.boolean().default(false).describe('приложить список призраков (до 100 ближайших)') },
@@ -2906,7 +3135,7 @@ export function createFactorioServer(botName, hooks) {
         return r;
       }),
 
-    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов. План, в котором призраков уже не осталось (всё построено), — не ошибка: already_built=true.',
+    def('ghost_build', 'План-призраки: построить призраки из инвентаря — план name и/или все призраки команды в области (x, y, x2, y2). Строит тем же способом, что place_many: персонаж сам идёт к ближайшим призракам и ставит всё, до чего дотягивается, в темпе опытного игрока (одинаковые подряд — до 30 в секунду, смена предмета — около пяти в секунду); направление, вход/выход подземного конвейера и рецепт берутся из призрака. Если под призраками есть постройки, помеченные на снос (ghost_place с replace=true, mark_remove), сначала снимает их руками — содержимое и сама постройка идут в инвентарь (removed); кончилось место — останавливается (stopped), разгрузись и повтори. Ставит только то, на что есть предметы; чего не хватило — в missing. Что не встало — в skipped с причиной. За один вызов — около трёх минут работы: если остались призраки (ghosts_left) — донеси предметы и повтори тот же вызов. План, в котором призраков уже не осталось (всё построено), — не ошибка: already_built=true.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
         wait_craft_s: waitCraftArg },
@@ -2922,6 +3151,28 @@ export function createFactorioServer(botName, hooks) {
         const built = [], skipped = new Map(), left = {};
         const deadline = Date.now() + 180_000;
         let stopped;
+        // Сначала снимается то, что помечено на снос под призраками (ghost_place с replace, mark_remove).
+        const removed = {}, notRemoved = [];
+        let inventoryFull = false;
+        if (q0.to_remove > 0) {
+          const tried = new Set();
+          while (!stopped) {
+            const qb = await run('ghost_q', { ...sel, limit: 0, blockers: 150 + tried.size });
+            const todo = (Array.isArray(qb.blockers) ? qb.blockers : []).filter((b) => !tried.has(`${b.name}@${b.x},${b.y}`));
+            if (!todo.length) break;
+            const r = await demolishMany(todo, deadline);
+            for (const [k, v] of Object.entries(r.removed)) removed[k] = (removed[k] || 0) + v;
+            for (const s of r.skipped) { tried.add(`${s.name}@${s.x},${s.y}`); notRemoved.push(s); }
+            inventoryFull = r.full;
+            stopped = r.stopped;
+          }
+        }
+        const removal = () => (Object.keys(removed).length || notRemoved.length ? { removed, not_removed: notRemoved.length ? notRemoved.slice(0, 15) : undefined } : {});
+        if (stopped) {
+          const q = await run('ghost_q', { ...sel, limit: 0 }).catch(() => null);
+          return { plan: sel.name, placed: 0, ...removal(), to_remove_left: q ? q.to_remove : undefined, ghosts_left: q ? q.ghosts : undefined, stopped, completed: false,
+            note: inventoryFull ? 'снос не закончен: освободи инвентарь (сложи снятое в сундук) и повтори тот же вызов' : 'снос не закончен: повтори тот же вызов' };
+        }
         for (;;) {
           const q = await run('ghost_q', { ...sel, limit: 150 });
           const have = { ...q.have };
@@ -2949,12 +3200,12 @@ export function createFactorioServer(botName, hooks) {
         for (const x of built) by[x.placed] = (by[x.placed] || 0) + 1;
         const miss = q && q.missing && Object.keys(q.missing).length ? q.missing : undefined;
         const sk = [...skipped.values()];
-        return { plan: sel.name, placed: built.length, waited_craft_s: waited ?? undefined, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
+        return { plan: sel.name, placed: built.length, ...removal(), waited_craft_s: waited ?? undefined, placed_by_name: by, left, ghosts_left: q ? q.ghosts : undefined, missing: miss,
           skipped: sk.slice(0, 15), skipped_count: sk.length, stopped, completed: q ? q.ghosts === 0 : undefined,
           note: q && q.ghosts > 0 && !miss && !sk.length ? 'не всё успел: повтори тот же вызов' : undefined };
       }),
 
-    def('ghost_clear', 'План-призраки: убрать призраки своих планов с карты (постройки не трогает). С name — план целиком, с name и областью (x, y, x2, y2) — только его часть в области, только с областью — призраки всех твоих планов в ней. Чужие планы и призраки, поставленные людьми, не трогаются.',
+    def('ghost_clear', 'План-призраки: убрать призраки своих планов с карты (постройки не трогает); метки сноса, которые эти планы поставили через replace, тоже снимаются (unmarked). С name — план целиком, с name и областью (x, y, x2, y2) — только его часть в области, только с областью — призраки всех твоих планов в ней. Чужие планы и призраки, поставленные людьми, не трогаются.',
       { name: z.string().optional().describe('имя плана'),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области') },
       (a) => {
@@ -2963,7 +3214,66 @@ export function createFactorioServer(botName, hooks) {
         return run('ghost_clear', sel);
       }),
 
-    def('insert_all', 'Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
+    def('mark_remove', 'Пометить на снос, как планировщиком разборки в игре: метка видна всем на карте (людям и ботам), снос можно спланировать заранее, а снять помеченное потом — remove_marked (или ghost_build, если сверху стоят призраки). Что помечать: либо область (x, y, x2, y2) до 200×200 клеток, либо points — список точек {x, y} (до 200). В области без names помечаются только постройки своей команды; names — только такие объекты (внутренние имена; tree — деревья, rock — камни и скалы). Идти никуда не нужно, но карта там должна быть открыта. Помеченная постройка сразу перестаёт работать (как в игре) — не помечай то, что ещё нужно. В ответе marked — сколько помечено, already — уже были помечены, by_name — по видам, list — первые 30. Снять метки — unmark_remove.',
+      { x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
+        points: z.array(z.object(coords)).min(1).max(200).optional().describe('точки вместо области'),
+        names: z.array(z.string()).min(1).max(30).optional().describe('помечать только такие объекты, например ["stone-furnace", "transport-belt", "tree"]') },
+      async (a) => {
+        const area = ghostArea(a);
+        if ((area.x1 === undefined) === !a.points) throw new Error('укажи либо область (x, y, x2, y2), либо points');
+        const r = await run('mark', { ...area, points: a.points, names: a.names });
+        if (!Array.isArray(r.list)) r.list = [];
+        return r;
+      }),
+
+    def('unmark_remove', 'Снять метки сноса (как отмена разборки в игре): в области (x, y, x2, y2) до 200×200 клеток или в точках points; names — только с таких объектов. Снимает любые метки команды в указанном месте, в том числе поставленные людьми и другими ботами, — указывай место точно. Постройка снова начинает работать.',
+      { x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
+        points: z.array(z.object(coords)).min(1).max(200).optional().describe('точки вместо области'),
+        names: z.array(z.string()).min(1).max(30).optional().describe('только такие объекты') },
+      async (a) => {
+        const area = ghostArea(a);
+        if ((area.x1 === undefined) === !a.points) throw new Error('укажи либо область (x, y, x2, y2), либо points');
+        const r = await run('mark', { ...area, points: a.points, names: a.names, unmark: true });
+        if (!Array.isArray(r.list)) r.list = [];
+        return r;
+      }),
+
+    def('marked_list', 'Что помечено на снос. С областью (x, y, x2, y2) — все метки команды в ней, в том числе поставленные людьми: marked — сколько, by_name — по видам, items — ближайшие к тебе (до 100): {name, x, y, by — какой бот пометил, plan — каким планом ghost_place}. Без аргументов — сводка по меткам, поставленным ботами: сколько, кто, границы. Только чтение.',
+      { x: z.number().optional(), y: z.number().optional(), x2: z.number().optional().describe('x противоположного угла области'), y2: z.number().optional().describe('y противоположного угла области'),
+        names: z.array(z.string()).min(1).max(30).optional().describe('только такие объекты') },
+      async (a) => {
+        const r = await run('marked_q', { ...ghostArea(a), names: a.names, limit: 100 });
+        for (const k of ['by_name', 'by_bot']) if (Array.isArray(r[k])) r[k] = {};
+        if (r.items && !Array.isArray(r.items)) r.items = [];
+        return r;
+      }),
+
+    def('remove_marked', 'Снести помеченное на снос в области (x, y, x2, y2): персонаж сам обходит помеченные постройки (метки mark_remove, ghost_place с replace и поставленные людьми), от ближних к дальним, и снимает их руками в инвентарь вместе с содержимым — в темпе игрока (каждая разборка занимает своё время: лента — доли секунды, дерево — около секунды, большой камень — несколько секунд). names — только такие объекты. Кончилось место в инвентаре — останавливается (stopped): сложи снятое в сундук и повтори. В ответе removed — что снято по видам, left — сколько помеченного осталось в области, skipped — что не вышло. Около трёх минут на вызов; не всё успел — повтори тот же вызов.',
+      { ...coords, x2: z.number().describe('x противоположного угла области'), y2: z.number().describe('y противоположного угла области'),
+        names: z.array(z.string()).min(1).max(30).optional().describe('только такие объекты, например ["stone-furnace"]; tree — деревья, rock — камни') },
+      async (a) => {
+        const area = ghostArea(a);
+        const deadline = Date.now() + 180_000;
+        const removed = {}, skipped = [], tried = new Set();
+        let stopped, full = false;
+        while (!stopped) {
+          const q = await run('marked_q', { ...area, names: a.names, limit: 150 + tried.size });
+          const todo = (Array.isArray(q.items) ? q.items : []).filter((b) => !tried.has(`${b.name}@${b.x},${b.y}`)).map(({ name, x, y, close }) => ({ name, x, y, close }));
+          if (!todo.length) break;
+          const r = await demolishMany(todo, deadline);
+          for (const [k, v] of Object.entries(r.removed)) removed[k] = (removed[k] || 0) + v;
+          for (const s of r.skipped) { tried.add(`${s.name}@${s.x},${s.y}`); skipped.push(s); }
+          full = r.full;
+          stopped = r.stopped;
+        }
+        const q = await run('marked_q', { ...area, names: a.names, limit: 0 }).catch(() => null);
+        const count = Object.values(removed).reduce((s, v) => s + v, 0);
+        return { removed_count: count, removed, left: q ? q.marked : undefined, skipped: skipped.length ? skipped.slice(0, 15) : undefined, stopped,
+          completed: q ? q.marked === 0 : undefined,
+          note: full ? 'освободи инвентарь (сложи снятое в сундук) и повтори тот же вызов' : undefined };
+      }),
+
+    def('insert_all','Положить предметы из инвентаря во все объекты одного вида рядом: заправить все печи или буры углём, раздать руду по печам. Обходит их пешком по очереди и кладёт в каждый до count штук.',
       { name: z.string().describe('внутреннее имя объектов, например stone-furnace или burner-mining-drill'), item: z.string().describe('что класть, например coal'),
         count: z.number().int().min(1).default(5).describe('сколько класть в каждый'), radius: z.number().min(1).max(40).default(20).describe('радиус поиска объектов от персонажа') },
       async (a) => {
