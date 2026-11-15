@@ -8,7 +8,7 @@ local U = require('agent.util')
 local G = {handlers = {}}
 
 local ACTIONS = {walk_to = 'идёт', mine = 'добывает', place = 'строит', build_ghosts = 'строит по плану', transfer = 'перекладывает',
-  configure = 'настраивает', wait = 'ждёт', craft = 'крафтит', say = 'говорит', research = 'исследования'}
+  configure = 'настраивает', repair = 'чинит', wait = 'ждёт', craft = 'крафтит', say = 'говорит', research = 'исследования'}
 local TAG_EVERY = 120
 local TEXT_COLOR = {0.8, 0.9, 1}
 local LINE_COLOR = {0.4, 0.8, 1, 0.6}

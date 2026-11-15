@@ -203,6 +203,66 @@ test('mine: отмена во время пакета возвращает от�
   ok(!st.mining, 'после отмены добыча остановлена');
 });
 
+test('repair: чинит в темпе игры, тратит ресурс ремкомплекта; цела — already; нет комплекта — no_item', async () => {
+  await reset({ 'repair-pack': 1 });
+  await world(`
+    local s = game.surfaces.nauvis
+    local t = s.create_entity{name = 'gun-turret', position = {A.ox + 34, A.oy + 16}, force = 'player'}
+    t.health = 300
+    local w = s.create_entity{name = 'stone-wall', position = {A.ox + 33.5, A.oy + 12.5}, force = 'player'}
+    w.health = 152
+    return true`);
+  const hp = (name) => world(`local e = game.surfaces.nauvis.find_entities_filtered{area = {{A.ox, A.oy}, {A.ox + 60, A.oy + 30}}, name = A.name}[1] return {hp = e.health}`, { name }).then((r) => r.hp);
+  // Турель: 100 единиц при 2 за тик — 50 тиков и 50 единиц ресурса комплекта.
+  let r = await call(A, 'repair', { target: P(34, 16) });
+  ok(r.ok && r.name === 'gun-turret' && r.health === 400 && r.repaired === 100 && r.ticks === 50 && r.tools_left === 1, JSON.stringify(r));
+  eq(await hp('gun-turret'), 400);
+  let dur = await world(`return {d = storage.agent.agents[A.name].entity.get_main_inventory().find_item_stack('repair-pack').durability}`, { name: NAME });
+  eq(dur.d, 250);
+  r = await call(A, 'repair', { target: P(34, 16) });
+  ok(r.ok && r.already && r.repaired === 0, JSON.stringify(r));
+  // Стена чинится вдвое быстрее (множитель ремонта 2): 198 единиц за 50 тиков.
+  r = await call(A, 'repair', { target: P(33.5, 12.5) });
+  ok(r.ok && r.health === 350 && r.repaired === 198 && r.ticks === 50, JSON.stringify(r));
+  // Комплект кончается посреди ремонта: починено ровно на остаток ресурса (200 тиков × 2), дальше no_item.
+  await world(`local e = game.surfaces.nauvis.find_entities_filtered{area = {{A.ox, A.oy}, {A.ox + 60, A.oy + 30}}, name = 'gun-turret'}[1] e.health = 1 return true`);
+  r = await call(A, 'repair', { target: P(34, 16), wait_s: 30 });
+  ok(!r.ok && r.error.code === 'no_item' && r.error.data.repaired === 399 || (r.ok && r.repaired === 399), JSON.stringify(r));
+  eq((await inv())['repair-pack'], undefined, 'комплект израсходован');
+  await world(`local e = game.surfaces.nauvis.find_entities_filtered{area = {{A.ox, A.oy}, {A.ox + 60, A.oy + 30}}, name = 'gun-turret'}[1] e.health = 100 return true`);
+  r = await call(A, 'repair', { target: P(34, 16) });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  eq(await hp('gun-turret'), 100, 'без комплекта прочность не растёт');
+  eq((await call(A, 'repair', { target: P(34, 16), item: 'iron-plate' })).http, 400);
+});
+
+test('repair: область с подходом — только повреждённое своей команды; без подхода — out_of_reach', async () => {
+  await reset({ 'repair-pack': 2 });
+  await world(`
+    local s = game.surfaces.nauvis
+    for i = 0, 2 do
+      local w = s.create_entity{name = 'stone-wall', position = {A.ox + 50.5, A.oy + 14.5 + i}, force = 'player'}
+      if i < 2 then w.health = 310 end
+    end
+    local en = s.create_entity{name = 'stone-wall', position = {A.ox + 50.5, A.oy + 18.5}, force = 'enemy'}
+    en.health = 100
+    return true`);
+  const area = { x1: O.x + 48, y1: O.y + 12, x2: O.x + 53, y2: O.y + 20 };
+  let r = await call(A, 'repair', { area });
+  ok(r.ok && r.total === 2 && r.done === 0 && r.skipped === 2 && r.items[0].code === 'out_of_reach', JSON.stringify(r));
+  r = await call(A, 'repair', { area, approach: true, wait_s: 60 });
+  ok(r.ok && r.total === 2 && r.done === 2 && r.walked > 5 && r.items.every((x) => x.health === 350 && x.repaired === 40 && x.ticks === 10), JSON.stringify(r));
+  const left = await world(`
+    local n, enemy = 0, 0
+    for _, e in pairs(game.surfaces.nauvis.find_entities_filtered{area = {{A.ox + 48, A.oy + 12}, {A.ox + 53, A.oy + 20}}, name = 'stone-wall'}) do
+      if e.force.name == 'enemy' then enemy = math.floor(e.health + 0.5) elseif e.health < e.max_health then n = n + 1 end
+    end
+    return {n = n, enemy = enemy}`);
+  eq(left, { n: 0, enemy: 100 });
+  r = await call(A, 'repair', { target: P(50.5, 18.5) });
+  ok(!r.ok && r.error.code === 'not_allowed', 'чужое не чинится: ' + JSON.stringify(r));
+});
+
 test('configure: рецепт, поворот, копирование настроек, фильтр', async () => {
   await reset({ 'assembling-machine-1': 2, inserter: 1, 'iron-plate': 10 });
   await call(A, 'place', { items: [{ item: 'assembling-machine-1', ...P(34.5, 15.5) }, { item: 'assembling-machine-1', ...P(34.5, 19.5) }, { item: 'inserter', ...P(32.5, 15.5), direction: 'north' }] });
