@@ -171,7 +171,14 @@ export const API = {
     params: {
       plan: 'имя плана — метка на поставленных призраках и пометках (по ней ghosts, build_ghosts, ghost_clear, mine)',
       items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (filters, control_behavior, items)}; ' +
-        'рельсы стоят на сетке 2×2 — центр прямого рельса в нечётных x и y, как у уже построенных',
+        'рельсы стоят на сетке 2×2 — центр прямого рельса в нечётных x и y, как у уже построенных. ' +
+        'Поворот рельсов на 90° (стоимость — предметы rail):От последнего прямого рельса (x, y) direction north ' +
+        'путь уходит на север и сворачивает на восток: curved-rail-a (x, y−3) northeast; curved-rail-b (x+2, y−8) northeast; curved-rail-b (x+6, y−12) west; ' +
+        'curved-rail-a (x+11, y−14) west; дальше прямые straight-rail direction east от (x+14, y−14) с шагом 2 по x. Эта же дуга соединяет путь, идущий ' +
+        'с востока на запад, с путём на юг. Остальные три дуги — поворот набора на 90° по часовой вокруг (x, y), сколько нужно раз: смещение (dx, dy) → (−dy, dx), ' +
+        'direction — следующее через одно по кругу north, northeast, east, southeast, south, southwest, west, northwest (north → east, northeast → southeast, west → north). ' +
+        'Диагональ (поворот на 45°): между двумя curved-rail-b вставь n диагональных straight-rail direction northeast в (x+5+2i, y−11−2i), i = 0…n−1, ' +
+        'а всё, что после них, сдвинь на (+2n, −2n). Перед постановкой проверь blueprint_check, после постройки — trains и inspect',
       tiles: 'список плитки {name: stone-path | concrete | landfill | …, x, y}',
       blueprint: 'или имя сохранённого чертежа', string: 'или строка чертежа в формате игры',
       x: 'клетка северо-западного угла чертежа', y: '',

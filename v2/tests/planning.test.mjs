@@ -297,4 +297,45 @@ test('рельсы в списке: призраки встают точно в 
   }
 });
 
+test('рельсы: поворот на 90° из help встаёт призраками и соединяет пути — все четыре поворота и диагональная вставка', async () => {
+  // Набор из описания ghost_place: смещения от прямого рельса (x, y), идущего на север; direction — число из 16.
+  const turn = (diag = 0) => {
+    const s = 2 * diag;
+    const list = [['straight-rail', 0, 2, 0], ['straight-rail', 0, 0, 0], ['curved-rail-a', 0, -3, 2], ['curved-rail-b', 2, -8, 2]];
+    for (let i = 0; i < diag; i++) list.push(['straight-rail', 5 + 2 * i, -11 - 2 * i, 2]);
+    list.push(['curved-rail-b', 6 + s, -12 - s, 12], ['curved-rail-a', 11 + s, -14 - s, 12], ['straight-rail', 14 + s, -14 - s, 4], ['straight-rail', 16 + s, -14 - s, 4]);
+    return list;
+  };
+  const NAMES = { 0: 'north', 2: 'northeast', 4: 'east', 6: 'southeast', 8: 'south', 10: 'southwest', 12: 'west', 14: 'northwest' };
+  // Поворот набора на 90° по часовой: (dx, dy) → (−dy, dx), direction + 4.
+  const rotate = (list, k) => list.map(([name, dx, dy, d]) => {
+    for (let i = 0; i < k; i++) [dx, dy, d] = [-dy, dx, (d + 4) % 16];
+    return [name, dx, dy, d];
+  });
+  const cases = [0, 1, 2, 3].map((k) => ({ label: 'поворот ' + k * 90, list: rotate(turn(), k), px: 31, py: 15 }));
+  cases.push({ label: 'с диагональю', list: turn(1), px: 11, py: 27 });
+  for (const c of cases) {
+    await reset({}, 2.5, 2.5);
+    const items = c.list.map(([name, dx, dy, d]) => ({ name, ...P(c.px + dx, c.py + dy), direction: NAMES[d] }));
+    const r = await call(A, 'ghost_place', { plan: 'turn', items });
+    ok(r.ok && r.placed === items.length && r.blocked === 0, `${c.label}: ` + JSON.stringify(r));
+    const w = await world(`local s = game.surfaces.nauvis
+      local area = {{A.ox - 2, A.oy - 2}, {A.ox + 62, A.oy + 32}}
+      local at = {}
+      for _, g in pairs(s.find_entities_filtered{area = area, type = 'entity-ghost'}) do at[#at + 1] = g.ghost_name .. ' ' .. g.position.x .. ' ' .. g.position.y g.revive() end
+      table.sort(at)
+      local first = s.find_entities_filtered{area = area, name = 'straight-rail', position = {A.x, A.y}, radius = 0.5}[1]
+      local best = 0
+      for _, d in pairs{defines.rail_direction.front, defines.rail_direction.back} do
+        local re, n = first.get_rail_end(d), 0
+        while n < 50 and re.move_natural() do n = n + 1 end
+        best = math.max(best, n)
+      end
+      return {at = at, chain = best, rails = s.count_entities_filtered{area = area, type = {'straight-rail', 'curved-rail-a', 'curved-rail-b', 'half-diagonal-rail'}}}`,
+      { x: items[0].x, y: items[0].y });
+    eq(w.at, items.map((e) => `${e.name} ${e.x} ${e.y}`).sort(), `${c.label}: призраки стоят там, где заданы`);
+    eq([w.rails, w.chain], [items.length, items.length - 1], `${c.label}: путь от первого рельса до последнего непрерывен`);
+  }
+});
+
 run(async () => { admin.close(); });
