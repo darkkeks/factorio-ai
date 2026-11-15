@@ -596,6 +596,16 @@ function scanBotLog() {
   }
 }
 
+// Архив: сессии и субагенты, которые зрители убрали с глаз. Общий для всех, хранится в state-map.json.
+const MAP_STATE = path.join(ROOT, 'state-map.json');
+let archived = new Set(); // "id сессии" | "id сессии/id субагента"
+try { archived = new Set(JSON.parse(fs.readFileSync(MAP_STATE, 'utf8')).archived ?? []); } catch { /* файла ещё нет */ }
+function setArchived(key, on) {
+  if (on) archived.add(key); else archived.delete(key);
+  fs.writeFileSync(MAP_STATE + '.tmp', JSON.stringify({ archived: [...archived] }, null, 1));
+  fs.renameSync(MAP_STATE + '.tmp', MAP_STATE);
+}
+
 let secrets = null;
 function redact(text) {
   if (!secrets) {
@@ -649,6 +659,7 @@ function sessionTree(id) {
     // «Работает» — не отмечен завершённым и писал в лог недавно (после убитой сессии отметка не появляется никогда).
     running: !m.meta.finished && now - m.mtime < 300_000,
   }));
+  // Отметку архива ставим при выдаче: она меняется независимо от файлов.
   const byTool = new Map(metas.filter((m) => m.meta.toolUseId).map((m) => [m.meta.toolUseId, m.agent]));
   const res = { key, nodes, byTool, parents };
   treeCache.set(id, res);
@@ -723,7 +734,7 @@ function sessionList(bot) {
     try { st = fs.statSync(sessionFile(id)); } catch { continue; }
     let title = '';
     try { const tail = readRange(sessionFile(id), Math.max(0, st.size - 300_000), st.size).toString('utf8'); const m = [...tail.matchAll(/"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"/g)].pop(); if (m) title = JSON.parse(`"${m[1]}"`); } catch { /* без названия */ }
-    out.push({ id, title: clip(title, 120), mtime: Math.floor(st.mtimeMs), created: Math.floor(st.birthtimeMs), current: current.has(id), active: Date.now() - st.mtimeMs < 120_000 });
+    out.push({ id, archived: archived.has(id), title: clip(title, 120), mtime: Math.floor(st.mtimeMs), created: Math.floor(st.birthtimeMs), current: current.has(id), active: Date.now() - st.mtimeMs < 120_000 });
   }
   return out.sort((a, b) => b.mtime - a.mtime);
 }
@@ -762,6 +773,19 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const reply = (code, type, body, cache = 'no-cache') => res.writeHead(code, { 'content-type': type, 'cache-control': cache }).end(body);
   try {
+    if (req.method === 'POST' && url.pathname === '/api/session/archive') {
+      // Убрать сессию или субагента в архив либо вернуть. Доступно любому зрителю: это только отметка, данные не удаляются.
+      let body = '';
+      for await (const chunk of req) { body += chunk; if (body.length > 2000) return reply(413, 'text/plain', ''); }
+      const m = JSON.parse(body);
+      scanBotLog();
+      const agent = String(m.agent ?? '');
+      if (!botSessions.get(String(m.bot))?.has(m.id) || !/^[a-f0-9]{0,40}$/.test(agent)) return reply(404, 'application/json', '{"error":"нет такой сессии"}');
+      if (agent && !sessionTree(m.id).nodes.some((n) => n.agent === agent)) return reply(404, 'application/json', '{"error":"нет такого субагента"}');
+      setArchived(agent ? `${m.id}/${agent}` : m.id, !!m.archived);
+      log(`архив: ${m.bot} ${m.id}${agent ? '/' + agent : ''} → ${m.archived ? 'в архив' : 'из архива'}`);
+      return reply(200, 'application/json', '{"ok":true}');
+    }
     if (req.method !== 'GET' && req.method !== 'HEAD') return reply(405, 'text/plain', '');
     if (url.pathname === '/') return reply(200, 'text/html; charset=utf-8', fs.readFileSync(path.join(WEB, 'index.html')));
     const ic = url.pathname.match(/^\/icon\/([a-z0-9-]{1,80})\.png$/);
@@ -785,7 +809,7 @@ const server = http.createServer(async (req, res) => {
       const id = q.get('id') ?? '', agent = q.get('agent') ?? '';
       scanBotLog();
       if (!botSessions.get(bot)?.has(id) || !/^[a-f0-9]{0,40}$/.test(agent)) return reply(404, 'application/json', '{"error":"нет такой сессии"}');
-      if (url.pathname === '/api/session/tree') return json({ nodes: sessionTree(id).nodes, now: Date.now() });
+      if (url.pathname === '/api/session/tree') return json({ nodes: sessionTree(id).nodes.map((n) => ({ ...n, archived: archived.has(`${id}/${n.agent}`) })), now: Date.now() });
       if (url.pathname === '/api/session/log') {
         const num = (k) => (q.has(k) && /^\d{1,15}$/.test(q.get(k)) ? Number(q.get(k)) : null);
         try { return json(sessionLog(id, agent, num('after'), num('before'))); } catch { return reply(404, 'application/json', '{"error":"нет такого лога"}'); }

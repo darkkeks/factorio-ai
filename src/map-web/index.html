@@ -72,6 +72,12 @@
   .node:hover { background: #2c2c2c; }
   .node.sel { background: #3d3418; }
   .node small { display: block; color: #9a968c; }
+  .node { position: relative; }
+  .node.arch { opacity: .5; }
+  .node .toarch { position: absolute; right: 4px; top: 4px; display: none; padding: 0 6px; font-size: 12px; }
+  .node:hover .toarch { display: block; }
+  #sess-show-l { white-space: nowrap; color: #9a968c; cursor: pointer; }
+  @media (hover: none) { .node .toarch { display: block; } }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; margin-right: 6px; }
   .dot.run { background: #5fae4e; box-shadow: 0 0 5px #5fae4e; }
   .ev { margin: 6px 0; overflow-wrap: anywhere; }
@@ -121,7 +127,7 @@
   <video id="live-video" muted autoplay playsinline></video>
 </div>
 <div id="sess" class="box hidden">
-  <header><b id="sess-bot"></b><select id="sess-list" title="Сессия"></select><button id="sess-close">✕</button></header>
+  <header><b id="sess-bot"></b><select id="sess-list" title="Сессия"></select><button id="sess-arch" title="Убрать эту сессию в архив (или вернуть)">в архив</button><label id="sess-show-l" title="Показывать убранное в архив"><input type="checkbox" id="sess-show"> архив <span id="sess-archn"></span></label><button id="sess-close">✕</button></header>
   <div id="sess-main"><div id="sess-tree"></div><div id="sess-log"></div></div>
 </div>
 <div id="bot" class="box hidden">
@@ -413,15 +419,40 @@ async function openSessions(bot) {
   $('sess-bot').textContent = bot;
   $('sess-tree').innerHTML = ''; $('sess-log').innerHTML = '<div class="muted">загрузка…</div>';
   try {
-    const list = await api('api/sessions?bot=' + encodeURIComponent(bot));
-    if (!list.length) { $('sess-list').innerHTML = ''; $('sess-log').innerHTML = '<div class="muted">у этого бота нет сессий Claude (он управляется извне или ещё не запускался)</div>'; return; }
-    $('sess-list').innerHTML = list.map((x) => `<option value="${x.id}">${x.active ? '● ' : ''}${esc(dt(x.mtime))}${x.current ? ' · текущая' : ''}${x.title ? ' · ' + esc(x.title) : ''}</option>`).join('');
-    pickSession((list.find((x) => x.current) || list[0]).id);
+    SS.list = await api('api/sessions?bot=' + encodeURIComponent(bot));
+    renderSessionList(true);
   } catch { $('sess-log').innerHTML = '<div class="muted">не удалось загрузить</div>'; }
 }
+// Архив — общий для всех зрителей: убранные сессии и субагенты не видны, пока не включена галочка «архив».
+function renderSessionList(pick) {
+  const all = SS.list || [], shown = all.filter((x) => SS.showArch || !x.archived), n = all.filter((x) => x.archived).length;
+  $('sess-archn').textContent = n ? `(сессий: ${n})` : '';
+  $('sess-list').innerHTML = shown.map((x) => `<option value="${x.id}">${x.archived ? '[архив] ' : ''}${x.active ? '● ' : ''}${esc(dt(x.mtime))}${x.current ? ' · текущая' : ''}${x.title ? ' · ' + esc(x.title) : ''}</option>`).join('');
+  if (!shown.length) {
+    SS.id = null; clearInterval(SS.timer); SS.gen++;
+    $('sess-tree').innerHTML = '';
+    $('sess-log').innerHTML = `<div class="muted">${all.length ? 'все сессии этого бота в архиве — включите галочку «архив»' : 'у этого бота нет сессий Claude (он управляется извне или ещё не запускался)'}</div>`;
+    $('sess-arch').style.display = 'none';
+    return;
+  }
+  $('sess-arch').style.display = '';
+  if (pick || !shown.some((x) => x.id === SS.id)) pickSession((shown.find((x) => x.current) || shown[0]).id);
+  else { $('sess-list').value = SS.id; syncArchBtn(); }
+}
+function syncArchBtn() { const cur = (SS.list || []).find((x) => x.id === SS.id); $('sess-arch').textContent = cur && cur.archived ? 'вернуть из архива' : 'в архив'; }
+async function archive(agent, on) {
+  const r = await fetch('api/session/archive', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot: SS.bot, id: SS.id, agent, archived: on }) });
+  if (!r.ok) return;
+  if (agent) { if (on && SS.agent === agent && !SS.showArch) pickNode(''); else loadTree().catch(() => {}); return; }
+  const cur = SS.list.find((x) => x.id === SS.id);
+  if (cur) cur.archived = on;
+  renderSessionList(false);
+}
+$('sess-arch').onclick = () => { const cur = (SS.list || []).find((x) => x.id === SS.id); if (cur) archive('', !cur.archived); };
+$('sess-show').onchange = (e) => { SS.showArch = e.target.checked; renderSessionList(false); if (SS.id) loadTree().catch(() => {}); };
 function closeSessions() { clearInterval(SS.timer); SS.gen++; $('sess').classList.add('hidden'); }
 function pickSession(id) {
-  SS.id = id; $('sess-list').value = id;
+  SS.id = id; $('sess-list').value = id; syncArchBtn();
   clearInterval(SS.timer);
   pickNode('');
   SS.timer = setInterval(pollSession, 2000);
@@ -431,9 +462,11 @@ async function loadTree() {
   const t = await api(`api/session/tree?${sq()}`);
   if (gen !== SS.gen) return;
   SS.nodes = t.nodes;
-  const kids = (parent, depth) => t.nodes.filter((n) => n.parent === parent).map((n) =>
-    `<div class="node${SS.agent === n.agent ? ' sel' : ''}" data-agent="${n.agent}" style="margin-left:${depth * 14}px"><span class="dot${n.running ? ' run' : ''}"></span>${esc(n.description || n.agent)}<small>${n.running ? 'работает' : n.finished ? 'завершён' : 'остановлен'} · ${esc(tm(n.mtime))}${n.model ? ' · ' + esc(n.model) : ''}</small></div>${kids(n.agent, depth + 1)}`).join('');
-  $('sess-tree').innerHTML = `<div class="node${SS.agent === '' ? ' sel' : ''}" data-agent=""><span class="dot${t.nodes.some((n) => n.running) ? ' run' : ''}"></span>главная сессия<small>субагентов: ${t.nodes.length}, работает: ${t.nodes.filter((n) => n.running).length}</small></div>${kids('', 1)}`;
+  const vis = t.nodes.filter((n) => SS.showArch || !n.archived), hidden = t.nodes.length - t.nodes.filter((n) => !n.archived).length;
+  const kids = (parent, depth) => vis.filter((n) => n.parent === parent).map((n) =>
+    `<div class="node${SS.agent === n.agent ? ' sel' : ''}${n.archived ? ' arch' : ''}" data-agent="${n.agent}" style="margin-left:${depth * 14}px"><span class="dot${n.running ? ' run' : ''}"></span>${esc(n.description || n.agent)}<button class="toarch" data-arch="${n.agent}" data-on="${n.archived ? 0 : 1}">${n.archived ? 'вернуть' : 'в архив'}</button><small>${n.archived ? 'в архиве · ' : ''}${n.running ? 'работает' : n.finished ? 'завершён' : 'остановлен'} · ${esc(tm(n.mtime))}${n.model ? ' · ' + esc(n.model) : ''}</small></div>${kids(n.agent, depth + 1)}`).join('');
+  // Субагент, чей родитель скрыт в архиве, скрывается вместе с ним.
+  $('sess-tree').innerHTML = `<div class="node${SS.agent === '' ? ' sel' : ''}" data-agent=""><span class="dot${t.nodes.some((n) => n.running) ? ' run' : ''}"></span>главная сессия<small>субагентов: ${t.nodes.length - hidden}, работает: ${t.nodes.filter((n) => n.running).length}${hidden ? `, в архиве: ${hidden}` : ''}</small></div>${kids('', 1)}`;
 }
 function evHtml(e) {
   const t = `<time>${tm(e.ts)}</time>`;
@@ -500,7 +533,12 @@ $('sess-log').onclick = async (e) => {
   if (r.start <= 0) e.target.remove();
   box.scrollTop += box.scrollHeight - h;
 };
-$('sess-tree').onclick = (e) => { const n = e.target.closest('.node'); if (n) pickNode(n.dataset.agent); };
+$('sess-tree').onclick = (e) => {
+  const a = e.target.closest('.toarch');
+  if (a) return archive(a.dataset.arch, a.dataset.on === '1');
+  const n = e.target.closest('.node');
+  if (n) pickNode(n.dataset.agent);
+};
 $('sess-list').onchange = (e) => pickSession(e.target.value);
 $('sess-close').onclick = closeSessions;
 $('bot-sess').onclick = () => openSessions(selected);
