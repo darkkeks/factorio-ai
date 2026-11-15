@@ -141,6 +141,8 @@ export const API = {
       input_priority: 'left | right | none — разделитель', output_priority: 'left | right | none — разделитель',
       stack_size: 'ограничение захвата манипулятора', bar: 'сколько слотов сундука оставить открытыми (false — снять ограничение)',
       station: 'имя станции', trains_limit: 'предел поездов станции (false — снять)',
+      schedule: 'цель — локомотив или вагон: расписание поезда целиком, [{station, wait: [{type, ticks? | seconds?, compare?: and | or, item? | fluid?, comparator?, count?}]}]; type: time | inactivity (ticks или seconds), full, empty, not_empty, fuel_full, passenger_present, passenger_not_present, item_count | fluid_count (item | fluid, comparator, count); станции — только существующие (см. trains); false — очистить. В ответе train: {id, manual, state, schedule}',
+      manual_mode: 'цель — локомотив или вагон: false — пустить поезд по расписанию, true — ручной режим (поезд останавливается)',
       control: 'настройки логики: объект полей управляющего поведения (circuit_enable_disable, circuit_condition, …)',
       wire: '{to: цель, type: red | green | copper, disconnect?} — провод между двумя объектами в досягаемости',
       copy_from: 'цель — скопировать настройки с другой постройки (как shift-клики)',
@@ -329,7 +331,7 @@ export const API = {
     result: '{in_network, roboports, logistic_robots: {total, available}, construction_robots, items: {предмет: количество}, requesters, providers, storages} или {in_network: false, networks}',
     example: {},
   },
-  trains: { kind: 'query', summary: 'Обзор поездов и станций команды.', params: {}, result: '{trains: [{id, state, speed, x, y, at_station, going_to, schedule, cargo}], stations: [{station, x, y, trains_count, trains_limit}]}', example: {} },
+  trains: { kind: 'query', summary: 'Обзор поездов и станций команды.', params: {}, result: '{trains: [{id, state, manual, speed, x, y, at_station, going_to, schedule, schedule_current, stops: [{station, wait: [{type, ticks?, …}]}], cargo}] (расписание задаётся через configure: schedule, manual_mode), stations: [{station, x, y, trains_count, trains_limit}]}', example: {} },
   recipes: {
     kind: 'query',
     summary: 'Справочник рецептов: по имени рецепта или предмета, который он даёт (name), либо все рецепты с ингредиентом (uses).',

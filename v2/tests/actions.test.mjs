@@ -263,6 +263,52 @@ test('repair: область с подходом — только поврежд
   ok(!r.ok && r.error.code === 'not_allowed', 'чужое не чинится: ' + JSON.stringify(r));
 });
 
+test('configure: расписание и режим поезда', async () => {
+  await reset();
+  const made = await world(`
+    local s = game.surfaces.nauvis
+    for i = 0, 9 do s.create_entity{name = 'straight-rail', position = {A.ox + 21 + i * 2, A.oy + 19}, direction = defines.direction.east, force = 'player'} end
+    local loco = s.create_entity{name = 'locomotive', position = {A.ox + 30, A.oy + 19}, direction = defines.direction.east, force = 'player'}
+    local a = s.create_entity{name = 'train-stop', position = {A.ox + 39, A.oy + 21}, direction = defines.direction.east, force = 'player'}
+    local b = s.create_entity{name = 'train-stop', position = {A.ox + 21, A.oy + 17}, direction = defines.direction.west, force = 'player'}
+    a.backer_name = 'T-sched-A'
+    b.backer_name = 'T-sched-B'
+    return {x = loco.position.x, y = loco.position.y, manual = loco.train.manual_mode}`);
+  const loco = { x: made.x, y: made.y, name: 'locomotive' };
+  let r = await call(A, 'configure', { target: loco, schedule: [
+    { station: 'T-sched-A', wait: [{ type: 'full' }, { type: 'inactivity', seconds: 5, compare: 'or' }] },
+    { station: 'T-sched-B', wait: [{ type: 'item_count', item: 'iron-plate', comparator: '<', count: 10 }, { type: 'time', ticks: 600 }] },
+  ] });
+  ok(r.ok && r.train && r.train.schedule.length === 2, JSON.stringify(r));
+  eq(r.train.schedule[0].station, 'T-sched-A');
+  eq(r.train.schedule[0].wait[1].ticks, 300);
+  eq(r.train.schedule[0].wait[1].compare, 'or');
+  eq(r.train.schedule[1].wait[0].item, 'iron-plate');
+  eq(r.train.schedule[1].wait[0].count, 10);
+  eq(r.train.manual, true);
+  const tr = (await call(A, 'trains')).trains.find((t) => t.id === r.train.id);
+  ok(tr && tr.stops.length === 2 && tr.stops[1].wait[1].type === 'time', JSON.stringify(tr));
+  r = await call(A, 'configure', { target: loco, manual_mode: false });
+  ok(r.ok && r.train.manual === false, JSON.stringify(r));
+  r = await call(A, 'configure', { target: loco, manual_mode: true });
+  ok(r.ok && r.train.manual === true, JSON.stringify(r));
+  r = await call(A, 'configure', { target: loco, schedule: [{ station: 'T-нет-такой' }] });
+  ok(!r.ok && r.error.code === 'not_found', JSON.stringify(r));
+  r = await call(A, 'configure', { target: loco, schedule: [{ station: 'T-sched-A', wait: [{ type: 'circuit' }] }] });
+  ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+  r = await call(A, 'configure', { target: P(39, 21), schedule: [{ station: 'T-sched-A' }] });
+  ok(!r.ok && r.error.code === 'bad_request', 'не поезд: ' + JSON.stringify(r));
+  r = await call(A, 'configure', { target: loco, schedule: false });
+  ok(r.ok && r.train.schedule.length === 0, JSON.stringify(r));
+  await reset({}, 30.5, 2.5);
+  await world(`local s = game.surfaces.nauvis
+    for i = 0, 9 do s.create_entity{name = 'straight-rail', position = {A.ox + 21 + i * 2, A.oy + 19}, direction = defines.direction.east, force = 'player'} end
+    s.create_entity{name = 'locomotive', position = {A.ox + 30, A.oy + 19}, direction = defines.direction.east, force = 'player'}
+    return true`);
+  r = await call(A, 'configure', { target: loco, manual_mode: false });
+  ok(!r.ok && r.error.code === 'out_of_reach', 'далеко: ' + JSON.stringify(r));
+});
+
 test('configure: рецепт, поворот, копирование настроек, фильтр', async () => {
   await reset({ 'assembling-machine-1': 2, inserter: 1, 'iron-plate': 10 });
   await call(A, 'place', { items: [{ item: 'assembling-machine-1', ...P(34.5, 15.5) }, { item: 'assembling-machine-1', ...P(34.5, 19.5) }, { item: 'inserter', ...P(32.5, 15.5), direction: 'north' }] });

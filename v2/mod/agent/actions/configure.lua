@@ -26,6 +26,61 @@ local function try(what, fn)
   if not ok then U.fail('bad_request', what .. ': ' .. tostring(err)) end
 end
 
+-- Расписание поезда: то, что игрок набирает в окне поезда. Станции — только существующие у своей команды (как в списке
+-- окна), условия ожидания — простые: по времени, простою, заполненности и количеству груза.
+local RAIL_STOCK = {locomotive = true, ['cargo-wagon'] = true, ['fluid-wagon'] = true, ['artillery-wagon'] = true}
+local WAIT_PLAIN = {full = true, empty = true, not_empty = true, fuel_full = true, passenger_present = true, passenger_not_present = true}
+local WAIT_TICKS = {time = true, inactivity = true}
+local WAIT_COUNT = {item_count = 'item', fluid_count = 'fluid'}
+local COMPARATORS = {['<'] = true, ['>'] = true, ['='] = true, ['>='] = true, ['<='] = true, ['!='] = true}
+local WAIT_HELP = 'time | inactivity (ticks или seconds), full, empty, not_empty, fuel_full, passenger_present, passenger_not_present, item_count | fluid_count (item | fluid, comparator, count)'
+local TRAIN_STATE = {}
+for name, v in pairs(defines.train_state) do TRAIN_STATE[v] = name end
+
+local function schedule_records(e, list)
+  if type(list) ~= 'table' then U.fail('bad_request', 'schedule: список {station, wait: [...]} или false — очистить') end
+  if #list > 50 then U.fail('bad_request', 'schedule: не больше 50 остановок') end
+  local records = {}
+  for i, rec in ipairs(list) do
+    local where = 'schedule[' .. i .. ']'
+    if type(rec) ~= 'table' or type(rec.station) ~= 'string' then U.fail('bad_request', where .. ': нужен station — имя станции') end
+    if #game.train_manager.get_train_stops{force = e.force, surface = e.surface, station_name = rec.station} == 0 then
+      U.fail('not_found', where .. ': у команды нет станции с именем ' .. rec.station .. ' (список — trains)')
+    end
+    local waits = rec.wait or {}
+    if type(waits) ~= 'table' then U.fail('bad_request', where .. '.wait: список условий') end
+    if waits.type ~= nil then waits = {waits} end
+    if #waits > 10 then U.fail('bad_request', where .. '.wait: не больше 10 условий') end
+    local conds = {}
+    for j, w in ipairs(waits) do
+      local ww = where .. '.wait[' .. j .. ']'
+      if type(w) == 'string' then w = {type = w} end
+      if type(w) ~= 'table' then U.fail('bad_request', ww .. ': {type, …}; type: ' .. WAIT_HELP) end
+      local c = {type = w.type, compare_type = w.compare or 'and'}
+      if c.compare_type ~= 'and' and c.compare_type ~= 'or' then U.fail('bad_request', ww .. '.compare: and | or') end
+      if WAIT_TICKS[w.type] then
+        local ticks = w.ticks or (type(w.seconds) == 'number' and w.seconds * 60)
+        if type(ticks) ~= 'number' or ticks < 1 or ticks > 4000000 then U.fail('bad_request', ww .. ': нужно ticks или seconds (от 1 тика)') end
+        c.ticks = math.floor(ticks)
+      elseif WAIT_COUNT[w.type] then
+        local kind = WAIT_COUNT[w.type]
+        local name = w[kind]
+        local proto = type(name) == 'string' and (kind == 'item' and prototypes.item[name] or kind == 'fluid' and prototypes.fluid[name])
+        if not proto then U.fail('bad_request', ww .. ': нужен ' .. kind .. ' — имя ' .. (kind == 'item' and 'предмета' or 'жидкости')) end
+        local cmp = w.comparator or '>='
+        if not COMPARATORS[cmp] then U.fail('bad_request', ww .. '.comparator: <, >, =, >=, <=, !=') end
+        if type(w.count) ~= 'number' then U.fail('bad_request', ww .. ': нужен count — число') end
+        c.condition = {first_signal = {type = kind, name = name}, comparator = cmp, constant = math.floor(w.count)}
+      elseif not WAIT_PLAIN[w.type] then
+        U.fail('bad_request', ww .. '.type: ' .. WAIT_HELP)
+      end
+      conds[j] = c
+    end
+    records[i] = {station = rec.station, wait_conditions = conds}
+  end
+  return records
+end
+
 local function configure_one(A, it)
   local e, ent = A.entity, it.entity
   if not ent.valid then U.fail('not_found', 'объекта уже нет') end
@@ -101,6 +156,29 @@ local function configure_one(A, it)
   end
   if p.trains_limit ~= nil then try('trains_limit', function() ent.trains_limit = p.trains_limit == false and nil or p.trains_limit end) end
 
+  -- Поезд: расписание и ручной/автоматический режим — окно поезда, открытое у локомотива или вагона в досягаемости.
+  if p.schedule ~= nil or p.manual_mode ~= nil then
+    local train = RAIL_STOCK[ent.type] and ent.train
+    if not train then U.fail('bad_request', 'schedule, manual_mode: цель — локомотив или вагон поезда') end
+    if p.schedule ~= nil then
+      local records = p.schedule == false and {} or schedule_records(e, p.schedule)
+      try('schedule', function()
+        if #records == 0 then
+          train.schedule = nil
+        else
+          local old = train.schedule
+          local cur = old and old.current or 1
+          train.schedule = {current = cur <= #records and cur or 1, records = records}
+        end
+      end)
+    end
+    if p.manual_mode ~= nil then
+      if type(p.manual_mode) ~= 'boolean' then U.fail('bad_request', 'manual_mode: true | false') end
+      try('manual_mode', function() train.manual_mode = p.manual_mode end)
+    end
+    done.train = {id = train.id, manual = train.manual_mode, state = TRAIN_STATE[train.state], schedule = U.list(U.schedule(train))}
+  end
+
   -- Настройки логики: поля управляющего поведения постройки (то, что игрок задаёт в её окне логической сети).
   if p.control ~= nil then
     if type(p.control) ~= 'table' then U.fail('bad_request', 'control: объект с полями управляющего поведения') end
@@ -134,7 +212,7 @@ local function configure_one(A, it)
 end
 
 local SETTINGS = {'copy_from', 'recipe', 'recipe_quality', 'direction', 'rotate', 'filters', 'filter_mode', 'input_priority',
-  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'control', 'wire'}
+  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'control', 'wire'}
 
 local function check_one(it, where)
   if type(it) ~= 'table' or type(it.target) ~= 'table' then U.fail('bad_request', where .. ': нужен target — {unit} или {x, y, name?}') end

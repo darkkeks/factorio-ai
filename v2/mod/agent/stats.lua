@@ -335,6 +335,7 @@ O.register('trains', {agent = true, fn = function(A, p)
       r.schedule = {}
       for i, rec in ipairs(sch.records) do r.schedule[i] = rec.station or (rec.rail and 'rail') or '?' end
       r.schedule_current = sch.current
+      if #trains < 50 then r.stops = U.list(U.schedule(t)) end
     end
     local cargo = {}
     for _, s in pairs(t.get_contents()) do cargo[U.item_key(s.name, s.quality)] = s.count end

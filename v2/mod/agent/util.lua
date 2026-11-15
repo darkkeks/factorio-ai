@@ -87,6 +87,33 @@ function U.item_key(name, quality)
   return name
 end
 
+--- Расписание поезда, как в его окне: [{station, wait: [{type, ticks?, compare?, item? | fluid?, comparator?, count?}]}].
+function U.schedule(train)
+  local sch = train.schedule
+  local out = {}
+  if not sch then return out end
+  for i, rec in ipairs(sch.records) do
+    local r = {station = rec.station or (rec.rail and 'rail') or '?'}
+    if rec.temporary then r.temporary = true end
+    local wait = {}
+    for j, w in ipairs(rec.wait_conditions or {}) do
+      local c = {type = w.type}
+      if w.ticks then c.ticks = w.ticks end
+      if j > 1 then c.compare = w.compare_type end
+      local cond = w.condition
+      if cond and (w.type == 'item_count' or w.type == 'fluid_count') then
+        local sig = cond.first_signal
+        if sig then c[w.type == 'item_count' and 'item' or 'fluid'] = sig.name end
+        c.comparator, c.count = cond.comparator, cond.constant
+      end
+      wait[j] = c
+    end
+    if #wait > 0 then r.wait = wait end
+    out[i] = r
+  end
+  return out
+end
+
 --- Сколько предметов (с учётом качества) у сущности или в инвентаре.
 function U.count(holder, name, quality)
   return holder.get_item_count{name = name, quality = quality or 'normal'}
