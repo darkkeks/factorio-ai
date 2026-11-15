@@ -19,6 +19,8 @@ local function fail(m) error(m, 0) end
 local function bot()
   local e = storage.vb[A.bot]
   if e and e.valid then return e end
+  -- Персонаж был и погиб: помечаем для журнала событий (EVENTS), иначе новый персонаж скроет смерть.
+  if e then storage.vb_dead = storage.vb_dead or {} storage.vb_dead[A.bot] = game.tick end
   local S = game.surfaces.nauvis
   local F = game.forces.player
   e = S.create_entity{name='character', position=S.find_non_colliding_position('character', F.get_spawn_position(S), 40, 0.5), force=F}
@@ -750,6 +752,8 @@ const BODY = {
     end
     local list = report(A.count)
     local n = e.begin_crafting{recipe=rc, count=math.min(A.count, can)}
+    -- Для журнала событий (EVENTS): очередь была непустой, даже если крафт кончится раньше следующей сверки.
+    if storage.vb_ev and n > 0 then storage.vb_ev.q[A.bot] = e.crafting_queue_size end
     local r = {queued=n, asked=A.count, queue_size=e.crafting_queue_size}
     if n < A.count then r.ingredients_for_asked = list end
     return r`,
@@ -2127,12 +2131,119 @@ const FOLLOW = (`
   local function bot() local e = storage.vb and storage.vb[A.bot] if e and e.valid and storage.vb_path and storage.vb_path[A.bot] then return e end error('нет пути', 0) end
 ` + BODY.follow).split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
 
+// События (fb-042). Обработчиков событий в Lua нет, поэтому журнал собирается сверкой: команда раз в полсекунды игры
+// (не чаще) сравнивает мир с прошлым снимком и дописывает новое в storage.vb_ev (последние 200 событий, общий для всех
+// ботов). Только то, что игрок видит сам: значки тревог своей команды (берутся у игрока команды, как у него на экране),
+// конец исследования, смерть персонажа, своё здоровье и очередь крафта. Персонажа команда не трогает и не создаёт.
+const EVENTS = `
+  storage.vb_ev = storage.vb_ev or {seq=0, items={}, q={}, at={}, dead={}, seen={}, hp={}, hurt={}}
+  local V = storage.vb_ev
+  local f, s = game.forces.player, game.surfaces.nauvis
+  local function r1(v) return math.floor(v*10+0.5)/10 end
+  local function P(p) return {x=r1(p.x), y=r1(p.y)} end
+  local function add(ev)
+    V.seq = V.seq + 1 ev.seq = V.seq ev.tick = game.tick
+    V.items[#V.items+1] = ev
+    if #V.items > 200 then table.remove(V.items, 1) end
+  end
+  local src, err
+  if not V.scan or game.tick - V.scan >= 30 then
+    V.scan = game.tick
+    local D = storage.vb_dead or {}
+    for n, e in pairs(storage.vb or {}) do
+      if (not e.valid or D[n]) and not V.dead[n] then
+        -- Труп: погибший после последней сверки, ближайший к месту, где персонажа видели живым.
+        local a, best, bd = V.at[n]
+        for _, c in pairs(s.find_entities_filtered{type='character-corpse'}) do
+          if not a or c.character_corpse_tick_of_death >= a.t then
+            local d = a and ((c.position.x-a.x)^2+(c.position.y-a.y)^2) or -c.character_corpse_tick_of_death
+            if not bd or d < bd then best, bd = c, d end
+          end
+        end
+        -- Кого ни разу не видели живым (давно брошенный персонаж), о том не сообщаем.
+        if a or D[n] then add{type='character_died', bot=n, corpse=best and P(best.position) or nil, last_seen=a and {x=r1(a.x), y=r1(a.y)} or nil} end
+        V.dead[n] = true V.q[n] = 0 V.hp[n] = nil
+      end
+      if e.valid then
+        if D[n] then D[n] = nil V.q[n] = 0 V.hp[n] = nil end
+        V.dead[n] = nil
+        local q = e.crafting_queue_size
+        if (V.q[n] or 0) > 0 and q == 0 then add{type='craft_done', bot=n} end
+        V.q[n] = q
+        local h = e.health
+        if V.hp[n] and h < V.hp[n] - 1 and (not V.hurt[n] or game.tick - V.hurt[n] >= 300) then
+          V.hurt[n] = game.tick
+          add{type='character_hurt', bot=n, health=math.floor(h), pos=P(e.position)}
+        end
+        V.hp[n] = h
+        V.at[n] = {x=e.position.x, y=e.position.y, t=game.tick}
+      end
+    end
+    local cur, R = f.current_research, V.res
+    if R and (not cur or cur.name ~= R.name or cur.level ~= R.level) then
+      local t = f.technologies[R.name]
+      if t and (t.researched or t.level > R.level) then add{type='research_finished', name=R.name, next=cur and cur.name or 'ничего: очередь исследований пуста'} end
+    end
+    V.res = cur and {name=cur.name, level=cur.level} or nil
+    -- Тревоги команды — те же значки, что у игрока внизу экрана. Спрашиваем у игрока команды, который сейчас в игре.
+    local pl
+    for _, p in pairs(f.players) do if p.connected then pl = p break end end
+    if pl then
+      src = pl.name
+      local KIND, CD = {}, {destroyed=0, under_attack=600, turret_no_ammo=3600, turret_fire=600, train_no_fuel=3600, train_no_path=3600}
+      for k, v in pairs{entity_destroyed='destroyed', entity_under_attack='under_attack', turret_out_of_ammo='turret_no_ammo', turret_fire='turret_fire', train_out_of_fuel='train_no_fuel', train_no_path='train_no_path'} do
+        if defines.alert_type[k] then KIND[defines.alert_type[k]] = v end
+      end
+      local ok, e2 = pcall(function()
+        local seen, groups, order = {}, {}, {}
+        for _, by in pairs(pl.get_alerts{surface=s}) do
+          for ty, list in pairs(by) do
+            local kind = KIND[ty]
+            if kind then
+              for _, al in pairs(list) do
+                local tg = al.target and al.target.valid and al.target or nil
+                local pos = al.position or (tg and tg.position)
+                local name = al.prototype and al.prototype.name or (tg and tg.name) or '?'
+                if pos then
+                  local key = kind..'|'..name..'|'..pos.x..'|'..pos.y
+                  local last = V.seen[key]
+                  if not last or al.tick > last + CD[kind] then
+                    seen[key] = al.tick
+                    local gk = kind..'|'..name
+                    local g = groups[gk]
+                    if not g then g = {type=kind, name=name, count=0, at={}} groups[gk] = g order[#order+1] = g end
+                    g.count = g.count + 1
+                    if #g.at < 5 then g.at[#g.at+1] = P(pos) end
+                  else seen[key] = last end
+                end
+              end
+            end
+          end
+        end
+        V.seen = seen
+        for _, g in pairs(order) do add(g) end
+      end)
+      if not ok then err = tostring(e2) end
+    end
+    V.src = src V.err = err
+  end
+  local OWN = {craft_done=true, character_hurt=true}
+  local out = {}
+  for _, ev in pairs(V.items) do
+    local new
+    if A.since then new = ev.seq > A.since else new = game.tick - ev.tick <= 18000 end
+    if new and (not OWN[ev.type] or ev.bot == A.bot) then out[#out+1] = ev end
+  end
+  return {cursor=V.seq, tick=game.tick, events=out, alerts_from=V.src, alerts_error=V.err}`;
+// Короткая проверка «есть ли новое» для ожидания: длинную команду сверки не шлём чаще, чем нужно (очередь RCON общая).
+const EVENTS_PEEK = `local V = storage.vb_ev return {seq=V and V.seq or 0, age=V and V.scan and game.tick - V.scan or 100000}`;
+
 // ── Одно тело — один исполнитель ──
 // Персонажа могут вести сразу несколько источников: главная сессия, саб-агент, собственные скрипты бота через fx.
 // Одновременные действия рвут его в разные стороны, поэтому действие, которое двигает персонажа, для каждого
 // персонажа выполняется только одно; второму вызову отвечаем отказом с объяснением, а не ставим его в очередь.
 const READ_ONLY = new Set(['status', 'look_around', 'find', 'inspect', 'inspect_many', 'research', 'power', 'belt', 'alerts', 'pollution',
-  'area_map', 'route', 'where_items', 'production', 'recipe_info', 'say', 'wait', 'feedback', 'feedback_status', 'read_chat',
+  'area_map', 'route', 'where_items', 'production', 'events', 'recipe_info', 'say', 'wait', 'feedback', 'feedback_status', 'read_chat',
   'craft', 'template_save', 'template_cost', 'template_delete', 'ghost_place', 'ghost_list', 'ghost_clear', 'stop']);
 const busy = new Map(); // персонаж -> { tool, since }
 const stopAsked = new Map(); // персонаж -> когда попросили остановиться
@@ -3070,6 +3181,37 @@ export function createFactorioServer(botName, hooks) {
           out[k] = Array.isArray(r[k]) ? r[k] : [];
           if (r[`${k}_count`] > out[k].length) out[`${k}_not_shown`] = r[`${k}_count`] - out[k].length;
         }
+        return out;
+      }),
+
+    def('events', 'Что случилось с момента since — вместо частого опроса inspect в дозоре. События — то, о чём игрок узнаёт по значкам тревог и экрану: destroyed — постройка команды разрушена (name, count, at — до 5 мест); under_attack — постройку бьют; turret_fire — турель стреляет; turret_no_ammo — турель без патронов; train_no_fuel, train_no_path; research_finished (name, next); character_died — персонаж бота погиб (bot, corpse — где труп: вещи заберёт take_items; новый персонаж появится у точки возрождения с пустым инвентарём); character_hurt — твой персонаж теряет здоровье (health, pos); craft_done — твоя очередь ручного крафта опустела. Кто именно напал, тревога не говорит — смотри look_around или pollution. since — cursor из прошлого ответа; без since — события за последние 5 минут. wait_s — если событий нет, вызов ждёт первого (до 30 с) и сразу возвращается: в скрипте дозора вызывай в цикле с wait_s=30 и новым cursor. Только чтение: персонажа не двигает, работает параллельно с его действиями. Журнал общий для команды и короткий (200 событий); события копятся, только пока кто-то из ботов их спрашивает, а тревоги построек — пока в игре есть игрок команды (alerts_from).',
+      { since: z.number().int().min(0).optional().describe('cursor из прошлого ответа: показать только то, что случилось после него'),
+        wait_s: z.number().min(0).max(30).default(0).describe('сколько секунд ждать первого события, если новых нет'),
+        limit: z.number().int().min(1).max(200).default(50).describe('сколько последних событий показать') },
+      async (a) => {
+        const start = Date.now();
+        let since = a.since;
+        const get = async () => { const r = await lua(EVENTS, { bot: botName, since }); r.events = Array.isArray(r.events) ? r.events : []; return r; };
+        let r = await get();
+        // Курсор больше номера последнего события — журнал начат заново (новая карта): показываем как без since.
+        if (since !== undefined && since > r.cursor) { since = undefined; r = await get(); }
+        let why;
+        while (!r.events.length && Date.now() - start < a.wait_s * 1000) {
+          if (hooks.aborted()) { why = 'прервано'; break; }
+          since = r.cursor;
+          await sleep(1000);
+          const p = await lua(EVENTS_PEEK);
+          if (p.seq > r.cursor || p.age >= 120) r = await get();
+        }
+        const all = r.events;
+        const events = all.slice(-a.limit).map((ev) => { const { seq, tick, ...rest } = ev; return { ...rest, ago_s: Math.round((r.tick - tick) / 6) / 10 }; });
+        const out = { cursor: r.cursor, events };
+        if (all.length > events.length) out.not_shown = all.length - events.length;
+        if (a.wait_s > 0) out.waited_s = Math.round((Date.now() - start) / 100) / 10;
+        if (why) out.stopped = why;
+        if (r.alerts_from) out.alerts_from = r.alerts_from;
+        else out.note = 'в игре нет игрока команды: тревоги построек (разрушено, атака, турели) сейчас не видны, остальные события приходят';
+        if (r.alerts_error) out.alerts_error = r.alerts_error;
         return out;
       }),
 
