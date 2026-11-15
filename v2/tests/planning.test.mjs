@@ -204,4 +204,45 @@ test('плитка: призраки плитки через ghost_place и buil
   eq(t.n, 6);
 });
 
+test('замена поверх лент (подземный конвейер, разделитель, быстрая лента, поворот): видна в ghosts плана и строится build_ghosts по плану', async () => {
+  await reset({ 'underground-belt': 2, splitter: 1, 'fast-transport-belt': 1, 'wooden-chest': 1, 'transport-belt': 1 }, 24.5, 12.5);
+  await world(`local s = game.surfaces.nauvis for i = 0, 7 do for _, y in pairs{10.5, 13.5} do s.create_entity{name = 'transport-belt', position = {A.ox + 20.5 + i, A.oy + y}, direction = defines.direction.east, force = 'player'} end end return true`);
+  const items = [
+    { name: 'underground-belt', ...P(21.5, 10.5), direction: 'east', underground: 'input' },
+    { name: 'underground-belt', ...P(24.5, 10.5), direction: 'east', underground: 'output' },
+    { name: 'splitter', ...P(23.5, 14), direction: 'east', filter: { name: 'iron-plate' }, output_priority: 'left' },
+    { name: 'fast-transport-belt', ...P(26.5, 13.5), direction: 'east' },
+    { name: 'transport-belt', ...P(27.5, 13.5), direction: 'south' },
+    { name: 'wooden-chest', ...P(27.5, 11.5) },
+  ];
+  const chk = await call(A, 'blueprint_check', { items });
+  ok(chk.ok && chk.replace === 5 && chk.will_place === 1, JSON.stringify(chk));
+  eq(await count({ type: 'entity-ghost' }), 0, 'проверка без постановки ничего не ставит');
+  const r = await call(A, 'ghost_place', { plan: 'rp', items });
+  ok(r.ok && r.replace === 5 && r.placed === 5 && r.marked_upgrade === 1 && r.marked_deconstruct === 4, JSON.stringify(r));
+  const g = await call(A, 'ghosts', { plan: 'rp' });
+  ok(g.ghosts === 5 && g.upgrade === 1 && g.deconstruct === 4, JSON.stringify(g));
+  const rep = g.items.filter((i) => i.kind === 'ghost' && i.replaces === 'transport-belt');
+  eq(rep.length, 4, 'призраки поверх лент показывают, что заменят: ' + JSON.stringify(g.items));
+  ok(g.items.some((i) => i.kind === 'ghost' && i.name === 'wooden-chest' && !i.replaces), 'призрак на пустом месте — без replaces');
+  // Старые ленты из-под замены возвращаются в инвентарь.
+  const b = await call(A, 'build_ghosts', { plan: 'rp', approach: true });
+  ok(b.ok && b.done === 6 && b.skipped === 0, JSON.stringify(b));
+  const w = await world(`local s = game.surfaces.nauvis
+    local area = {{A.ox + 19, A.oy + 9}, {A.ox + 29, A.oy + 16}}
+    local sp = s.find_entities_filtered{area = area, name = 'splitter'}[1]
+    local ug = {}
+    for _, u in pairs(s.find_entities_filtered{area = area, name = 'underground-belt'}) do ug[u.belt_to_ground_type] = u.direction end
+    local turned = s.find_entities_filtered{name = 'transport-belt', position = {A.ox + 27.5, A.oy + 13.5}, radius = 0.2}[1]
+    return {ghosts = s.count_entities_filtered{area = area, type = 'entity-ghost'}, marked = s.count_entities_filtered{area = area, to_be_deconstructed = true},
+      belts = s.count_entities_filtered{area = area, name = 'transport-belt'}, fast = s.count_entities_filtered{area = area, name = 'fast-transport-belt'},
+      filter = sp and sp.splitter_filter and sp.splitter_filter.name, prio = sp and sp.splitter_output_priority,
+      ug_in = ug.input, ug_out = ug.output, turned = turned and turned.direction}`);
+  eq(w, { ghosts: 0, marked: 0, belts: 12, fast: 1, filter: 'iron-plate', prio: 'left', ug_in: 4, ug_out: 4, turned: 8 }, 'замены стоят, настройки призрака сохранены');
+  const st = await call(A, 'status');
+  ok(st.inventory['transport-belt'] === 5 &&!st.inventory.splitter && !st.inventory['underground-belt'] && !st.inventory['fast-transport-belt'], JSON.stringify(st.inventory));
+  const left = await call(A, 'ghosts', { plan: 'rp' });
+  eq(left.total, 0, 'план выполнен');
+});
+
 run(async () => { admin.close(); });

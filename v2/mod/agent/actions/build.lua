@@ -207,6 +207,21 @@ local function build_ghost(A, it)
   local name, pos = g.ghost_name, U.pos(g.position)
   local plan = Plans.forget(g)
   local _, revived = g.revive{raise_revive = true}
+  if g.valid and not tile and g.surface.can_fast_replace{name = name, position = g.position, direction = g.direction, force = g.force} then
+    -- Под призраком стоит совместимая постройка (лента под подземным конвейером или разделителем, та же постройка в другую
+    -- сторону): быстрая замена на месте, как у игрока с предметом в руке. Старое возвращается в инвентарь, настройки призрака
+    -- переходят новой постройке, призрак исчезает.
+    local args = {name = name, position = g.position, direction = g.direction, force = g.force, quality = quality,
+      fast_replace = true, character = e, spill = false, raise_built = true}
+    if g.ghost_type == 'underground-belt' then args.type = g.belt_to_ground_type end
+    local n = g.surface.create_entity(args)
+    if n then
+      if g.valid then g.destroy() end
+      e.remove_item{name = item, count = need, quality = quality}
+      E.tally('entities_built', A.name, n)
+      return describe(n, {plan = plan, replaced = true})
+    end
+  end
   if g.valid then
     Plans.remember(g, plan)
     U.fail('blocked', 'место под призраком занято: мешает постройка (возможно, помеченная на снос), дерево, камень или персонаж')
@@ -276,10 +291,15 @@ Q.register('build_ghosts', Tour.action{
         list[#list + 1] = {entity = g, x = g.position.x, y = g.position.y, name = g.ghost_name}
       end
     end
-    -- Пометки на замену в области исполняются тем же действием (быстрая замена на месте).
-    if p.area and p.upgrades ~= false and not p.plan then
-      for _, c in pairs(s.find_entities_filtered{area = filter.area, force = force, to_be_upgraded = true}) do
-        list[#list + 1] = {entity = c, x = c.position.x, y = c.position.y, name = c.name, upgrade = true}
+    -- Пометки на замену в области или в плане исполняются тем же действием (быстрая замена на месте).
+    if p.upgrades ~= false then
+      local a = filter.area
+      local marks = p.plan and Plans.entities(p.plan) or s.find_entities_filtered{area = a, force = force, to_be_upgraded = true}
+      for _, c in pairs(marks) do
+        if c.valid and c.type ~= 'entity-ghost' and c.type ~= 'tile-ghost' and c.force == force and c.to_be_upgraded()
+            and (not a or (c.position.x >= a[1][1] and c.position.x <= a[2][1] and c.position.y >= a[1][2] and c.position.y <= a[2][2])) then
+          list[#list + 1] = {entity = c, x = c.position.x, y = c.position.y, name = c.name, upgrade = true}
+        end
       end
     end
     -- Сначала постройки, потом плитка: так строит и игрок.

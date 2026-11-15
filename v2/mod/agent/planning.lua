@@ -63,15 +63,16 @@ end
 -- Проверка без постановки: списки чертежа, угол (ox, oy) → отчёт.
 local function dry_run(A, surface, force, ents, tiles, ox, oy, w, h, cost)
   local counts = {ok = 0, already = 0, ghost = 0, replace = 0, blocked = 0}
-  local blocked, replace = {}, {}
+  local blocked, replace, replace_ents = {}, {}, {}
   for _, e in ipairs(ents) do
     local wx, wy = ox + e.position.x, oy + e.position.y
     local status, info, nature = classify(surface, force, e, wx, wy)
     counts[status] = counts[status] + 1
     if status == 'blocked' and #blocked < 100 then
       blocked[#blocked + 1] = {name = e.name, x = wx, y = wy, by = info, nature = nature or nil}
-    elseif status == 'replace' and #replace < 100 then
-      replace[#replace + 1] = {name = e.name, x = wx, y = wy, replaces = info}
+    elseif status == 'replace' then
+      replace_ents[#replace_ents + 1] = e
+      if #replace < 100 then replace[#replace + 1] = {name = e.name, x = wx, y = wy, replaces = info} end
     end
   end
   local have, missing = {}, {}
@@ -88,7 +89,7 @@ local function dry_run(A, surface, force, ents, tiles, ox, oy, w, h, cost)
     will_place = counts.ok, already = counts.already, already_planned = counts.ghost, replace = counts.replace, blocked = counts.blocked,
     blocked_items = U.list(blocked), replace_items = U.list(replace),
     cost = cost, have = have, missing = missing, charted = charted,
-  }
+  }, replace_ents
 end
 
 -- Загрузить в предмет то, что бот хочет поставить: список, сохранённый чертёж или строку. → списки, угол, размер.
@@ -142,10 +143,26 @@ Q.register('ghost_place', {
         U.fail('not_visible', 'часть области не открыта на карте: план там поставить нельзя')
       end
       local cost = BP.cost_of(stack)
-      local report = dry_run(A, surface, force, ents, tiles, ox, oy, w, h, cost)
+      local report, replace_ents = dry_run(A, surface, force, ents, tiles, ox, oy, w, h, cost)
       local mode = p.mode or 'forced'
       local dec_before, up_before = marked(surface, area, 'to_be_deconstructed'), marked(surface, area, 'to_be_upgraded')
       local created = BP.build(stack, surface, force, ox, oy, w, h, mode)
+      if mode == 'forced' and #replace_ents > 0 then
+        -- Постройки поверх совместимых (подземный конвейер или разделитель поверх ленты, лента другого вида или направления)
+        -- движок в режиме forced молча пропускает. Ставим их отдельным чертежом в режиме superforced, как игрок с зажатыми
+        -- Ctrl+Shift: старое помечается на снос или замену, сверху встаёт призрак. Мешать им может только заменяемое.
+        local sub = {}
+        for i, e in ipairs(replace_ents) do
+          local c = {}
+          for k, v in pairs(e) do c[k] = v end
+          c.entity_number = i
+          c.position = {x = e.position.x, y = e.position.y}
+          sub[i] = c
+        end
+        local _, _, sw, sh, sx, sy = BP.normalize(sub, {})
+        BP.write(stack, sub, {})
+        for _, g in pairs(BP.build(stack, surface, force, ox + sx, oy + sy, sw, sh, 'superforced')) do created[#created + 1] = g end
+      end
       local placed, placed_tiles = 0, 0
       for _, g in pairs(created) do
         if g.valid then
@@ -471,7 +488,7 @@ O.register('blueprint_check', {agent = true, fn = function(A, p)
   local e = A.entity
   return BP.with(function(stack)
     local ents, tiles, ox, oy, w, h = load_request(A, stack, p)
-    return dry_run(A, e.surface, e.force, ents, tiles, ox, oy, w, h, BP.cost_of(stack))
+    return (dry_run(A, e.surface, e.force, ents, tiles, ox, oy, w, h, BP.cost_of(stack)))
   end)
 end})
 
@@ -490,6 +507,19 @@ local function add_cost(cost, proto, quality)
   if s then
     local k = U.item_key(s.name, quality)
     cost[k] = (cost[k] or 0) + (s.count or 1)
+  end
+end
+
+-- Что призрак заменит на месте: постройка под ним, помеченная на снос, того же семейства (лента → подземный конвейер,
+-- разделитель; та же постройка в другую сторону). build_ghosts ставит такой призрак быстрой заменой, сносить заранее не надо.
+local function replaced_by(g)
+  local group = g.ghost_prototype.fast_replaceable_group
+  if not group then return nil end
+  local w, h = BP.footprint(g.ghost_name, g.direction)
+  local x, y = g.position.x, g.position.y
+  for _, c in pairs(g.surface.find_entities_filtered{area = {{x - w / 2 + 0.1, y - h / 2 + 0.1}, {x + w / 2 - 0.1, y + h / 2 - 0.1}},
+      force = g.force, to_be_deconstructed = true}) do
+    if c.prototype.fast_replaceable_group == group then return c.name end
   end
 end
 
@@ -514,6 +544,9 @@ local function describe_list(A, list, p)
           plan = Plans.of(c)}
         if c.supports_direction then r.direction = U.dirname(c.direction) end
         if kind == 'upgrade' then local t = c.get_upgrade_target() r.to = t and t.name end
+        if kind == 'ghost' then
+          r.replaces = replaced_by(c)
+        end
         items[#items + 1] = r
       end
     end
