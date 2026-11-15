@@ -16,6 +16,24 @@ storage.vb_kit = storage.vb_kit or {}
 -- и если следующая команда идущего персонажа застряла в ней, он не уходит вслепую: его останавливает любая чужая команда.
 for n, t in pairs(storage.vb_until or {}) do if game.tick > t then local w = storage.vb[n] if w and w.valid then w.walking_state = {walking=false, direction=w.walking_state.direction} w.character_running_speed_modifier = 0 end storage.vb_until[n] = nil end end
 local function fail(m) error(m, 0) end
+-- Можно ли персонажу e стоять в точке (постройки, деревья, вода, скалы). Сам персонаж себе не мешает (fb-052): игра
+-- считает занятыми клетки вплотную к нему, и в тесном месте (между бурами) поиск пути не мог сделать ни шага от старта.
+local function stand(s, e, x, y)
+  if s.can_place_entity{name='character', position={x, y}} then return true end
+  local p = e.position
+  if math.abs(x-p.x) >= 0.45 or math.abs(y-p.y) >= 0.45 then return false end
+  local L = e.prototype.collision_mask.layers
+  for _, c in pairs(s.find_entities_filtered{area={{x-0.2, y-0.2}, {x+0.2, y+0.2}}}) do
+    if c.unit_number == nil or c.unit_number ~= e.unit_number then
+      for l in pairs(c.prototype.collision_mask.layers) do if L[l] then return false end end
+    end
+  end
+  for _, q in pairs{{x-0.2, y-0.2}, {x+0.2, y-0.2}, {x-0.2, y+0.2}, {x+0.2, y+0.2}} do
+    local t = s.get_tile(q[1], q[2])
+    for l in pairs(L) do if t.collides_with(l) then return false end end
+  end
+  return true
+end
 local function bot()
   local e = storage.vb[A.bot]
   if e and e.valid then return e end
@@ -376,7 +394,7 @@ const BODY = {
     local function free(x, y)
       local k = key(x, y)
       local v = fc[k]
-      if v == nil then v = s.can_place_entity{name='character', position={x/2, y/2}} fc[k] = v end
+      if v == nil then v = stand(s, e, x/2, y/2) fc[k] = v end
       return v
     end
     -- Конвейеры проходимы, но сносят персонажа: путь по ним дороже, так что ленты он пересекает, а не идёт вдоль.
@@ -547,7 +565,7 @@ const BODY = {
     local function free(x, y)
       local k = key(x, y)
       local v = fc[k]
-      if v == nil then v = s.can_place_entity{name='character', position={x/2, y/2}} fc[k] = v end
+      if v == nil then v = stand(s, e, x/2, y/2) fc[k] = v end
       return v
     end
     local M = A.margin*2
@@ -673,7 +691,7 @@ const BODY = {
       local blocker
       for t = 1, math.min(24, math.ceil(d*2)) do
         local qx, qy = bx + (A.x-bx)*t/(d*2), by + (A.y-by)*t/(d*2)
-        if not s.can_place_entity{name='character', position={qx, qy}} then
+        if not stand(s, e, qx, qy) then
           local what = thing(s, {qx, qy})
           if what == 'земля' then what = s.get_tile(qx, qy).name end
           blocker = {x=r1(qx), y=r1(qy), what=what}
