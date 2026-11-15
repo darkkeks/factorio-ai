@@ -60,6 +60,39 @@ local function describe(n, extra)
 end
 B.describe = describe
 
+-- Призрак столба оживает только с проводами, записанными в нём самом: к столбам, уже стоявшим, когда ставили призрак,
+-- и к соседям по чертежу с проводами. Столбы, поставленные призраками по списку, друг с другом не связаны и после revive
+-- остались бы каждый в своей сети. Поэтому призрак столба без проводов к другим призракам и без сигнальных проводов ставится,
+-- как столб из руки игрока: игра сама тянет медный провод к соседним столбам; провода, записанные в призраке, сохраняются.
+-- Возвращает постройку или nil — тогда призрак цел и оживляется обычным путём.
+local function pole_from_ghost(g, quality)
+  if g.ghost_type ~= 'electric-pole' then return nil end
+  local keep = {}
+  for id, c in pairs(g.get_wire_connectors(false)) do
+    if c.connection_count > 0 then
+      if id ~= defines.wire_connector_id.pole_copper then return nil end
+      for _, w in pairs(c.connections) do
+        local o = w.target.owner
+        if o.type == 'entity-ghost' then return nil end
+        keep[#keep + 1] = o
+      end
+    end
+  end
+  local s, name, pos, force = g.surface, g.ghost_name, g.position, g.force
+  if not s.can_place_entity{name = name, position = pos, force = force, build_check_type = defines.build_check_type.manual} then return nil end
+  local n = s.create_entity{name = name, position = pos, direction = g.direction, force = force, quality = quality, raise_built = true}
+  if not n then return nil end
+  if g.valid then g.destroy() end
+  local c = n.get_wire_connector(defines.wire_connector_id.pole_copper, true)
+  for _, o in pairs(keep) do
+    if o.valid then
+      local oc = o.get_wire_connector(defines.wire_connector_id.pole_copper, true)
+      if oc and not c.is_connected_to(oc) then c.connect_to(oc) end
+    end
+  end
+  return n
+end
+
 -- Поставить одну постройку из инвентаря. it — {item, x, y, direction?, underground?, recipe?, quality?}.
 local function place_one(A, it)
   local e = A.entity
@@ -95,8 +128,12 @@ local function place_one(A, it)
   for _, g in pairs(s.find_entities_filtered{type = 'entity-ghost', position = pos, radius = 0.6, force = force}) do
     if g.valid and g.ghost_name == proto.name and U.dist(g.position, pos) < 0.51 and g.quality.name == quality then
       if it.direction ~= nil and g.supports_direction and g.direction ~= dir then g.direction = dir end
-      local plan = Plans.forget(g)
-      local _, revived = g.revive{raise_revive = true}
+      Plans.forget(g)
+      local revived = pole_from_ghost(g, quality)
+      if not revived then
+        local _
+        _, revived = g.revive{raise_revive = true}
+      end
       if not revived then U.fail('blocked', 'место под призраком занято (мешает постройка, дерево, камень или персонаж)') end
       n = revived
       break
@@ -206,6 +243,14 @@ local function build_ghost(A, it)
   local tile = g.type == 'tile-ghost'
   local name, pos = g.ghost_name, U.pos(g.position)
   local plan = Plans.forget(g)
+  if not tile then
+    local n = pole_from_ghost(g, quality)
+    if n then
+      e.remove_item{name = item, count = need, quality = quality}
+      E.tally('entities_built', A.name, n)
+      return describe(n, {plan = plan})
+    end
+  end
   local _, revived = g.revive{raise_revive = true}
   if g.valid and not tile and g.surface.can_fast_replace{name = name, position = g.position, direction = g.direction, force = g.force} then
     -- Под призраком стоит совместимая постройка (лента под подземным конвейером или разделителем, та же постройка в другую

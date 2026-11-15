@@ -66,6 +66,34 @@ test('build_ghosts по плану с подходом; настройки пр�
   eq(list.total, 0);
 });
 
+test('build_ghosts и place: столбы из призраков без проводов соединяются с соседями, как поставленные из руки', async () => {
+  await reset({ 'small-electric-pole': 6 }, 22.5, 12.5);
+  const nets = (x1, x2) => world(`
+    local s, area = game.surfaces.nauvis, {{A.ox + A.x1, A.oy + 9}, {A.ox + A.x2, A.oy + 18}}
+    local ids, lone, n = {}, 0, 0
+    for _, p in pairs(s.find_entities_filtered{name = 'small-electric-pole', area = area}) do
+      n = n + 1
+      if p.get_wire_connector(defines.wire_connector_id.pole_copper, true).real_connection_count == 0 then lone = lone + 1 end
+      ids[p.electric_network_id] = true
+    end
+    return {n = n, lone = lone, nets = table_size(ids), ghosts = s.count_entities_filtered{type = 'entity-ghost', area = area}}`, { x1, x2 });
+  // Один столб уже стоит; из трёх новых до него дотягивается только средний, остальные — только друг до друга.
+  await world(`game.surfaces.nauvis.create_entity{name = 'small-electric-pole', position = {A.ox + 14.5, A.oy + 10.5}, force = 'player'} return true`);
+  const pole = (dx, dy) => ({ name: 'small-electric-pole', ...P(dx, dy) });
+  const pl = await call(A, 'ghost_place', { plan: 'poles', items: [pole(26.5, 10.5), pole(20.5, 10.5), pole(26.5, 16.5)] });
+  ok(pl.ok && pl.placed === 3, JSON.stringify(pl));
+  const r = await call(A, 'build_ghosts', { plan: 'poles', approach: true, wait_s: 60 });
+  ok(r.ok && r.done === 3 && r.items.every((i) => i.plan === 'poles'), JSON.stringify(r).slice(0, 400));
+  eq(await nets(12, 28), { n: 4, lone: 0, nets: 1, ghosts: 0 }, 'все столбы в одной сети, призраков не осталось');
+  eq((await call(A, 'ghosts', { plan: 'poles' })).total, 0);
+  // То же через place поверх призраков: два столба вдали от остальных.
+  await call(A, 'ghost_place', { plan: 'poles-2', items: [pole(40.5, 10.5), pole(46.5, 10.5)] });
+  const p2 = await call(A, 'place', { items: [{ item: 'small-electric-pole', ...P(40.5, 10.5) }, { item: 'small-electric-pole', ...P(46.5, 10.5) }], approach: true, wait_s: 60 });
+  ok(p2.ok && p2.done === 2, JSON.stringify(p2).slice(0, 400));
+  eq(await nets(38, 48), { n: 2, lone: 0, nets: 1, ghosts: 0 }, 'place поверх призраков тоже соединяет');
+  eq((await call(A, 'status')).inventory['small-electric-pole'], 1, 'потрачено ровно пять столбов');
+});
+
 test('чертёж: сохранить из списка, получить, повернуть, проверить без постановки, поставить', async () => {
   await reset({}, 2.5, 2.5);
   const s = await call(A, 'blueprint_save', { name: 'pair', entities: [{ name: 'stone-furnace', x: 101, y: 51 }, { name: 'inserter', x: 102.5, y: 50.5, direction: 'east' }, { name: 'wooden-chest', x: 103.5, y: 50.5 }] });
