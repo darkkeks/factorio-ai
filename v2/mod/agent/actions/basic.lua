@@ -18,6 +18,7 @@ Q.register('wait', {
         if not prototypes.item[p.item] then U.fail('bad_request', 'нет такого предмета: ' .. p.item) end
       end
       U.arg(p.max_ticks, 'int', 'max_ticks', true)
+      U.arg(p.ticks, 'int', 'ticks', true)  -- вместе с until ticks — тот же предел, что max_ticks
     else
       U.arg(p.ticks, 'int', 'ticks')
     end
@@ -33,8 +34,9 @@ Q.register('wait', {
     local waited = game.tick - act.started
     if p['until'] then
       if CONDITIONS[p['until']](A, p) then return {waited = waited, met = true} end
-      if p.max_ticks and waited >= p.max_ticks then
-        U.fail('timeout', 'условие не выполнилось за max_ticks', {waited = waited})
+      local limit = p.max_ticks or p.ticks
+      if limit and waited >= limit then
+        U.fail('timeout', 'условие не выполнилось за ' .. limit .. ' тиков', {waited = waited})
       end
       return nil
     end

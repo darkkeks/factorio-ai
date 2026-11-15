@@ -153,6 +153,16 @@ test('craft: очередь ручного крафта, wait craft_empty, со�
   eq((await inv())['iron-plate'], 12);
 });
 
+test('wait: предел ожидания условия — max_ticks или ticks, ошибка timeout', async () => {
+  await reset({});
+  for (const lim of [{ max_ticks: 30 }, { ticks: 30 }]) {
+    const r = await call(A, 'wait', { until: 'has_item', item: 'iron-gear-wheel', ...lim });
+    ok(!r.ok && r.error.code === 'timeout' && r.error.data.waited >= 30 && r.error.data.waited < 90, JSON.stringify(r));
+  }
+  const bad = await call(A, 'wait', { until: 'craft_empty', ticks: 'x' });
+  ok(!bad.ok && bad.error.code === 'bad_request', JSON.stringify(bad));
+});
+
 test('mine: ресурс по счёту, постройка с содержимым, вне досягаемости', async () => {
   await reset({});
   await world(`
