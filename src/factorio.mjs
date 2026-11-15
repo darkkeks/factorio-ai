@@ -33,12 +33,26 @@ local function P(p) return {x=r1(p.x), y=r1(p.y)} end
 local function dist(a, b) return ((a.x-b.x)^2+(a.y-b.y)^2)^0.5 end
 local function contents(i) local r = {} if i then for _, s in pairs(i.get_contents()) do r[s.name] = (r[s.name] or 0) + s.count end end return r end
 local SKIP = {character=true, corpse=true, ['character-corpse']=true, ['item-entity']=true, fish=true}
-local function at(e, x, y)
+-- Труп персонажа у точки (ближайший в радиусе r): игрок открывает его, как сундук, и забирает вещи.
+local function corpse_at(e, x, y, r)
+  local best, bd
+  for _, c in pairs(e.surface.find_entities_filtered{type='character-corpse', position={x, y}, radius=r}) do
+    local d = dist(c.position, {x=x, y=y})
+    if not bd or d < bd then best, bd = c, d end
+  end
+  return best
+end
+-- corpse=true — годится и труп персонажа: точно в этой точке он важнее постройки под ним, рядом — если больше ничего нет.
+local function at(e, x, y, corpse)
   local res
+  local body = corpse and corpse_at(e, x, y, 0.35)
+  if body then return body end
   for _, c in pairs(e.surface.find_entities_filtered{area={{x-0.45,y-0.45},{x+0.45,y+0.45}}}) do
     if c.type == 'resource' then res = c elseif not SKIP[c.type] and c.prototype.selectable_in_game then return c end
   end
   if res then return res end
+  body = corpse and corpse_at(e, x, y, 1)
+  if body then return body end
   fail('в точке '..x..','..y..' ничего нет')
 end
 local function reach(e, t, d) if dist(e.position, t.position or t) > (d or 10) then fail('слишком далеко, подойди ближе') end end
@@ -417,7 +431,7 @@ const BODY = {
     local e = bot()
     local groups, list = {}, {}
     for _, c in pairs(e.surface.find_entities_filtered{position=e.position, radius=A.radius}) do
-      if not SKIP[c.type] and c.type ~= 'cliff' and c.prototype.selectable_in_game then
+      if (not SKIP[c.type] or c.type == 'character-corpse') and c.type ~= 'cliff' and c.prototype.selectable_in_game then
         local key = c.name
         if c.type == 'tree' then key = 'tree' elseif c.force.name == 'enemy' then key = 'ВРАГ '..c.name end
         local g = groups[key]
@@ -446,9 +460,14 @@ const BODY = {
 
   inspect: `
     local e = bot()
-    local t = at(e, A.x, A.y)
+    local t = at(e, A.x, A.y, true)
     local r = {name=t.name, type=t.type, pos=P(t.position), dist=r1(dist(t.position, e.position))}
     if t.type == 'resource' then r.amount = t.amount return r end
+    if t.type == 'character-corpse' then
+      r.items = contents(t.get_inventory(defines.inventory.character_corpse))
+      r.note = 'труп персонажа: забрать всё — take_items без item'
+      return r
+    end
     r.direction = t.supports_direction and dirname(t.direction) or nil
     if t.health then r.health = math.floor(t.health) end
     pcall(function() local rc = t.get_recipe() if rc then r.recipe = rc.name end end)
@@ -848,10 +867,12 @@ const BODY = {
 
   take: `
     local e = bot()
-    local t = at(e, A.x, A.y)
+    local t = at(e, A.x, A.y, true)
     reach(e, t, 10)
     local invs = {}
-    if A.item then for i = 1, t.get_max_inventory_index() do local v = t.get_inventory(i) if v then invs[#invs+1] = v end end
+    local body = t.type == 'character-corpse'
+    if body then invs[1] = t.get_inventory(defines.inventory.character_corpse)
+    elseif A.item then for i = 1, t.get_max_inventory_index() do local v = t.get_inventory(i) if v then invs[#invs+1] = v end end
     else local v = t.get_output_inventory() if v then invs[1] = v end end
     local taken, left = {}, A.count
     if BELT[t.type] then
@@ -876,8 +897,13 @@ const BODY = {
         end
       end
     end
-    if not next(taken) then fail('забирать нечего') end
-    return {taken=taken, from=t.name}`,
+    if not next(taken) then fail(body and (A.item and 'в трупе нет '..A.item..' (или в инвентаре нет места)' or 'труп пуст или в инвентаре нет места') or 'забирать нечего') end
+    local r = {taken=taken, from=t.name}
+    if body then
+      r.left_in_corpse = invs[1].get_item_count()
+      if r.left_in_corpse > 0 and left > 0 and not A.item then r.note = 'в инвентаре кончилось место: освободи его и забери остальное' end
+    end
+    return r`,
 
   // Сколько предметов из списка A.items сейчас в инвентаре персонажа (для отчёта gather).
   gather_have: `
@@ -1706,6 +1732,17 @@ const BODY = {
         end
       end
     end
+    -- Трупы персонажей: вещи погибшего лежат в них, пока труп не исчезнет.
+    for _, c in pairs(s.find_entities_filtered{position=e.position, radius=A.radius, type='character-corpse'}) do
+      if not visible(c.position) then hidden = hidden + 1
+      else
+        local n = c.get_inventory(defines.inventory.character_corpse).get_item_count(A.item)
+        if n > 0 then
+          total = total + n
+          stores[#stores+1] = {name=c.name, x=c.position.x, y=c.position.y, d=dist(c.position, e.position), count=n}
+        end
+      end
+    end
     table.sort(stores, function(a, b) return a.d < b.d end)
     local list = {}
     for i = 1, math.min(#stores, A.limit) do local r = stores[i] r.dist = r1(r.d) r.d = nil list[i] = r end
@@ -2124,7 +2161,7 @@ export function createFactorioServer(botName, hooks) {
       { name: z.string(), radius: z.number().min(1).max(1000).default(300) },
       (a) => run('find', a)),
 
-    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with).', coords, (a) => run('inspect', a)),
+    def('inspect', 'Подробности об объекте в точке: рецепт, состояние, содержимое, топливо, направление. Для манипулятора — откуда берёт (takes_from) и куда кладёт (puts_to), для конвейера — что на нём лежит: всего (on_belt) и по полосам (lanes: left — левая по ходу движения, right — правая); для подземного конвейера — вход это или выход (underground) и где его парный конец (paired_with). Труп персонажа (character-corpse, координаты даёт find) — что в нём лежит (items).', coords, (a) => run('inspect', a)),
 
     def('move_to', 'Идти в точку или к игроку-человеку. Укажи либо x и y, либо player. Идёт только пешком, сам ищет путь в обход построек, деревьев, воды и скал. В ответе pos — где персонаж стоит на самом деле. Если в самой точке стоять нельзя, встаёт рядом (note). Если дойти не удалось — not_reached с причиной и distance_left: персонаж остановился в ближайшей к цели точке, до которой нашёл путь. Обход ограничен: если идти пришлось бы больше чем втрое дальше прямой (и больше 30 клеток), персонаж не идёт (или останавливается, как только это выяснилось) и отвечает not_reached «обход слишком длинный» — тогда иди через промежуточные точки или повтори с long_way=true. Трубы, как и для игрока, непроходимы (конвейеры проходимы): проход через линию труб — подземная труба.',
       { x: z.number().optional(), y: z.number().optional(), player: z.string().optional().describe('имя игрока в Factorio'),
@@ -2425,11 +2462,11 @@ export function createFactorioServer(botName, hooks) {
       { ...coords, item: z.string(), count: z.number().int().min(1).default(5) },
       async (a) => { await approach(a.x, a.y, 8); return run('insert', a); }),
 
-    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Сам подходит. Забрать из нескольких мест одним вызовом — gather (источники указываешь сам).',
+    def('take_items', 'Забрать предметы из объекта в точке. Без item — всё из выходного слота. С конвейера забирает то, что лежит на этой клетке. Из трупа персонажа (character-corpse — вещи погибшего; координаты даёт find character-corpse) без item забирает всё, что влезет в инвентарь, left_in_corpse — сколько осталось. Сам подходит. Забрать из нескольких мест одним вызовом — gather (источники указываешь сам).',
       { ...coords, item: z.string().optional(), count: z.number().int().min(1).default(1000) },
       async (a) => { await approach(a.x, a.y, 8); return run('take', a); }),
 
-    def('gather', 'Забрать предметы из нескольких мест одним вызовом вместо серии move_to + take_items. Источники указываешь явно: sources — список {x, y, item, count}; персонаж обходит пешком ровно эти места (каждый раз идёт к ближайшему из оставшихся) и забирает из каждого указанный предмет, не больше count (без count — весь, что там есть). Сам источники не ищет и ничего, кроме перечисленного, не трогает: сначала посмотри, где что лежит (where_items, inspect), и не указывай буферы, из которых руками брать нельзя. Берёт так же, как take_items с item: из сундука, из любого слота машины (забирая сырьё или топливо, остановишь её), с клетки ленты. В ответе got — что взял всего, from — по каждому источнику: taken и, если взято меньше count, short; skipped — где не вышло и почему; not_visited — куда не успел; have — сколько этих предметов теперь в инвентаре; complete — взято всё, что просил. До 50 источников и около трёх минут на вызов; прервалось — повтори вызов с оставшимися.',
+    def('gather', 'Забрать предметы из нескольких мест одним вызовом вместо серии move_to + take_items. Источники указываешь явно: sources — список {x, y, item, count}; персонаж обходит пешком ровно эти места (каждый раз идёт к ближайшему из оставшихся) и забирает из каждого указанный предмет, не больше count (без count — весь, что там есть). Сам источники не ищет и ничего, кроме перечисленного, не трогает: сначала посмотри, где что лежит (where_items, inspect), и не указывай буферы, из которых руками брать нельзя. Берёт так же, как take_items с item: из сундука, из любого слота машины (забирая сырьё или топливо, остановишь её), с клетки ленты, из трупа персонажа. В ответе got — что взял всего, from — по каждому источнику: taken и, если взято меньше count, short; skipped — где не вышло и почему; not_visited — куда не успел; have — сколько этих предметов теперь в инвентаре; complete — взято всё, что просил. До 50 источников и около трёх минут на вызов; прервалось — повтори вызов с оставшимися.',
       { sources: z.array(z.object({ x: z.number(), y: z.number(), item: z.string().describe('внутреннее имя предмета, например iron-plate'),
           count: z.number().int().min(1).max(100000).optional().describe('сколько взять отсюда; без него — всё') })).max(50).optional()
           .describe('откуда и что забрать, например [{"x": 10.5, "y": -3.5, "item": "iron-plate", "count": 200}]') },
@@ -2578,7 +2615,7 @@ export function createFactorioServer(botName, hooks) {
         return out;
       }),
 
-    def('where_items', 'Где лежит предмет: ближайшие сундуки, печи, сборочные автоматы, лаборатории, буры, вагоны, в которых он есть, с количеством, от ближних к дальним — чтобы потом забрать одним вызовом gather, явно указав источники (sources). count — сколько всего в объекте (во всех слотах), in_output — сколько из этого в выходном слоте машины (остальное — её сырьё или топливо: забирая, остановишь её). belts — сколько лежит на конвейерах в 60 клетках и ближайшие клетки лент с ним. have — сколько уже у тебя. Видно в 60 клетках от персонажа и там, где карта показывается вживую (радар, игроки); сколько объектов в радиусе осталось вне видимости — not_visible. Идти никуда не нужно.',
+    def('where_items', 'Где лежит предмет: ближайшие сундуки, печи, сборочные автоматы, лаборатории, буры, вагоны и трупы персонажей (character-corpse), в которых он есть, с количеством, от ближних к дальним — чтобы потом забрать одним вызовом gather, явно указав источники (sources). count — сколько всего в объекте (во всех слотах), in_output — сколько из этого в выходном слоте машины (остальное — её сырьё или топливо: забирая, остановишь её). belts — сколько лежит на конвейерах в 60 клетках и ближайшие клетки лент с ним. have — сколько уже у тебя. Видно в 60 клетках от персонажа и там, где карта показывается вживую (радар, игроки); сколько объектов в радиусе осталось вне видимости — not_visible. Идти никуда не нужно.',
       { item: z.string().describe('внутреннее имя предмета, например iron-plate'),
         radius: z.number().min(1).max(300).default(60).describe('радиус поиска от персонажа'),
         limit: z.number().int().min(1).max(50).default(15).describe('сколько ближайших мест показать'),
