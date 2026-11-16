@@ -19,7 +19,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { ROOT } from './config.mjs';
 import { readItems, setStatus, markAnnounced, readRelease, submitFeedback, RELEASE_NOW } from './feedback.mjs';
 import { pending, release } from './release.mjs';
-import { lua } from './rcon.mjs';
+import { lua, rcon } from './rcon.mjs';
 
 const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/claude-code/bin/claude');
 const MODEL = process.env.WORKER_MODEL || 'claude-fable-5-2';
@@ -150,8 +150,13 @@ function push() {
   }
 }
 
-// Сообщение в игровой чат от имени разработчиков: сессиям ботов оно приходит как «[игровой чат] разработчики: …».
+// Сообщение в игровой чат от имени разработчиков. Идёт через мод (операция announce): так оно попадает и в журнал
+// событий — его получают боты, подключённые снаружи. Если мод операцию не знает (старая сборка) — прежним способом.
 async function say(message) {
+  try {
+    const out = JSON.parse(await rcon('/agent ' + JSON.stringify({ op: 'announce', admin: true, params: { from: 'разработчики', text: message } })));
+    if (out.ok) return;
+  } catch { /* мод не ответил — ниже запасной способ */ }
   await lua(`
     storage.vb_chat = storage.vb_chat or {seq=0, items={}}
     local c = storage.vb_chat

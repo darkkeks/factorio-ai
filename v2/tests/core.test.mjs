@@ -32,7 +32,7 @@ test('ping: версия мода и список операций', async () =>
 test('help: описаны все операции и действия мода', async () => {
   const h = await (await fetch(`${process.env.V2_API || 'http://127.0.0.1:8790'}/v2/help`)).json();
   const p = await call('t-admin', 'ping');
-  const missing = [...p.ops, ...p.actions.map((a) => a.name)].filter((n) => !h.operations[n] && !['journal', 'touch', 'pause_if_idle', 'show', 'legacy_report'].includes(n));
+  const missing = [...p.ops, ...p.actions.map((a) => a.name)].filter((n) => !h.operations[n] && !['journal', 'touch', 'pause_if_idle', 'announce', 'show', 'legacy_report'].includes(n));
   eq(missing, [], 'в help нет операций');
 });
 
@@ -202,6 +202,28 @@ test('пауза: чтение не будит игру, действие буд
   await call(A, 'wait_action', { action_id: w.action_id, wait_s: 5 });
   r = await call('t-admin', 'pause_if_idle', { voice: true, ignore: ['tester', 'camera'] });
   ok(r.paused === false, 'люди в голосовом канале — игра идёт');
+});
+
+test('пауза: бот, от которого давно нет запросов, игру не держит; первый же его запрос это возвращает', async () => {
+  const w = await call(A, 'wait', { ticks: 600, wait: false });
+  await lua(`storage.agent.agents['bench-1'].seen = game.tick - 5 * 3600 - 10 return {}`);
+  let r = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'] });
+  ok(r.paused === true && r.busy === 0 && r.silent === 1, JSON.stringify(r));
+  await call(A, 'status'); // бот вернулся: чтение паузу не снимает, но сторож теперь видит его занятым
+  r = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'] });
+  ok(r.paused === false && r.busy === 1 && r.silent === 0, JSON.stringify(r));
+  await call(A, 'cancel');
+  r = await call('t-admin', 'pause_if_idle', { hold: true, ignore: ['tester', 'camera'] });
+  ok(r.paused === false, 'hold: паузу не ставить');
+});
+
+test('announce: объявление разработчиков попадает в ленту чата и в события ботов', async () => {
+  const before = (await call(A, 'chat')).seq;
+  const text = 'проверка объявления ' + Date.now();
+  ok((await call('t-admin', 'announce', { text })).sent === true);
+  const m = (await call(A, 'chat', { since: before })).messages;
+  ok(m.length === 1 && m[0].text === text && m[0].from === 'разработчики' && !m[0].bot, JSON.stringify(m));
+  ok((await call(A, 'announce', { text })).error.code === 'forbidden', 'боту объявления недоступны');
 });
 
 run(async () => { admin.close(); });

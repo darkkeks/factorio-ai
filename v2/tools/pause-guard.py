@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Сторож паузы: игра идёт, пока в ней есть люди, люди есть в голосовом канале или у любого бота непустая очередь
-действий (или ручного крафта). Иначе — пауза.
+"""Сторож паузы: игра идёт, пока в ней есть люди или хотя бы один подключённый бот что-то делает (непустая очередь
+действий или ручного крафта). Иначе — пауза. Бот, от которого 5 минут игры нет запросов, считается отключённым.
 
 Правило исполняет мод одной командой (операция pause_if_idle), поэтому гонки «бот поставил действие, пока сторож
 решал» нет; поставленное действие само снимает паузу, не дожидаясь сторожа. Чтение мира игру не будит.
-Голосовой бот на хосте, пока в канале есть люди, обновляет файл ~/voice-active; если бот упал или выключен,
-файл устаревает. Если мода в игре нет (старое сохранение), работает прежнее правило без учёта очередей.
+Люди в голосовом канале сами по себе игру не держат: боты могут быть где угодно, а не только у голосового бота.
+Если мода в игре нет (старое сохранение), пауза ставится, когда в игре нет людей.
 """
 import json, os, socket, struct, time
 
-HEARTBEAT = os.path.expanduser('~/voice-active')
 # Режим ожидания (v2/tools/hold.sh): файл ставят люди, когда никто не играет. Действия ботов сервер ботов в это время
-# не принимает, а игра стоит на паузе, пока в ней нет людей, — голосовой канал и очереди ботов не учитываются.
+# не принимает, а игра стоит на паузе, пока в ней нет людей, — очереди ботов не учитываются.
 HOLD = os.path.expanduser('~/hold')
 PASSWORD = os.environ['RCON_PASSWORD']
 PORT = int(os.environ.get('RCON_PORT', '27015'))
@@ -43,12 +42,12 @@ class Rcon:
         return buf
 
 
-def legacy(rcon, voice):
+def legacy(rcon):
     players, paused = rcon.call(2, '/silent-command local n = 0 for _, p in pairs(game.connected_players) do if p.name ~= "%s" then n = n + 1 end end rcon.print(n .. " " .. tostring(game.tick_paused))' % CAMERA).split()
-    want = players == '0' and not voice
+    want = players == '0'
     if want != (paused == 'true'):
         rcon.call(2, '/silent-command game.tick_paused = %s' % ('true' if want else 'false'))
-        return want, 'игроков: %s, люди в голосовом канале: %s (мода нет)' % (players, 'да' if voice else 'нет')
+        return want, 'игроков: %s (мода нет)' % players
     return None, None
 
 
@@ -56,7 +55,6 @@ rcon = None
 while True:
     try:
         rcon = rcon or Rcon()
-        voice = os.path.exists(HEARTBEAT) and time.time() - os.path.getmtime(HEARTBEAT) < 45
         if os.path.exists(HOLD):
             players, paused = rcon.call(2, '/silent-command local n = 0 for _, p in pairs(game.connected_players) do if p.name ~= "%s" then n = n + 1 end end rcon.print(n .. " " .. tostring(game.tick_paused))' % CAMERA).split()
             want = players == '0'
@@ -65,7 +63,7 @@ while True:
                 print(time.strftime('%F %T'), 'пауза' if want else 'игра идёт', '(режим ожидания: боты остановлены; игроков: %s)' % players, flush=True)
             time.sleep(5)
             continue
-        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'voice': voice, 'ignore': [CAMERA]}}
+        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'ignore': [CAMERA]}}
         out = rcon.call(2, '/agent ' + json.dumps(req, ensure_ascii=False))
         try:
             r = json.loads(out)
@@ -75,9 +73,9 @@ while True:
             r = r['result']
             if r['changed']:
                 print(time.strftime('%F %T'), 'пауза' if r['paused'] else 'игра идёт',
-                      '(игроков: %s, люди в голосовом канале: %s, занятых ботов: %s)' % (r['humans'], 'да' if voice else 'нет', r['busy']), flush=True)
+                      '(игроков: %s, занятых ботов: %s, отключённых с очередью: %s)' % (r['humans'], r['busy'], r.get('silent', 0)), flush=True)
         else:
-            changed, why = legacy(rcon, voice)
+            changed, why = legacy(rcon)
             if changed is not None:
                 print(time.strftime('%F %T'), 'пауза' if changed else 'игра идёт', '(%s)' % why, flush=True)
     except Exception as e:  # сервер перезапускается — пробуем снова

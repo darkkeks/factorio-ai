@@ -28,29 +28,36 @@ O.register('journal', {admin = true, fn = function(_, p)
   return {events = U.list(items), seq = seq, first = first}
 end})
 
--- Занят ли кто-нибудь: очередь действий или очередь ручного крафта (для правила паузы).
+-- Занят ли кто-нибудь: очередь действий или очередь ручного крафта (для правила паузы). Бот, от которого давно нет
+-- запросов, отключённым считается и игру не держит: его очередь остаётся и продолжится, когда игра пойдёт
+-- (вернулся он сам или играет кто-то ещё). Подключённый бот опрашивает события не реже раза в минуту.
+local SILENT = 5 * 60 * 60 -- тиков без запросов, после которых бот считается отключённым
 local function busy_count()
-  local st, n = storage.agent, 0
-  for name in pairs(st.active) do n = n + 1 end
-  for name in pairs(st.crafting) do if not st.active[name] then n = n + 1 end end
-  return n
+  local st, n, silent = storage.agent, 0, 0
+  local function count(name)
+    local A = st.agents[name]
+    if A and game.tick - (A.seen or 0) > SILENT then silent = silent + 1 else n = n + 1 end
+  end
+  for name in pairs(st.active) do count(name) end
+  for name in pairs(st.crafting) do if not st.active[name] then count(name) end end
+  return n, silent
 end
 O.busy_count = busy_count
 
-O.register('busy', {fn = function() return {busy = busy_count(), paused = game.tick_paused} end})
+O.register('busy', {fn = function() return {busy = (busy_count()), paused = game.tick_paused} end})
 
--- Правило паузы одним неделимым шагом: игра идёт, пока в ней есть люди, люди есть в голосовом канале
--- или у любого персонажа непустая очередь. Вызывает сторож паузы; voice — есть ли люди в голосовом канале.
+-- Правило паузы одним неделимым шагом: игра идёт, пока в ней есть люди или у подключённого бота непустая очередь.
+-- Вызывает сторож паузы. hold — внешняя причина не ставить паузу (прежнее имя параметра — voice).
 O.register('pause_if_idle', {admin = true, fn = function(_, p)
   local ignore = {}
   for _, n in pairs(p.ignore or {}) do ignore[n] = true end
   local humans = 0
   for _, pl in pairs(game.connected_players) do if not ignore[pl.name] then humans = humans + 1 end end
-  local busy = busy_count()
-  local want = humans == 0 and not p.voice and busy == 0
+  local busy, silent = busy_count()
+  local want = humans == 0 and not p.voice and not p.hold and busy == 0
   local changed = game.tick_paused ~= want
   game.tick_paused = want
-  return {paused = want, changed = changed, humans = humans, busy = busy}
+  return {paused = want, changed = changed, humans = humans, busy = busy, silent = silent}
 end})
 
 O.register('agents', {fn = function()
@@ -128,6 +135,21 @@ O.register('show', {admin = true, fn = function(_, p)
   if (p.what == 'camera' or p.what == 'follow') and not (A and A.entity and A.entity.valid) then U.fail('not_found', 'нет такого бота') end
   Gui.show(player, p.what, A)
   return {shown = p.what}
+end})
+
+-- Объявление в игровой чат не от бота (ответы разработчиков на заявки, сообщения об обновлениях): его видят люди
+-- в игре, оно попадает в историю чата и приходит ботам событием chat, как любое сообщение.
+O.register('announce', {admin = true, fn = function(_, p)
+  U.arg(p.text, 'string', 'text')
+  local from = type(p.from) == 'string' and p.from or 'разработчики'
+  storage.vb_chat = storage.vb_chat or {seq = 0, items = {}}
+  local c = storage.vb_chat
+  c.seq = c.seq + 1
+  c.items[#c.items + 1] = {seq = c.seq, from = from, text = p.text}
+  if #c.items > 50 then table.remove(c.items, 1) end
+  game.print('[color=0.6,0.8,1]' .. from .. ':[/color] ' .. p.text)
+  J.chat(from, p.text)
+  return {sent = true}
 end})
 
 -- Бот жив: сервер на хосте шлёт это, когда запросы бота до мода не доходят (чтение буфера событий).

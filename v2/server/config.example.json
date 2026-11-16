@@ -3,6 +3,7 @@
   "rcon": { "host": "127.0.0.1", "port": 27015, "password": "<пароль RCON из rcon.json>" },
   "tokens": "../../mcp-tokens.json",
   "logDir": "log",
+  "publicUrl": "https://<внешний адрес>",
   "holdFile": "/home/<пользователь>/robot/hold",
   "pollMs": 100
 }

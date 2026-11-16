@@ -6,7 +6,7 @@
 //   GET  /v2/help         описание операций
 //
 // Настройки — config.json рядом (или путь в V2_CONFIG): { http: {host, port}, rcon: {host, port, password},
-// tokens: "файл с токенами", logDir: "каталог журналов" }.
+// tokens: "файл с токенами", logDir: "каталог журналов", publicUrl: "внешний адрес — для справки ботам" }.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -147,7 +147,7 @@ async function runSingleAction(who, op, body) {
 }
 
 const special = {
-  async help() { return helpDocument(game.info); },
+  async help() { return helpDocument(game.info, conf.publicUrl); },
 
   async act(who, body) { return runAct(who, body); },
 
@@ -342,6 +342,8 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'GET') for (const [k, v] of url.searchParams) { try { body[k] = JSON.parse(v); } catch { body[k] = v; } }
     else throw new GameError('bad_request', 'метод: POST (или GET для запросов без тела)');
     if (req.headers['x-forwarded-for']) body[EXTERNAL] = true;
+    // Права администратора — только изнутри: снаружи токен администратора не действует.
+    if (body[EXTERNAL] && who.admin) throw new GameError('forbidden', 'операции администратора снаружи недоступны');
     // Сервер игры перезапускается: запрос ждёт его возвращения (снаружи — меньше, под таймауты nginx), а не отклоняется.
     if (!game.ready && !['metrics', 'feedback', 'feedback_status', 'help'].includes(op)) {
       const t1 = performance.now();
