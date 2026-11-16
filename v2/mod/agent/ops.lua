@@ -143,8 +143,8 @@ O.register('show', {admin = true, fn = function(_, p)
   if not player then U.fail('not_found', 'нет такого игрока') end
   local A = p.agent and storage.agent.agents[p.agent]
   if (p.what == 'camera' or p.what == 'follow') and not (A and A.entity and A.entity.valid) then U.fail('not_found', 'нет такого бота') end
-  Gui.show(player, p.what, A)
-  return {shown = p.what}
+  local given = Gui.show(player, p.what, A, p)
+  return {shown = p.what, given = given}
 end})
 
 -- Выход из игры и возвращение — как у человека, который отключился от сервера: персонаж исчезает из мира со всем,

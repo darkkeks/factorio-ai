@@ -129,6 +129,56 @@ test('строка чертежа: экспорт, импорт под друг�
   ok((await call(A, 'blueprint_delete', { name: 'pair-copy' })).ok);
 });
 
+test('чертежи ботов видны людям: окно «Чертежи ботов», чертёж или книга в руку, список следует за сохранением и удалением', async () => {
+  const player = await lua(`for _, p in pairs(game.players) do if p.cursor_stack then return p.name end end return false`);
+  ok(player, 'на стенде нет игрока с рукой');
+  await lua(`local p = game.get_player(A.p) p.cursor_stack.clear() if p.gui.left.agent_bps then p.gui.left.agent_bps.destroy() end return true`, { p: player });
+  ok((await call(A, 'blueprint_save', { name: 'gui-one', entities: [{ name: 'stone-furnace', x: 1, y: 1 }, { name: 'inserter', x: 2.5, y: 0.5 }] })).ok);
+  ok((await call(A, 'blueprint_save', { name: 'gui-team', team: true, entities: [{ name: 'wooden-chest', x: 0.5, y: 0.5 }] })).ok);
+  const rows = () => lua(`
+    local out = {}
+    local function walk(el)
+      local t = el.tags
+      if t and t.agent_do == 'bp_take' and t.name then out[#out + 1] = t.owner .. ':' .. t.name end
+      for _, c in pairs(el.children) do walk(c) end
+    end
+    walk(game.get_player(A.p).gui.left.agent_bps)
+    return out`, { p: player });
+  ok((await call('t-admin', 'show', { player, what: 'blueprints' })).ok);
+  let list = await rows();
+  ok(list.includes(`${NAME}:gui-one`) && list.includes('*:gui-team') && list.includes(`${NAME}:pair`), JSON.stringify(list));
+  const hand = () => lua(`
+    local p = game.get_player(A.p)
+    local s = p.cursor_stack
+    if not s.valid_for_read then return {empty = true} end
+    local r = {name = s.name, label = s.label, temporary = p.cursor_stack_temporary}
+    if s.is_blueprint then r.entities = #s.get_blueprint_entities() end
+    if s.is_blueprint_book then
+      r.inside = {}
+      local inv = s.get_inventory(defines.inventory.item_main)
+      for i = 1, #inv do if inv[i].valid_for_read then r.inside[#r.inside + 1] = inv[i].label end end
+    end
+    return r`, { p: player });
+  const one = await call('t-admin', 'show', { player, what: 'blueprint', owner: NAME, name: 'gui-one' });
+  ok(one.ok && one.given === true, JSON.stringify(one));
+  let h = await hand();
+  ok(h.name === 'blueprint' && h.label === 'gui-one' && h.entities === 2 && h.temporary === true, JSON.stringify(h));
+  // Рука занята прежним чертежом: он временный и уступает место книге.
+  const book = await call('t-admin', 'show', { player, what: 'blueprint', owner: NAME });
+  ok(book.ok, JSON.stringify(book));
+  h = await hand();
+  ok(h.name === 'blueprint-book' && h.inside.includes('gui-one') && h.inside.includes('pair') && !h.inside.includes('gui-team'), JSON.stringify(h));
+  const team = await call('t-admin', 'show', { player, what: 'blueprint', owner: 'team', name: 'gui-team' });
+  ok(team.ok, JSON.stringify(team));
+  eq((await hand()).label, 'gui-team');
+  ok((await call(A, 'blueprint_delete', { name: 'gui-one' })).ok && (await call(A, 'blueprint_delete', { name: 'gui-team' })).ok);
+  await call('t-admin', 'show', { player, what: 'blueprints' });
+  list = await rows();
+  ok(!list.includes(`${NAME}:gui-one`) && !list.includes('*:gui-team') && list.includes(`${NAME}:pair`), JSON.stringify(list));
+  eq((await call('t-admin', 'show', { player, what: 'blueprint', owner: NAME, name: 'gui-one' })).error.code, 'not_found');
+  await lua(`local p = game.get_player(A.p) p.cursor_stack.clear() p.gui.left.agent_bps.destroy() return true`, { p: player });
+});
+
 test('проверка без постановки показывает, что во что упирается; superforced помечает мешающее на снос', async () => {
   await reset({}, 2.5, 2.5);
   await world(`local s = game.surfaces.nauvis s.create_entity{name = 'wooden-chest', position = {A.ox + 21.5, A.oy + 10.5}, force = 'player'} s.create_entity{name = 'tree-01', position = {A.ox + 23.5, A.oy + 10.5}} return true`);

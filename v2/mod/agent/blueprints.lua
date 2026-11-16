@@ -166,7 +166,20 @@ function BP.store(A, name, rec, team)
   local old = s[name]
   if old and team and old.by ~= A.name then U.fail('not_allowed', 'общий чертёж ' .. name .. ' сохранил ' .. tostring(old.by) .. ': заменить его может только автор') end
   s[name] = rec
+  BP.touch()
   return owner
+end
+
+--- Отметить, что набор чертежей изменился: открытые у людей окна «Чертежи ботов» перерисуются.
+function BP.touch()
+  local st = storage.agent
+  st.bp_rev = (st.bp_rev or 0) + 1
+end
+
+function BP.remove(owner, name)
+  local s = shelf(owner)
+  if s then s[name] = nil end
+  BP.touch()
 end
 
 --- Загрузить запись в предмет-чертёж, применить поворот и отражение. Возвращает списки и размер.

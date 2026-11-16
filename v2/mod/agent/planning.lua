@@ -479,7 +479,7 @@ O.register('blueprint_delete', {agent = true, write = true, fn = function(A, p)
   U.arg(p.name, 'string', 'name')
   local rec, owner = BP.find(A, p.name)
   if owner == BP.TEAM and rec.by ~= A.name then U.fail('not_allowed', 'общий чертёж может удалить только автор (' .. tostring(rec.by) .. ')') end
-  storage.agent.blueprints[owner][p.name] = nil
+  BP.remove(owner, p.name)
   return {deleted = p.name}
 end})
 
