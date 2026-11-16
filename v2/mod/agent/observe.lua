@@ -67,6 +67,9 @@ local function full(e, force)
   end
   if e.type == 'character-corpse' then
     r.items = U.contents(e.get_inventory(defines.inventory.character_corpse))
+    r.died_tick = e.character_corpse_tick_of_death
+    local rec = storage.agent.corpses[math.floor(e.position.x * 256 + 0.5) .. ',' .. math.floor(e.position.y * 256 + 0.5)]
+    if rec then r.bot = rec.agent end
     return r
   end
   if e.type == 'character' then

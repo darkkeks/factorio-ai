@@ -58,6 +58,12 @@ end
 local function transfer_one(A, it)
   local e, ent = A.entity, it.entity
   if not ent.valid then U.fail('not_found', 'объекта уже нет') end
+  if ent.type == 'character-corpse' then
+    -- Кто последним брал из трупа: попадёт в событие corpse_gone его владельцу.
+    local p = ent.position
+    local rec = storage.agent.corpses[math.floor(p.x * 256 + 0.5) .. ',' .. math.floor(p.y * 256 + 0.5)]
+    if rec then rec.by = A.name end
+  end
   if ent.force ~= e.force and ent.force.name ~= 'neutral' and ent.type ~= 'character-corpse' then
     U.fail('not_allowed', 'это объект чужой команды')
   end

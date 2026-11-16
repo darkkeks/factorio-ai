@@ -157,6 +157,30 @@ test('transfer: вне досягаемости без approach — out_of_reach
   ok(r.ok && r.moved === 3 && r.walked > 20, JSON.stringify(r));
 });
 
+test('гибель: agent_died с перечнем потерянного, труп в inspect, corpse_gone, когда его опустошили', async () => {
+  await reset({ coal: 10, 'iron-plate': 5 }, 20.5, 15.5);
+  await world(`local e = storage.agent.agents[A.name].entity
+    e.get_inventory(defines.inventory.character_guns).insert{name = 'pistol', count = 1}
+    e.die() return true`, { name: NAME });
+  const s0 = (await call(A, 'events')).seq;
+  const died = (await call(A, 'events', { since: s0 - 20, types: ['agent_died'] })).events.pop();
+  ok(died && died.lost.coal === 10 && died.lost['iron-plate'] === 5 && died.lost.pistol === 1, JSON.stringify(died));
+  await world(`storage.agent.agents[A.name].entity.teleport({A.ox + 22.5, A.oy + 15.5}) return true`, { name: NAME });
+  const target = { ...P(20.5, 15.5), name: 'character-corpse' };
+  const i = await call(A, 'inspect', { target });
+  ok(i.ok && i.found && i.items.coal === 10 && i.bot === NAME && i.died_tick > 0, JSON.stringify(i));
+  let r = await call(A, 'transfer', { target, direction: 'take', item: 'coal' });
+  ok(r.ok && r.moved === 10, JSON.stringify(r));
+  let ev = await call(A, 'events', { since: s0, types: ['corpse_gone'] });
+  eq(ev.events.length, 0);
+  r = await call(A, 'transfer', { target, direction: 'take' });
+  ok(r.ok && r.moved === 6, JSON.stringify(r));
+  ev = await call(A, 'events', { since: s0, wait_s: 3, types: ['corpse_gone'] });
+  const gone = ev.events[0];
+  ok(gone && gone.reason === 'emptied' && gone.by === NAME && !gone.items_left, JSON.stringify(ev));
+  ok(!(await call(A, 'inspect', { target })).found, 'трупа больше нет');
+});
+
 test('craft: очередь ручного крафта, wait craft_empty, событие craft_done', async () => {
   await reset({ 'iron-plate': 20 });
   const s0 = (await call(A, 'events')).seq;

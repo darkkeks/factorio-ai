@@ -10,6 +10,39 @@ local E = {handlers = {}, nth = {}}
 
 local DAMAGE_EVERY = 300 -- повторный урон по тому же объекту — не чаще раза в 5 секунд
 
+-- Трупы персонажей ботов: ключ — место (у трупа нет номера), значение — {agent, tick, by — кто последним забирал}.
+local function corpse_key(pos) return math.floor(pos.x * 256 + 0.5) .. ',' .. math.floor(pos.y * 256 + 0.5) end
+E.corpse_key = corpse_key
+
+local CARRIED = {defines.inventory.character_main, defines.inventory.character_guns, defines.inventory.character_ammo,
+  defines.inventory.character_armor, defines.inventory.character_trash}
+
+-- Всё, что было при персонаже: оно остаётся в трупе. К событию гибели игра уже переложила вещи в труп,
+-- поэтому читаем его; если трупа ещё нет — то, что осталось при персонаже.
+local function carried(e)
+  local out = {}
+  for _, c in pairs(e.surface.find_entities_filtered{type = 'character-corpse', position = e.position, radius = 0.5}) do
+    if c.character_corpse_tick_of_death == game.tick then
+      for k, n in pairs(U.contents(c.get_inventory(defines.inventory.character_corpse))) do out[k] = (out[k] or 0) + n end
+    end
+  end
+  for _, id in ipairs(CARRIED) do
+    for k, n in pairs(U.contents(e.get_inventory(id))) do out[k] = (out[k] or 0) + n end
+  end
+  return out
+end
+
+local function corpse_gone(corpse, reason, by)
+  local corpses = storage.agent.corpses
+  local key = corpse_key(corpse.position)
+  local rec = corpses[key]
+  if not rec then return end
+  corpses[key] = nil
+  local left = U.contents(corpse.get_inventory(defines.inventory.character_corpse))
+  J.add('corpse_gone', rec.agent, {position = U.pos(corpse.position), reason = reason, by = by or rec.by,
+    died_tick = rec.tick, items_left = next(left) and left or nil})
+end
+
 local function who(cause)
   if not (cause and cause.valid) then return nil end
   local name = storage.agent.by_unit[cause.unit_number or 0]
@@ -48,6 +81,8 @@ E.handlers[defines.events.on_entity_died] = function(ev)
     local A = st.agents[name]
     A.deaths = A.deaths + 1
     local where = U.pos(e.position)
+    local lost = carried(e)
+    st.corpses[corpse_key(e.position)] = {agent = name, tick = game.tick}
     -- Очередь погибшего обрывается; новый персонаж появляется у точки возрождения с пустым инвентарём.
     for _, act in ipairs(A.queue) do act.on_fail = 'stop' end
     if A.queue[1] then
@@ -64,11 +99,25 @@ E.handlers[defines.events.on_entity_died] = function(ev)
     A.unit, A.entity = nil, nil
     local ok, err = pcall(S.spawn, A)
     J.add('agent_died', name, {position = where, by = who(ev.cause), respawned = ok,
-      respawn_position = ok and U.pos(A.entity.position) or nil})
+      respawn_position = ok and U.pos(A.entity.position) or nil, lost = lost})
   elseif unit and e.type ~= 'character' then
     J.add('entity_died', nil, {name = e.name, unit = unit, position = U.pos(e.position), by = who(ev.cause),
       by_force = ev.force and ev.force.name or nil})
   end
+end
+
+-- Труп исчезает, когда из него забрали всё (или по сроку, если он задан); человек может ещё и снять его добычей.
+E.handlers[defines.events.on_character_corpse_expired] = function(ev)
+  local c = ev.corpse
+  if not (c and c.valid) then return end
+  local inv = c.get_inventory(defines.inventory.character_corpse)
+  corpse_gone(c, (not inv or inv.is_empty()) and 'emptied' or 'expired')
+end
+E.handlers[defines.events.on_pre_player_mined_item] = function(ev)
+  local c = ev.entity
+  if not (c and c.valid) or c.type ~= 'character-corpse' then return end
+  local p = game.get_player(ev.player_index)
+  corpse_gone(c, 'mined', p and p.name or nil)
 end
 
 -- Постройки ставят и снимают пачками: в журнал идёт сводка раз в секунду на автора, а не событие на каждую.

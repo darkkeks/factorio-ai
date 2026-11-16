@@ -10,7 +10,7 @@ local Gui = require('agent.gui')
 local Legacy = require('agent.legacy')
 
 local S = {}
-S.VERSION = 7
+S.VERSION = 8
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}

@@ -519,7 +519,11 @@ export const EVENT_TYPES = {
   queue_empty: 'своя очередь действий опустела',
   craft_done: 'очередь ручного крафта опустела',
   agent_damaged: 'свой персонаж получил урон: {health, damage, by, position}; не чаще раза в 5 секунд',
-  agent_died: 'свой персонаж погиб: {position — место трупа, by, respawn_position}; новый персонаж — у точки возрождения, с пустым инвентарём',
+  agent_died: 'свой персонаж погиб: {position — место трупа, by, respawn_position, lost: {предмет: количество} — что осталось в трупе}; новый персонаж — у точки возрождения, ' +
+    'с пустым инвентарём. Труп лежит, пока из него не заберут всё (сам не исчезает, старый с новым не сливается, враги его не трогают): inspect с target {x, y, name: "character-corpse"} → ' +
+    '{items, bot — чей, died_tick}; забрать — transfer take с той же целью',
+  corpse_gone: 'труп своего персонажа исчез: {position, reason: emptied — из него забрали всё | mined — снят человеком | expired, by? — бот, последним бравший из трупа, или человек, снявший его, ' +
+    'died_tick, items_left? — что пропало вместе с трупом}. Если вещи забрал человек через окно трупа, by нет',
   entity_damaged: 'постройка команды повреждена: {name, unit, position, health, max_health, by}; по одному объекту не чаще раза в 5 секунд',
   entity_died: 'постройка команды разрушена: {name, unit, position, by, by_force}',
   research_finished: 'исследование завершено: {name, level}',
