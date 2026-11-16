@@ -7,8 +7,9 @@
 // заявку людям (статус discussion).
 //
 // Правки не выходят по одной: правка мода требует перезапуска сервера игры. Поэтому готовые правки копятся в git,
-// а на рабочий сервер выходят пакетом (src/release.mjs): когда очередь разобрана и в игре нет людей — либо сразу
-// по просьбе человека (node src/feedback.mjs release). Правки только сервера ботов и правил выходят без ожидания.
+// а на рабочий сервер выходят пакетом (src/release.mjs): автоматически между заходами, не чаще одного выпуска
+// в 30 минут (людей в игре предупреждают в чате за 20 секунд), либо сразу по просьбе человека
+// (node src/feedback.mjs release). Правки правил доходят до ботов без выпуска.
 //
 //   tmux new-window -d -t 0: -n feedback-worker 'cd ~/claude/discord-voice && node src/feedback-worker.mjs 2>&1 | tee -a feedback/worker.log'
 import fs from 'node:fs';
@@ -17,7 +18,7 @@ import path from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { ROOT } from './config.mjs';
 import { readItems, setStatus, markAnnounced, readRelease, submitFeedback, RELEASE_NOW } from './feedback.mjs';
-import { pending, release, humans } from './release.mjs';
+import { pending, release } from './release.mjs';
 import { lua } from './rcon.mjs';
 
 const CLAUDE = process.env.WORKER_CLAUDE_BIN || path.join(os.homedir(), 'claude/claude-code/bin/claude');
@@ -32,7 +33,7 @@ const TOOLS = ['Read', 'Glob', 'Grep',
   'Bash(node --check *)', 'Bash(v2/tools/reload.sh*)', 'Bash(v2/tools/test-server.sh *)', 'Bash(v2/tools/test-api.sh *)', 'Bash(v2/tools/verify.sh*)',
   'Bash(node v2/tests/*)', 'Bash(node v2/tools/rc.mjs *)', 'Bash(v2/tools/apidoc.py *)', 'Bash(curl -s http://127.0.0.1:8790/*)',
   'Bash(git diff *)', 'Bash(git status *)', 'Bash(git log *)'];
-const MIN_RELEASE_GAP_MS = 10 * 60_000; // пакеты с перезапуском игры — не чаще
+const MIN_RELEASE_GAP_MS = 30 * 60_000; // выпуски — не чаще одного в 30 минут
 
 const log = (...a) => console.log(new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace('T', ' '), ...a);
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' });
@@ -173,39 +174,37 @@ async function announce() {
   }
 }
 
-// Выпуск накопленного пакета. Правки мода — только когда в игре нет людей (или по просьбе человека) и не слишком часто;
-// пока в очереди есть неразобранные заявки, пакет копится дальше.
+// Выпуск накопленного пакета — автоматически, между заходами, не чаще одного выпуска в 30 минут.
+// Людей в игре перед перезапуском предупреждают в чате (это делает release). Команда человека
+// (node src/feedback.mjs release) выпускает сразу, без оглядки на 30 минут.
 let lastWait = '';
-async function maybeRelease(queueLength) {
+async function maybeRelease() {
   const force = fs.existsSync(RELEASE_NOW);
   const p = pending();
   if (p.blocked) { if (lastWait !== p.blocked) log(`выпуск остановлен: ${p.blocked}`); lastWait = p.blocked; if (force) fs.rmSync(RELEASE_NOW, { force: true }); return; }
   if (!p.mod && !p.server) { if (force) { fs.rmSync(RELEASE_NOW, { force: true }); log('просили выпустить обновление, но выпускать нечего'); } return; }
   if (changes().length) return; // выпускается только закоммиченное
-  let why = '';
+  const what = `${p.mod ? 'мод' : ''}${p.mod && p.server ? ' и ' : ''}${p.server ? 'сервер ботов' : ''}`;
   if (!force) {
-    if (queueLength) why = 'в очереди есть неразобранные заявки';
-    else if (p.mod) {
-      const rel = readRelease();
-      if (rel.at && Date.now() - Date.parse(rel.at) < MIN_RELEASE_GAP_MS) why = 'с прошлого обновления прошло меньше 10 минут';
-      else if (await humans() > 0) why = 'в игре люди';
+    const rel = readRelease();
+    const left = rel.at ? MIN_RELEASE_GAP_MS - (Date.now() - Date.parse(rel.at)) : 0;
+    if (left > 0) {
+      const why = `с прошлого выпуска прошло меньше 30 минут, выйдет после ${new Date(Date.now() + left).toTimeString().slice(0, 5)}`;
+      if (lastWait !== p.head) log(`пакет ждёт выпуска (${what}; ${p.files.length} файлов): ${why}`);
+      lastWait = p.head;
+      return;
     }
-  }
-  if (why) {
-    if (lastWait !== why) log(`пакет ждёт выпуска (${p.mod ? 'мод' : ''}${p.mod && p.server ? ' и ' : ''}${p.server ? 'сервер ботов' : ''}; ${p.files.length} файлов): ${why}`);
-    lastWait = why;
-    return;
   }
   lastWait = '';
   fs.rmSync(RELEASE_NOW, { force: true });
   log(`выпускаю пакет: ${p.files.join(', ')}${force ? ' (по просьбе человека)' : ''}`);
-  const r = await release({ force, log });
+  const r = await release({ force: true, log });
   if (!r.released) {
     log(`пакет не выпущен: ${r.reason}`);
     if (r.failed) await say(`Обновление управления ботами выпустить не удалось, работает прежняя версия: ${r.reason}`.slice(0, 500)).catch(() => {});
     return;
   }
-  log(`пакет выпущен (${r.mod ? 'мод' : ''}${r.mod && r.server ? ' и ' : ''}${r.server ? 'сервер ботов' : ''}); заявки: ${r.ids.join(', ') || 'нет'}`);
+  log(`пакет выпущен (${what}); заявки: ${r.ids.join(', ') || 'нет'}`);
   await sleep(5000); // сессии ботов переподключаются к чату
   await say(`Вышло обновление управления ботами${r.ids.length ? `: начали действовать правки по заявкам ${r.ids.join(', ')}` : ''}. Описание операций — ${'${FX_URL}'}v2/help.`).catch((e) => log(`не сообщил в чат: ${e.message}`));
 }
@@ -236,7 +235,7 @@ for (;;) {
     if (queue.length) await handle(queue);
     push();
     await announce();
-    await maybeRelease(readItems().filter((i) => i.status === 'new').length);
+    await maybeRelease();
   } catch (e) {
     log('ошибка обработчика:', e.message);
   }
