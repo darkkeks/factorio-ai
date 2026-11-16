@@ -165,6 +165,8 @@ export class Agent extends EventEmitter {
                 this.#killInContainer();
                 const pass = ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION'].filter((k) => env[k]).flatMap((k) => ['-e', `${k}=${env[k]}`]);
                 pass.push('-e', 'ENABLE_CLAUDEAI_MCP_SERVERS=false');
+                // Потолок контекста: автосжатие у ~150 тыс. токенов вместо миллионного окна (расход на чтение кэша).
+                pass.push('-e', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=150k');
                 // Доступ к игре: адрес сервера ботов и токен персонажа (имена переменных исторические).
                 pass.push('-e', `FX_URL=${API_URL}`, '-e', `FX_TOKEN=${this.token}`, '-e', `FX_BOT=${this.bot}`, '-e', `FX_HOME=/home/robot/bots/${slug(this.bot)}`);
                 return spawn('docker', ['exec', '-i', '-w', '/home/robot', ...pass, ROBOT_CONTAINER, 'claude', ...args], { stdio: ['pipe', 'pipe', 'inherit'], signal });
