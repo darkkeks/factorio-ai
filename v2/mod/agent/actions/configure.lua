@@ -5,6 +5,8 @@ local T = require('agent.target')
 local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
 local B = require('agent.actions.build')
+local Inv = require('agent.inv')
+local O = require('agent.ops')
 
 local WIRE = {
   red = defines.wire_connector_id.circuit_red,
@@ -84,12 +86,109 @@ local function schedule_records(e, list)
   return records
 end
 
+-- Заявка на предметы для стоящей постройки (то же, что игрок делает призраком предмета по слоту в её окне): игра
+-- создаёт заявку, строительные роботы везут предметы из сети. Слоты выбираются по порядку: свободные или с тем же предметом.
+local function request_list(v)
+  if type(v) ~= 'table' then U.fail('bad_request', 'request_items: {предмет: количество}, список {item, count, inventory?, quality?} или false — снять заявку') end
+  local list = {}
+  if v[1] ~= nil then
+    for i, r in ipairs(v) do list[i] = r end
+  elseif v.item ~= nil then
+    list[1] = v
+  else
+    local names = {}
+    for name in pairs(v) do names[#names + 1] = name end
+    table.sort(names, function(a, b) return tostring(a) < tostring(b) end)
+    for i, name in ipairs(names) do list[i] = {item = name, count = v[name]} end
+  end
+  if #list == 0 or #list > 20 then U.fail('bad_request', 'request_items: от 1 до 20 предметов') end
+  return list
+end
+
+local function request_items(e, ent, v)
+  if ent.type == 'entity-ghost' or ent.type == 'tile-ghost' then
+    U.fail('bad_request', 'request_items: цель — стоящая постройка; призраку предметы задаются при постановке (ghost_place, items)')
+  end
+  local proxy = ent.item_request_proxy
+  if v == false then
+    if proxy then proxy.destroy() end
+    return false
+  end
+  local plan, taken, total = {}, {}, {}
+  for i, r in ipairs(request_list(v)) do
+    local where = 'request_items[' .. i .. ']'
+    local proto = type(r) == 'table' and type(r.item) == 'string' and prototypes.item[r.item]
+    if not proto then U.fail('bad_request', where .. ': нужен item — имя предмета') end
+    if type(r.count) ~= 'number' or r.count < 1 or r.count > 10000 then U.fail('bad_request', where .. ': count — от 1 до 10000') end
+    local quality = r.quality or 'normal'
+    if not prototypes.quality[quality] then U.fail('bad_request', where .. ': нет такого качества: ' .. tostring(quality)) end
+    local iname = r.inventory
+    if iname == nil then
+      if proto.type == 'ammo' then iname = 'ammo'
+      elseif proto.type == 'module' then iname = 'modules'
+      elseif proto.fuel_value > 0 and ent.get_fuel_inventory() then iname = 'fuel'
+      elseif Inv.named(ent, 'main') then iname = 'main'
+      else U.fail('bad_request', where .. ': укажи inventory — fuel, input, modules, ammo, main, robots') end
+    end
+    local inv = type(iname) == 'string' and Inv.named(ent, iname)
+    local id = inv and inv.index
+    if not id then U.fail('bad_request', where .. ': у ' .. ent.name .. ' нет слотов ' .. tostring(iname)) end
+    if not inv.can_insert{name = proto.name, count = 1, quality = quality} then
+      U.fail('no_space', where .. ': ' .. proto.name .. ' не помещается в слоты ' .. iname .. ' у ' .. ent.name)
+    end
+    local left, stack_size, slots = math.floor(r.count), proto.stack_size, {}
+    local filtered = inv.supports_filters()
+    taken[id] = taken[id] or {}
+    for s = 1, math.min(#inv, 400) do
+      if left <= 0 then break end
+      if not taken[id][s] then
+        local st, room = inv[s], 0
+        if st.valid_for_read then
+          if st.name == proto.name and st.quality.name == quality then room = stack_size - st.count end
+        else
+          local f = filtered and inv.get_filter(s)
+          local fname = f and (type(f) == 'table' and f.name or f)
+          if not fname or fname == proto.name then room = stack_size end
+        end
+        if room > 0 then
+          local n = math.min(room, left)
+          slots[#slots + 1] = {inventory = id, stack = s - 1, count = n}
+          taken[id][s] = true
+          left = left - n
+        end
+      end
+    end
+    if left > 0 then
+      U.fail('no_space', where .. ': в слотах ' .. iname .. ' у ' .. ent.name .. ' место только под ' .. (math.floor(r.count) - left) .. ' ' .. proto.name,
+        {fits = math.floor(r.count) - left})
+    end
+    plan[#plan + 1] = {id = {name = proto.name, quality = quality}, items = {in_inventory = slots}}
+    local k = U.item_key(proto.name, quality)
+    total[k] = (total[k] or 0) + math.floor(r.count)
+  end
+  try('request_items', function()
+    if proxy then
+      proxy.insert_plan = plan
+    else
+      proxy = ent.surface.create_entity{name = 'item-request-proxy', position = ent.position, force = ent.force, target = ent, modules = plan}
+      if not proxy then error('игра не приняла заявку для ' .. ent.name) end
+    end
+  end)
+  return total, #ent.surface.find_logistic_networks_by_construction_area(ent.position, ent.force) > 0
+end
+
 local function configure_one(A, it)
   local e, ent = A.entity, it.entity
   if not ent.valid then U.fail('not_found', 'объекта уже нет') end
   if ent.force ~= e.force then U.fail('not_allowed', 'это объект чужой команды') end
   local p = it.p
   local done = {}
+
+  if p.request_items ~= nil then
+    local total, covered = request_items(e, ent, p.request_items)
+    done.request_items = total
+    if total then done.robots_in_range = covered end
+  end
 
   if p.copy_from ~= nil then
     local src = T.get(e.surface, p.copy_from)
@@ -268,8 +367,107 @@ local function configure_one(A, it)
   return B.describe(ent, done)
 end
 
+-- Личные логистические запросы персонажа — вкладка логистики в окне персонажа: предмет, минимум (роботы довезут)
+-- и максимум (лишнее уйдёт в мусорные слоты). Доступно после исследования логистики персонажа, как у игрока.
+local function personal_view(e, point)
+  local out = {}
+  for _, sec in pairs(point.sections) do
+    if sec.is_manual then
+      for i = 1, sec.filters_count do
+        local f = sec.get_slot(i)
+        local v = f and f.value
+        if v and v.name and #out < 200 then
+          out[#out + 1] = {item = v.name, quality = (v.quality and v.quality ~= 'normal') and v.quality or nil, min = f.min or 0, max = f.max,
+            have = e.get_item_count{name = v.name, quality = v.quality or 'normal'}, paused = (not sec.active) or nil}
+        end
+      end
+    end
+  end
+  return out
+end
+
+O.register('logistic_requests', {agent = true, write = true, fn = function(A, p)
+  local e = A.entity
+  local point = e.force.character_logistic_requests and e.get_requester_point()
+  if not point then
+    if p.set == nil and p.clear == nil and p.enabled == nil then return {available = false, requests = U.EMPTY} end
+    U.fail('not_allowed', 'личные логистические запросы ещё не исследованы (технология logistic-robotics)')
+  end
+  if p.enabled ~= nil then
+    if type(p.enabled) ~= 'boolean' then U.fail('bad_request', 'enabled: true | false') end
+    point.enabled = p.enabled
+  end
+  local function manual(create)
+    for _, sec in pairs(point.sections) do if sec.is_manual then return sec end end
+    return create and point.add_section() or nil
+  end
+  local function find(name, quality)
+    for _, sec in pairs(point.sections) do
+      if sec.is_manual then
+        for i = 1, sec.filters_count do
+          local f = sec.get_slot(i)
+          local v = f and f.value
+          if v and v.name == name and (v.quality or 'normal') == quality then return sec, i end
+        end
+      end
+    end
+  end
+  if p.clear ~= nil then
+    if p.clear == true then
+      for _, sec in pairs(point.sections) do
+        if sec.is_manual then for i = sec.filters_count, 1, -1 do sec.clear_slot(i) end end
+      end
+    elseif type(p.clear) == 'table' then
+      if #p.clear > 100 then U.fail('bad_request', 'clear: не больше 100 предметов') end
+      for _, c in ipairs(p.clear) do
+        local name = type(c) == 'table' and c.item or c
+        local sec, i = find(name, type(c) == 'table' and c.quality or 'normal')
+        if sec then sec.clear_slot(i) end
+      end
+    else
+      U.fail('bad_request', 'clear: true — снять все запросы, или список предметов')
+    end
+  end
+  if p.set ~= nil then
+    if type(p.set) ~= 'table' then U.fail('bad_request', 'set: список {item, min, max?, quality?}') end
+    local list = p.set.item ~= nil and {p.set} or p.set
+    if #list == 0 or #list > 100 then U.fail('bad_request', 'set: от 1 до 100 запросов {item, min, max?, quality?}') end
+    for i, r in ipairs(list) do
+      local where = 'set[' .. i .. ']'
+      if type(r) ~= 'table' or type(r.item) ~= 'string' or not prototypes.item[r.item] then U.fail('bad_request', where .. ': нужен item — имя предмета') end
+      local min, max = r.min or 0, r.max
+      if type(min) ~= 'number' or min < 0 or min > 1000000 then U.fail('bad_request', where .. ': min — число от 0') end
+      if max ~= nil and (type(max) ~= 'number' or max < min or max > 1000000) then U.fail('bad_request', where .. ': max — число не меньше min') end
+      if r.quality ~= nil and not prototypes.quality[r.quality] then U.fail('bad_request', where .. ': нет такого качества: ' .. tostring(r.quality)) end
+    end
+    for i, r in ipairs(list) do
+      local quality = r.quality or 'normal'
+      local sec, slot = find(r.item, quality)
+      if not sec then
+        sec = manual(true)
+        if not sec then U.fail('blocked', 'игра не дала добавить раздел запросов') end
+        slot = sec.filters_count + 1
+        for k = 1, sec.filters_count do
+          local f = sec.get_slot(k)
+          if not (f and f.value) then slot = k break end
+        end
+      end
+      try('set[' .. i .. ']', function()
+        sec.set_slot(slot, {value = {type = 'item', name = r.item, quality = quality, comparator = '='},
+          min = math.floor(r.min or 0), max = r.max and math.floor(r.max) or nil})
+      end)
+    end
+  end
+  local net = e.logistic_network
+  return {available = true, enabled = point.enabled, in_network = net ~= nil,
+    trash_slots = #(e.get_inventory(defines.inventory.character_trash) or {}),
+    trash = U.contents(e.get_inventory(defines.inventory.character_trash)),
+    requests = U.list(personal_view(e, point))}
+end})
+
 local SETTINGS = {'copy_from', 'recipe', 'recipe_quality', 'direction', 'rotate', 'filters', 'filter_mode', 'input_priority',
-  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'platform_requests', 'launch', 'control', 'wire'}
+  'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'platform_requests', 'launch', 'control', 'wire',
+  'request_items'}
 
 local function check_one(it, where)
   if type(it) ~= 'table' or type(it.target) ~= 'table' then U.fail('bad_request', where .. ': нужен target — {unit} или {x, y, name?}') end

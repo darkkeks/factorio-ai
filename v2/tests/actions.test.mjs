@@ -381,6 +381,90 @@ test('configure: рецепт, поворот, копирование настр
   ok(r.ok, JSON.stringify(r));
 });
 
+// Сеть роботов рядом с персонажем: робопорт с питанием, роботы, сундук-поставщик с запасом.
+const robots = (stock) => world(`
+  local s, f = game.surfaces.nauvis, game.forces.player
+  local rp = s.create_entity{name = 'roboport', position = {A.ox + 30, A.oy + 24}, force = f}
+  s.create_entity{name = 'electric-energy-interface', position = {A.ox + 35, A.oy + 24}, force = f}
+  s.create_entity{name = 'substation', position = {A.ox + 33, A.oy + 27}, force = f}
+  rp.insert{name = 'logistic-robot', count = 10}
+  rp.insert{name = 'construction-robot', count = 10}
+  local c = s.create_entity{name = 'passive-provider-chest', position = {A.ox + 26.5, A.oy + 20.5}, force = f}
+  for name, n in pairs(A.stock) do c.insert{name = name, count = n} end
+  return true`, { stock });
+
+test('configure request_items: заявка роботам на предметы для стоящей постройки', async () => {
+  await reset({});
+  await robots({ 'piercing-rounds-magazine': 100, coal: 50 });
+  await world(`local s = game.surfaces.nauvis
+    s.create_entity{name = 'gun-turret', position = {A.ox + 34, A.oy + 16}, force = 'player'}
+    s.create_entity{name = 'stone-furnace', position = {A.ox + 34, A.oy + 19}, force = 'player'}
+    return true`);
+  const turret = { ...P(34, 16), name: 'gun-turret' }, furnace = { ...P(34, 19), name: 'stone-furnace' };
+  let r = await call(A, 'configure', { target: turret, request_items: { 'piercing-rounds-magazine': 12 } });
+  ok(r.ok && r.request_items['piercing-rounds-magazine'] === 12 && r.robots_in_range === true, JSON.stringify(r));
+  let ins = await call(A, 'inspect', { target: turret });
+  ok(ins.requests && ins.requests['piercing-rounds-magazine'] === 12, 'заявка видна в inspect: ' + JSON.stringify(ins));
+  r = await call(A, 'configure', { target: furnace, request_items: [{ item: 'coal', count: 5 }] });
+  ok(r.ok && r.request_items.coal === 5, JSON.stringify(r));
+  r = await call(A, 'configure', { target: turret, request_items: { 'piercing-rounds-magazine': 5000 } });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  r = await call(A, 'configure', { target: turret, request_items: { 'iron-plate': 5 } });
+  ok(!r.ok && r.error.code === 'bad_request', 'турели некуда класть пластины: ' + JSON.stringify(r));
+  r = await call(A, 'configure', { target: turret, request_items: { 'нет-такого': 5 } });
+  ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+  let got;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    got = await world(`local s = game.surfaces.nauvis
+      local t = s.find_entity('gun-turret', {A.ox + 34, A.oy + 16}) local fu = s.find_entity('stone-furnace', {A.ox + 34, A.oy + 19})
+      return {ammo = t.get_item_count('piercing-rounds-magazine'), coal = fu.get_item_count('coal')}`);
+    if (got.ammo === 12 && got.coal === 5) break;
+  }
+  ok(got.ammo === 12 && got.coal === 5, 'роботы привезли ровно заказанное: ' + JSON.stringify(got));
+  ins = await call(A, 'inspect', { target: turret });
+  ok(!ins.requests, 'заявка исполнена: ' + JSON.stringify(ins.requests));
+  // Снятие заявки: роботы ничего не везут.
+  r = await call(A, 'configure', { target: turret, request_items: { 'piercing-rounds-magazine': 20 } });
+  ok(r.ok, JSON.stringify(r));
+  r = await call(A, 'configure', { target: turret, request_items: false });
+  ok(r.ok && r.request_items === false, JSON.stringify(r));
+  ins = await call(A, 'inspect', { target: turret });
+  ok(!ins.requests, 'заявка снята: ' + JSON.stringify(ins.requests));
+});
+
+test('logistic_requests: личные запросы персонажа, роботы довозят до min', async () => {
+  await reset({});
+  const was = await world(`local f = game.forces.player local was = f.character_logistic_requests f.character_logistic_requests = false return {was = was}`);
+  try {
+    let r = await call(A, 'logistic_requests', {});
+    ok(r.ok && r.available === false, 'не исследовано: ' + JSON.stringify(r));
+    r = await call(A, 'logistic_requests', { set: [{ item: 'iron-plate', min: 10 }] });
+    ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
+    await world(`game.forces.player.character_logistic_requests = true return true`);
+    await call(A, 'logistic_requests', { clear: true });
+    await robots({ 'iron-plate': 200, 'copper-plate': 100 });
+    r = await call(A, 'logistic_requests', { set: [{ item: 'iron-plate', min: 30, max: 60 }, { item: 'copper-plate', min: 10 }] });
+    ok(r.ok && r.available && r.enabled && r.requests.length === 2, JSON.stringify(r));
+    const iron = r.requests.find((x) => x.item === 'iron-plate');
+    ok(iron.min === 30 && iron.max === 60 && iron.have === 0, JSON.stringify(r));
+    r = await call(A, 'logistic_requests', { set: [{ item: 'iron-plate', min: 40 }], clear: ['copper-plate'] });
+    ok(r.ok && r.requests.length === 1 && r.requests[0].min === 40 && r.in_network === true, 'изменение и снятие одного: ' + JSON.stringify(r));
+    r = await call(A, 'logistic_requests', { set: [{ item: 'iron-plate', min: 50, max: 10 }] });
+    ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+    let have = 0;
+    for (let i = 0; i < 40 && have < 40; i++) { await sleep(500); have = (await inv())['iron-plate'] || 0; }
+    ok(have === 40, 'роботы привезли 40 пластин: ' + have);
+    eq((await inv())['copper-plate'], undefined);
+    r = await call(A, 'logistic_requests', { clear: true });
+    ok(r.ok && r.requests.length === 0, JSON.stringify(r));
+  } finally {
+    await world(`local e = storage.agent.agents[A.name].entity local p = e.get_requester_point()
+      if p then for _, sec in pairs(p.sections) do if sec.is_manual then for i = sec.filters_count, 1, -1 do sec.clear_slot(i) end end end end
+      game.forces.player.character_logistic_requests = A.was return true`, { name: NAME, was: was.was });
+  }
+});
+
 test('configure: ракетная шахта — груз в ракету, запуск, автозапросы', async () => {
   await reset({ 'space-platform-starter-pack': 1, 'wooden-chest': 1 });
   const silo = { ...P(38.5, 15.5), name: 'rocket-silo' };

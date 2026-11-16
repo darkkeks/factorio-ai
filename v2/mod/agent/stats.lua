@@ -286,7 +286,15 @@ O.register('enemies', {agent = true, fn = function(A, p)
   end
   table.sort(nests, function(a, b) return a.distance < b.distance end)
   table.sort(worms, function(a, b) return a.distance < b.distance end)
-  return {center = U.pos(c), radius = radius, evolution = U.r2(game.forces.enemy.get_evolution_factor(surface)),
+  -- Разбивка эволюции — то же, что игроку пишет команда /evolution: доли времени, загрязнения и уничтоженных гнёзд.
+  local enemy = game.forces.enemy
+  local bt, bp, bk = enemy.get_evolution_factor_by_time(surface), enemy.get_evolution_factor_by_pollution(surface),
+    enemy.get_evolution_factor_by_killing_spawners(surface)
+  local sum = bt + bp + bk
+  local function share(v) return sum > 0 and math.floor(v / sum * 100 + 0.5) or 0 end
+  return {center = U.pos(c), radius = radius, evolution = U.r2(enemy.get_evolution_factor(surface)),
+    evolution_percent = math.floor(enemy.get_evolution_factor(surface) * 10000 + 0.5) / 100,
+    evolution_by = {time = share(bt), pollution = share(bp), kills = share(bk)},
     nests = U.list(nests), worms = U.list(worms), units = units, units_total = unit_count or 0, nearest_unit = nearest}
 end})
 

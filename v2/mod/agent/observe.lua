@@ -124,6 +124,19 @@ local function full(e, force)
     end
   end
   if next(inv) then r.inventory = inv end
+  -- Заявка на предметы для роботов (значок над постройкой): что ещё не привезли.
+  r.requests = try(function()
+    local proxy = e.item_request_proxy
+    if not proxy then return nil end
+    local out = {}
+    for _, pl in pairs(proxy.insert_plan) do
+      local n = 0
+      for _, s in pairs(pl.items.in_inventory or {}) do n = n + (s.count or 1) end
+      local k = U.item_key(pl.id.name, pl.id.quality)
+      out[k] = (out[k] or 0) + n
+    end
+    return next(out) and out or nil
+  end)
   if e.burner then
     r.fuel_burning = try(function() local b = e.burner.currently_burning return b and b.name.name end)
     r.fuel_left = e.burner.remaining_burning_fuel > 0 or (inv.fuel ~= nil)

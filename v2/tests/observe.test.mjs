@@ -100,6 +100,8 @@ test('туман войны: объект вне обзора — по памя�
   ok(biter.found === false, 'враг вне обзора не виден: ' + JSON.stringify(biter));
   const en = await call(A, 'enemies', { x: F.x, y: F.y, radius: 20 });
   ok(en.units_total === 0 && en.nests.length === 1 && en.nests[0].memory === true, JSON.stringify(en));
+  const by = en.evolution_by;
+  ok(by && [by.time, by.pollution, by.kills].every((v) => v >= 0 && v <= 100) && typeof en.evolution_percent === 'number', 'разбивка эволюции: ' + JSON.stringify(by));
   const found = await call(A, 'find', { names: ['wooden-chest', 'iron-chest', 'small-biter'], x: F.x, y: F.y, radius: 20 });
   ok(found.total === 1 && found.objects[0].memory && found.objects[0].name === 'wooden-chest', JSON.stringify(found));
   const ar = await call(A, 'area', { area: { x1: F.x - 2, y1: F.y - 2, x2: F.x + 10, y2: F.y + 10 }, objects: true });

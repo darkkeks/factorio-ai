@@ -151,6 +151,10 @@ export const API = {
       control: 'настройки логики: объект полей управляющего поведения (circuit_enable_disable, circuit_condition, …)',
       wire: '{to: цель, type: red | green | copper, disconnect?} — провод между двумя объектами в досягаемости',
       copy_from: 'цель — скопировать настройки с другой постройки (как shift-клики)',
+      request_items: 'заявка роботам на предметы для СТОЯЩЕЙ постройки (турель, печь, автомат — сносить не нужно): {предмет: количество} или список {item, count, inventory?, quality?}. ' +
+        'Строительные роботы привезут предметы из сети, если постройка в зоне строительства робопорта (в ответе robots_in_range). inventory по умолчанию: патроны — ammo, модули — modules, ' +
+        'топливо — fuel, иначе main; можно задать явно (fuel, input, modules, ammo, main, robots). Нет места в слотах — no_space. Новая заявка заменяет прежнюю; false — снять заявку. ' +
+        'В ответе request_items {предмет: количество}; что ещё не привезли — inspect → requests',
       items: 'или список {target, …настройки}', approach: 'true — самому обходить цели вне досягаемости',
     },
     result: '{name, x, y, unit, direction, recipe?, …}',
@@ -305,7 +309,7 @@ export const API = {
       'У рельса rail_ends — оба конца: [{x, y, heading, open, connected: [{name, x, y, direction, turn: left | straight | right}]}]; ' +
       'open: true — к концу ничего не пристыковано (разрыв или тупик). Призраки рельсов стыков не показывают — проверяй после постройки.',
     params: { target: '{x, y, name?}', targets: 'или список целей' },
-    result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo, robots}, slots, free_slots, robot_slots, free_robot_slots (робопорт: slots — ремкомплекты, robot_slots — роботы), fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
+    result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo, robots}, slots, free_slots, robot_slots, free_robot_slots (робопорт: slots — ремкомплекты, robot_slots — роботы), requests: {предмет: количество} — заявка роботам, ещё не привезённая (configure request_items), fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
     example: { target: { x: 10, y: 5 } },
   },
   area: {
@@ -358,9 +362,10 @@ export const API = {
   },
   enemies: {
     kind: 'query',
-    summary: 'Слой врагов на карте: гнёзда и черви на открытой карте, отряды — только в видимой зоне; эволюция.',
+    summary: 'Слой врагов на карте: гнёзда и черви на открытой карте, отряды — только в видимой зоне; эволюция и из чего она сложилась ' +
+      '(как в команде /evolution): evolution_by — доли в процентах от времени, загрязнения и уничтоженных гнёзд. Растёт ли kills после зачистки гнёзд, видно по сравнению до и после.',
     params: { x: '', y: '', radius: 'по умолчанию 150 (до 500)' },
-    result: '{evolution, nests: [{name, x, y, distance, memory?}], worms, units: {имя: количество}, units_total, nearest_unit}',
+    result: '{evolution (0…1), evolution_percent, evolution_by: {time, pollution, kills}, nests: [{name, x, y, distance, memory?}], worms, units: {имя: количество}, units_total, nearest_unit}',
     example: { radius: 300 },
   },
   logistics: {
@@ -369,6 +374,18 @@ export const API = {
     params: { x: '', y: '' },
     result: '{in_network, roboports, logistic_robots: {total, available}, construction_robots, items: {предмет: количество}, requesters, providers, storages} или {in_network: false, networks}',
     example: {},
+  },
+  logistic_requests: {
+    kind: 'control', write: true,
+    summary: 'Личные логистические запросы персонажа (вкладка логистики в окне персонажа): роботы сети, в зоне которой стоит персонаж, довозят предметы до min, ' +
+      'а лишнее сверх max уносят из мусорных слотов. Без параметров — только показать текущие. Доступно после исследования logistic-robotics (иначе available: false, а изменение — not_allowed).',
+    params: {
+      set: 'список {item, min, max?, quality?}: поставить или изменить запрос предмета (max не задан — без верхнего предела; min: 0 и max — только выбрасывать лишнее)',
+      clear: 'true — снять все запросы; или список предметов, чьи запросы снять',
+      enabled: 'true | false — галочка «личная логистика и автомусор» (запросы остаются, но не исполняются)',
+    },
+    result: '{available, enabled, in_network — стоит ли персонаж в зоне логистической сети, requests: [{item, quality?, min, max?, have — сколько сейчас в инвентаре}], trash_slots, trash: {предмет: количество}}',
+    example: { set: [{ item: 'iron-plate', min: 100, max: 200 }] },
   },
   trains: { kind: 'query', summary: 'Обзор поездов и станций команды.', params: {}, result: '{trains: [{id, state, manual, speed, x, y, at_station, going_to, schedule, schedule_current, stops: [{station, wait: [{type, ticks?, …}]}], cargo}] (расписание задаётся через configure: schedule, manual_mode), stations: [{station, x, y, trains_count, trains_limit}]}', example: {} },
   recipes: {
