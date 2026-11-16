@@ -427,6 +427,22 @@ export const API = {
     result: '{cancelled — номер отменённого или null, queue_length}',
     example: {},
   },
+  logout: {
+    kind: 'control', write: true,
+    summary: 'Выйти из игры: персонаж исчезает из мира со всем, что на нём, — как у человека, который отключился. Пока его нет, его нельзя убить или обобрать, ' +
+      'и он ничего не делает: очередь действий отменяется, ручной крафт замирает и продолжится после возвращения. Вызывай, когда заканчиваешь работу надолго. ' +
+      'После выхода все операции с персонажем отвечают кодом offline, пока не вызван login; ping, help, events, feedback работают.',
+    params: {},
+    result: '{offline: true, position, surface, cancelled — сколько действий отменено, crafting_paused — сколько рецептов осталось в очереди крафта}',
+    example: {},
+  },
+  login: {
+    kind: 'control', write: true,
+    summary: 'Вернуться в игру после logout: персонаж появляется там же, где вышел (если место заняли — рядом), с тем же инвентарём, здоровьем и очередью крафта.',
+    params: {},
+    result: '{offline: false, position, surface, moved — true, если встал не на прежнее место, crafting}',
+    example: {},
+  },
   clear: {
     kind: 'control', write: true,
     summary: 'Очистить очередь целиком вместе с текущим действием.',
@@ -537,6 +553,8 @@ export const EVENT_TYPES = {
   player_joined: 'человек зашёл в игру: {name}',
   player_left: 'человек вышел: {name}',
   agent_created: 'появился новый бот: {name}',
+  agent_logout: 'бот вышел из игры (logout): {name}',
+  agent_login: 'бот вернулся в игру (login): {name}',
   entities_built: 'кто-то другой (человек, бот, роботы) построил: {by, count, names: {имя: количество}, area}; сводка раз в секунду',
   entities_removed: 'кто-то другой снял постройки: {by, count, names, area}',
   enemies_near: 'враги в 32 клетках от твоего персонажа: {count, nearest: {name, x, y, distance}}; не чаще раза в 10 секунд',
@@ -554,6 +572,7 @@ export const ERROR_CODES = {
   forbidden: 'операция не для этого токена (HTTP 403)',
   unknown_op: 'нет такой операции (HTTP 404)',
   game_unavailable: 'сервер игры недоступен (HTTP 503)',
+  offline: 'персонаж вне игры после logout; вернуться — login',
   out_of_reach: 'цель дальше, чем дотягивается персонаж',
   no_item: 'нет предмета в инвентаре',
   no_space: 'нет свободного места',
@@ -618,6 +637,8 @@ export function helpDocument(info, publicUrl) {
         'События (чат, урон, завершение действий) — долгим опросом events; с первого вызова бери since из ответа.',
       limits: 'Через внешний адрес один запрос ждёт не дольше 50 секунд: долгие действия возвращают running: true, итог — событием action_done или wait_action. ' +
         'Запросы одного персонажа исполняются по очереди. Тело запроса — до 4 МБ.',
+      leaving: 'Заканчиваешь работу надолго — вызови logout: персонаж исчезнет из мира и будет в безопасности, пока тебя нет; вернуться — login. ' +
+        'Без logout персонаж остаётся стоять в мире, и его могут убить.',
       feedback: 'Чего не хватает или что работает не так — операция feedback; ответ разработчиков придёт в feedback_status и в чат.',
     },
     operations: ops,

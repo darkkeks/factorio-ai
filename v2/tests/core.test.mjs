@@ -232,4 +232,39 @@ test('announce: объявление разработчиков попадает
   ok((await call(A, 'announce', { text })).error.code === 'forbidden', 'боту объявления недоступны');
 });
 
+test('logout и login: персонаж исчезает из мира и возвращается на место с инвентарём и очередью крафта', async () => {
+  const B = 't-b3';
+  await call(B, 'login'); // если прошлый запуск оборвался на вышедшем боте
+  await lua(`local e = storage.agent.agents['bench-3'].entity e.insert{name = 'iron-plate', count = 40} return {}`);
+  const before = await call(B, 'status');
+  ok((await call(B, 'craft', { recipe: 'iron-gear-wheel', count: 15 })).ok);
+  const w = await call(B, 'wait', { ticks: 6000, wait: false });
+  const out = await call(B, 'logout');
+  ok(out.offline === true && out.cancelled === 1 && out.crafting_paused >= 1, JSON.stringify(out));
+  const world = await lua(`local A = storage.agent.agents['bench-3'] local e = A.offline.entity
+    return {gone = A.entity == nil, surface = e.surface.name, active = e.active, q = e.crafting_queue_size, progress = e.crafting_queue_progress,
+      near = game.surfaces.nauvis.count_entities_filtered{name = 'character', position = A.offline.position, radius = 0.5}, vb = storage.vb['bench-3'] == nil}`);
+  ok(world.gone && world.surface === 'agent-offline' && world.active === false && world.near === 0 && world.vb, JSON.stringify(world));
+  const st = await call(B, 'status');
+  ok(st.error?.code === 'offline', JSON.stringify(st));
+  ok((await call(B, 'walk_to', { x: 0, y: 0 })).error?.code === 'offline', 'действие вне игры');
+  ok((await call(B, 'logout')).already === true, 'повторный logout');
+  const done = await call(B, 'wait_action', { action_id: w.action_id, wait_s: 2 });
+  ok(done.actions?.[0]?.state === 'cancelled', JSON.stringify(done));
+  const busy = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'], keep: true });
+  ok(busy.busy === 0, 'вышедший бот игру не держит ' + JSON.stringify(busy));
+  await sleep(1500); // игра идёт (keep): крафт вышедшего стоит
+  const frozen = await lua(`local e = storage.agent.agents['bench-3'].offline.entity return {q = e.crafting_queue_size, progress = e.crafting_queue_progress}`);
+  ok(frozen.q === world.q && frozen.progress === world.progress, JSON.stringify([world, frozen]));
+  ok((await call(A, 'agents')).agents.find((a) => a.name === 'bench-3').offline === true, 'agents: offline');
+  const back = await call(B, 'login');
+  ok(back.offline === false && Math.abs(back.position.x - before.position.x) < 0.01 && Math.abs(back.position.y - before.position.y) < 0.01, JSON.stringify([before.position, back]));
+  const after = await call(B, 'status');
+  ok(after.ok && after.surface === 'nauvis' && after.health === before.health, JSON.stringify(after).slice(0, 200));
+  ok((await call(B, 'login')).already === true, 'повторный login');
+  await call(B, 'cancel_craft', {});
+  const end = await call(B, 'status');
+  ok(end.inventory['iron-plate'] + 2 * (end.inventory['iron-gear-wheel'] || 0) >= before.inventory['iron-plate'], 'пластины не пропали: ' + JSON.stringify(end.inventory));
+});
+
 run(async () => { admin.close(); });

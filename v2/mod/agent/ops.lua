@@ -74,7 +74,7 @@ O.register('agents', {fn = function()
   local out = {}
   for name, A in pairs(storage.agent.agents) do
     local e = A.entity
-    local r = {name = name, alive = (e and e.valid) or false, queue = #A.queue}
+    local r = {name = name, alive = (e and e.valid) or false, queue = #A.queue, offline = A.offline and true or nil}
     if e and e.valid then
       r.position = U.pos(e.position)
       r.health = U.r2(e.health)
@@ -147,6 +147,69 @@ O.register('show', {admin = true, fn = function(_, p)
   return {shown = p.what}
 end})
 
+-- Выход из игры и возвращение — как у человека, который отключился от сервера: персонаж исчезает из мира со всем,
+-- что на нём, и появляется там же, когда хозяин вернулся. Пока его нет, его нельзя ни убить, ни обобрать, и он ничего
+-- не делает: очередь действий отменяется, ручной крафт замирает. Персонаж не уничтожается, а целиком переносится
+-- на скрытую пустую поверхность и выключается — так сохраняется всё (броня с модулями, качество, очередь крафта).
+local LIMBO = 'agent-offline'
+local function limbo()
+  local s = game.surfaces[LIMBO]
+  if not s then
+    s = game.create_surface(LIMBO, {width = 64, height = 64, default_enable_all_autoplace_controls = false,
+      peaceful_mode = true, no_enemies_mode = true})
+    s.generate_with_lab_tiles = true
+    for _, f in pairs(game.forces) do f.set_surface_hidden(s, true) end
+  end
+  return s
+end
+
+O.register('logout', {agent = true, write = true, offline = true, fn = function(A)
+  if A.offline then return {offline = true, already = true} end
+  local st, e = storage.agent, A.entity
+  local cancelled = Q.clear(A, 'бот вышел из игры')
+  if e.driving then e.driving = false end
+  e.walking_state = {walking = false, direction = e.walking_state.direction}
+  e.mining_state = {mining = false}
+  local pos, surface = e.position, e.surface
+  st.offline_n = ((st.offline_n or 0) + 1) % 24
+  if not e.teleport({x = -24 + 2 * st.offline_n + 0.5, y = 0.5}, limbo()) then U.fail('internal', 'не удалось убрать персонажа из мира') end
+  e.disabled_by_script = true
+  A.offline = {entity = e, surface = surface.index, position = {x = pos.x, y = pos.y}, tick = game.tick}
+  A.entity = nil
+  st.crafting[A.name] = nil
+  if storage.vb then storage.vb[A.name] = nil end
+  game.print('[color=0.7,0.7,0.7]' .. A.name .. ' вышел из игры[/color]')
+  J.add('agent_logout', nil, {name = A.name})
+  return {offline = true, position = U.pos(pos), surface = surface.name, cancelled = cancelled, crafting_paused = e.crafting_queue_size}
+end})
+
+O.register('login', {agent = true, write = true, offline = true, fn = function(A)
+  local off = A.offline
+  if not off then return {offline = false, already = true, position = U.pos(A.entity.position)} end
+  local e = off.entity
+  A.offline = nil
+  if not (e and e.valid) then
+    -- Персонажа на скрытой поверхности нет (её удалили): как после гибели — новый у точки возрождения.
+    e = S.spawn(A)
+    return {offline = false, respawned = true, position = U.pos(e.position)}
+  end
+  local surface = game.get_surface(off.surface) or game.surfaces.nauvis
+  -- Место могли занять, пока бота не было: тогда ближайшее свободное, как при входе игрока.
+  local pos = surface.find_non_colliding_position('character', off.position, 32, 0.25) or off.position
+  e.disabled_by_script = false
+  if not e.teleport(pos, surface) then
+    e.disabled_by_script = true
+    A.offline = off
+    U.fail('blocked', 'не удалось вернуть персонажа в мир: место занято')
+  end
+  S.attach(A, e)
+  if e.crafting_queue_size > 0 then storage.agent.crafting[A.name] = true end
+  game.print('[color=0.7,0.7,0.7]' .. A.name .. ' вернулся в игру[/color]')
+  J.add('agent_login', nil, {name = A.name})
+  return {offline = false, position = U.pos(e.position), surface = surface.name, moved = (pos.x ~= off.position.x or pos.y ~= off.position.y) or nil,
+    crafting = e.crafting_queue_size}
+end})
+
 -- Объявление в игровой чат не от бота (ответы разработчиков на заявки, сообщения об обновлениях): его видят люди
 -- в игре, оно попадает в историю чата и приходит ботам событием chat, как любое сообщение.
 O.register('announce', {admin = true, fn = function(_, p)
@@ -163,6 +226,6 @@ O.register('announce', {admin = true, fn = function(_, p)
 end})
 
 -- Бот жив: сервер на хосте шлёт это, когда запросы бота до мода не доходят (чтение буфера событий).
-O.register('touch', {agent = true, fn = function() return {} end})
+O.register('touch', {agent = true, offline = true, fn = function() return {} end})
 
 return O

@@ -51,6 +51,9 @@ local function handle(raw)
       local saved = A.replies.map[id]
       if saved then return saved end
     end
+    if A.offline and not op.offline then
+      return reply(false, {code = 'offline', message = 'персонаж вне игры (был logout): вернуться — login'})
+    end
     A.seen = game.tick
     A.seen_at = storage.agent.now -- время по часам сторожа паузы: подключён ли бот (см. ops.lua)
   end

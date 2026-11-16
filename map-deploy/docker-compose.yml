@@ -9,6 +9,7 @@ services:
       VIRTUAL_HOST: factorio.darkkeks.me
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${HOME}/exports/public:/srv/export:ro
     networks: [server-stuff_default]
 networks:
   server-stuff_default:

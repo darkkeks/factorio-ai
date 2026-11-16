@@ -83,7 +83,8 @@ function S.agent(name, create)
     st.agents[name] = A
     J.add('agent_created', nil, {name = name})
   end
-  if not (A.entity and A.entity.valid) then S.spawn(A) end
+  -- Вышедшего из игры (logout) не возрождаем: его персонаж цел и ждёт на скрытой поверхности.
+  if not A.offline and not (A.entity and A.entity.valid) then S.spawn(A) end
   return A
 end
 
