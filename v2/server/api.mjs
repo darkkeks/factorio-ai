@@ -473,7 +473,7 @@ export const API = {
   ping: {
     kind: 'query', agent: false,
     summary: 'Версия мода, список операций и действий, текущий тик, пауза.',
-    params: {}, result: '{mod, version, api, tick, paused, ops, actions}', example: {},
+    params: {}, result: '{mod, version, build, api, tick, paused, hold — игра остановлена людьми, действия не принимаются, ops, actions}', example: {},
   },
   busy: {
     kind: 'query', agent: false,
@@ -560,6 +560,7 @@ export const ERROR_CODES = {
   damaged: 'действие прервано уроном',
   busy: 'поисковик пути игры занят, повтори',
   dead: 'персонаж погиб во время действия',
+  paused: 'игра остановлена людьми (режим ожидания): действия не принимаются, чтение работает; ping показывает hold: true, пока режим не снят',
   cancelled: 'действие отменено (ботом, остановкой очереди или сторожем cancel_if_silent_s)',
   timeout: 'условие ожидания не выполнилось за отведённое время',
   not_allowed: 'игра этого не разрешает (рецепт не исследован, чужая команда и т. п.)',

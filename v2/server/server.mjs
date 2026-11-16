@@ -23,6 +23,12 @@ const TOKENS = resolve(conf.tokens || 'tokens.json');
 const LOG_DIR = resolve(conf.logDir || 'log');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
+// Режим ожидания: пока существует этот файл, действия ботов не принимаются (читать мир можно). Его ставят люди,
+// когда никто не играет, чтобы скрипты ботов не играли сами: v2/tools/hold.sh on | off. Сторож паузы в этом режиме
+// держит игру на паузе, пока в ней нет людей.
+const HOLD = conf.holdFile ? resolve(conf.holdFile) : null;
+const onHold = () => HOLD !== null && fs.existsSync(HOLD);
+
 const WAIT_DEFAULT_S = 30;  // сколько сервер сам ждёт завершения действия
 const WAIT_MAX_S = 110;
 const EVENTS_WAIT_MAX_S = 60;
@@ -271,8 +277,12 @@ async function dispatch(who, op, body) {
   if (!spec) throw new GameError('unknown_op', `нет такой операции: ${op}; список — GET /v2/help`);
   if (spec.admin && !who.admin) throw new GameError('forbidden', 'операция только для администратора');
   if (spec.agent !== false && !who.agent && !spec.admin && spec.kind !== 'query') throw new GameError('forbidden', 'токен не привязан к персонажу');
+  if (who.agent && (spec.kind === 'action' || op === 'act') && onHold()) {
+    throw new GameError('paused', 'игра остановлена людьми: действия не принимаются, пока её не возобновят. Не повторяй запрос в цикле — проверяй не чаще раза в минуту (ping → hold).');
+  }
   if (special[op]) return special[op](who, body);
   if (spec.kind === 'action') return runSingleAction(who, op, body);
+  if (op === 'ping') return { ...(await game.call({ op: 'ping' })), hold: onHold() };
   const req = { op, params: stripControl(body) };
   if (who.agent) req.agent = who.agent;
   if (spec.admin) req.admin = true;

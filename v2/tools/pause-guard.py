@@ -10,6 +10,9 @@
 import json, os, socket, struct, time
 
 HEARTBEAT = os.path.expanduser('~/voice-active')
+# Режим ожидания (v2/tools/hold.sh): файл ставят люди, когда никто не играет. Действия ботов сервер ботов в это время
+# не принимает, а игра стоит на паузе, пока в ней нет людей, — голосовой канал и очереди ботов не учитываются.
+HOLD = os.path.expanduser('~/hold')
 PASSWORD = os.environ['RCON_PASSWORD']
 PORT = int(os.environ.get('RCON_PORT', '27015'))
 # Клиент-камера веб-карты — не человек: с ним одним игра должна вставать на паузу.
@@ -54,6 +57,14 @@ while True:
     try:
         rcon = rcon or Rcon()
         voice = os.path.exists(HEARTBEAT) and time.time() - os.path.getmtime(HEARTBEAT) < 45
+        if os.path.exists(HOLD):
+            players, paused = rcon.call(2, '/silent-command local n = 0 for _, p in pairs(game.connected_players) do if p.name ~= "%s" then n = n + 1 end end rcon.print(n .. " " .. tostring(game.tick_paused))' % CAMERA).split()
+            want = players == '0'
+            if want != (paused == 'true'):
+                rcon.call(2, '/silent-command game.tick_paused = %s' % ('true' if want else 'false'))
+                print(time.strftime('%F %T'), 'пауза' if want else 'игра идёт', '(режим ожидания: боты остановлены; игроков: %s)' % players, flush=True)
+            time.sleep(5)
+            continue
         req = {'op': 'pause_if_idle', 'admin': True, 'params': {'voice': voice, 'ignore': [CAMERA]}}
         out = rcon.call(2, '/agent ' + json.dumps(req, ensure_ascii=False))
         try:
