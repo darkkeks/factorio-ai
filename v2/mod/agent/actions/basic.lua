@@ -58,7 +58,7 @@ local function say(A, text)
 end
 
 Q.register('say', {
-  instant = true,
+  instant = true, free = true, -- тело не занимает: отдельный запрос исполняется сразу, не дожидаясь очереди
   check = function(p)
     U.arg(p.text, 'string', 'text')
     if #p.text > 2000 then U.fail('bad_request', 'сообщение длиннее 2000 байт') end

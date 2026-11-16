@@ -36,7 +36,7 @@ local function recipe_for(e, p)
 end
 
 Q.register('craft', {
-  instant = true,
+  instant = true, free = true, -- тело не занимает: отдельный запрос исполняется сразу, не дожидаясь очереди
   check = function(p)
     if p.recipe == nil and p.item == nil then U.fail('bad_request', 'нужен recipe или item') end
     U.arg(p.recipe, 'string', 'recipe', true) U.arg(p.item, 'string', 'item', true)
@@ -63,7 +63,7 @@ Q.register('craft', {
 })
 
 Q.register('cancel_craft', {
-  instant = true,
+  instant = true, free = true, -- тело не занимает: отдельный запрос исполняется сразу, не дожидаясь очереди
   check = function(p)
     U.arg(p.index, 'int', 'index', true) U.arg(p.count, 'int', 'count', true)
   end,

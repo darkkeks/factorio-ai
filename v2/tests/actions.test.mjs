@@ -464,6 +464,22 @@ test('research: добавить в очередь и убрать', async () =>
   eq(r.queue, before.queue);
 });
 
+test('say, craft и research тело не занимают: исполняются сразу, пока персонаж занят, а в списке act идут по порядку', async () => {
+  await reset({ 'iron-plate': 10 });
+  const w = await call(A, 'wait', { ticks: 600, wait: false });
+  const s = await call(A, 'say', { text: 'говорю на ходу' });
+  ok(s.ok && s.sent && s.ms < 300, 'say не ждёт очереди: ' + JSON.stringify(s));
+  const c = await call(A, 'craft', { item: 'iron-gear-wheel', count: 2 });
+  ok(c.ok && c.queued === 2 && c.ms < 300, 'craft не ждёт очереди: ' + JSON.stringify(c));
+  const r = await call(A, 'research', { add: [] });
+  ok(r.ok && r.ms < 300, 'research не ждёт очереди: ' + JSON.stringify(r));
+  eq((await call(A, 'queue')).queue.length, 1, 'ожидание продолжает стоять в очереди одно');
+  // В общем списке с действием тела — по порядку: реплика после ожидания.
+  const m = await call(A, 'act', { actions: [{ type: 'wait', ticks: 30 }, { type: 'say', text: 'после ожидания' }], wait: false });
+  eq((await call(A, 'queue')).queue.length, 3);
+  await call(A, 'clear');
+});
+
 test('immediate: мгновенное действие исполняется, пока тело занято', async () => {
   await reset({ 'wooden-chest': 1 });
   const w = await call(A, 'wait', { ticks: 600, wait: false });

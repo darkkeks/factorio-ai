@@ -23,7 +23,7 @@ local function queue_names(force)
 end
 
 Q.register('research', {
-  instant = true,
+  instant = true, free = true, -- тело не занимает: отдельный запрос исполняется сразу, не дожидаясь очереди
   check = function(p)
     if p.add == nil and p.remove == nil and p.set == nil then U.fail('bad_request', 'нужно add, remove или set') end
   end,
