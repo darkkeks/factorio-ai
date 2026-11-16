@@ -31,12 +31,20 @@ end})
 -- Занят ли кто-нибудь: очередь действий или очередь ручного крафта (для правила паузы). Бот, от которого давно нет
 -- запросов, отключённым считается и игру не держит: его очередь остаётся и продолжится, когда игра пойдёт
 -- (вернулся он сам или играет кто-то ещё). Подключённый бот опрашивает события не реже раза в минуту.
-local SILENT = 5 * 60 * 60 -- тиков без запросов, после которых бот считается отключённым
+-- Молчание меряется по настоящим часам: их при каждом вызове сообщает сторож паузы (now, секунды), запрос бота
+-- запоминает текущее значение. Так бот не «подключён» вечно, пока игра стоит и тики не идут. Бот без отметки
+-- (не обращался с тех пор, как появилось правило) отключён. Пока часов нет (сторож не работает) — по тикам игры.
+local SILENT_S = 5 * 60
 local function busy_count()
   local st, n, silent = storage.agent, 0, 0
+  local now = st.now
   local function count(name)
     local A = st.agents[name]
-    if A and game.tick - (A.seen or 0) > SILENT then silent = silent + 1 else n = n + 1 end
+    local gone
+    if not A then gone = false
+    elseif now then gone = A.seen_at == nil or now - A.seen_at > SILENT_S
+    else gone = game.tick - (A.seen or 0) > SILENT_S * 60 end
+    if gone then silent = silent + 1 else n = n + 1 end
   end
   for name in pairs(st.active) do count(name) end
   for name in pairs(st.crafting) do if not st.active[name] then count(name) end end
@@ -47,14 +55,16 @@ O.busy_count = busy_count
 O.register('busy', {fn = function() return {busy = (busy_count()), paused = game.tick_paused} end})
 
 -- Правило паузы одним неделимым шагом: игра идёт, пока в ней есть люди или у подключённого бота непустая очередь.
--- Вызывает сторож паузы. hold — внешняя причина не ставить паузу (прежнее имя параметра — voice).
+-- Вызывает сторож паузы раз в несколько секунд. now — настоящее время в секундах; keep — паузу не ставить
+-- (внешняя причина; прежнее имя — voice); bots_off — режим ожидания: боты игру не держат.
 O.register('pause_if_idle', {admin = true, fn = function(_, p)
+  if type(p.now) == 'number' then storage.agent.now = p.now end
   local ignore = {}
   for _, n in pairs(p.ignore or {}) do ignore[n] = true end
   local humans = 0
   for _, pl in pairs(game.connected_players) do if not ignore[pl.name] then humans = humans + 1 end end
   local busy, silent = busy_count()
-  local want = humans == 0 and not p.voice and not p.hold and busy == 0
+  local want = humans == 0 and not p.voice and not p.keep and (busy == 0 or p.bots_off == true)
   local changed = game.tick_paused ~= want
   game.tick_paused = want
   return {paused = want, changed = changed, humans = humans, busy = busy, silent = silent}

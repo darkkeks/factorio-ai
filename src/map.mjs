@@ -363,7 +363,7 @@ async function summaryLoop() {
 
 // Строки бота из логов: вызовы инструментов и его собственный текст. Реплики людей (🎤) не отдаём.
 function botLog(name) {
-  // Вызовы инструментов пишет сервер ботов (api.log), раньше — mcp.log и bot.log; текст бота — bot.log.
+  // Вызовы инструментов пишет сервер ботов (api.log), до него — bot.log; текст бота — bot.log.
   const read = (file, want) => {
     let text;
     try {
@@ -383,7 +383,7 @@ function botLog(name) {
     return entries.slice(-12);
   };
   let tools = [];
-  for (const file of ['api.log', 'mcp.log', 'bot.log']) { tools = read(file, { tool: true }); if (tools.length) break; }
+  for (const file of ['api.log', 'bot.log']) { tools = read(file, { tool: true }); if (tools.length) break; }
   // В логах только время суток: сортируем по нему, а записи «из будущего» (вчерашние, до полуночи) ставим первыми.
   const nowT = new Date().toISOString().slice(11, 19);
   const order = (e) => (e.time > nowT ? '0' : '1') + e.time;
@@ -1060,7 +1060,7 @@ function redact(text) {
     secrets = [];
     try { secrets.push(JSON.parse(fs.readFileSync(path.join(ROOT, 'rcon.json'), 'utf8')).password); } catch { /* нет файла */ }
     secrets.push(gamePassword());
-    try { secrets.push(...Object.keys(JSON.parse(fs.readFileSync(path.join(ROOT, 'mcp-tokens.json'), 'utf8')))); } catch { /* нет файла */ }
+    try { secrets.push(...Object.keys(JSON.parse(fs.readFileSync(path.join(ROOT, 'bot-tokens.json'), 'utf8')))); } catch { /* нет файла */ }
     secrets = secrets.filter((x) => x && x.length >= 6);
   }
   let out = text.replace(/sk-ant-[\w-]{8,}/g, '•••').replace(/(Bearer\s+)[\w.~+/-]{12,}/gi, '$1•••').replace(/("?(?:access|refresh)_?[tT]oken"?\s*[:=]\s*"?)[\w.~+/-]{12,}/g, '$1•••');

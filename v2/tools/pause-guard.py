@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Сторож паузы: игра идёт, пока в ней есть люди или хотя бы один подключённый бот что-то делает (непустая очередь
-действий или ручного крафта). Иначе — пауза. Бот, от которого 5 минут игры нет запросов, считается отключённым.
+действий или ручного крафта). Иначе — пауза. Бот, от которого 5 минут нет запросов, считается отключённым: часы
+моду сообщает сторож (now), поэтому молчание меряется и тогда, когда игра стоит.
 
 Правило исполняет мод одной командой (операция pause_if_idle), поэтому гонки «бот поставил действие, пока сторож
 решал» нет; поставленное действие само снимает паузу, не дожидаясь сторожа. Чтение мира игру не будит.
@@ -55,15 +56,8 @@ rcon = None
 while True:
     try:
         rcon = rcon or Rcon()
-        if os.path.exists(HOLD):
-            players, paused = rcon.call(2, '/silent-command local n = 0 for _, p in pairs(game.connected_players) do if p.name ~= "%s" then n = n + 1 end end rcon.print(n .. " " .. tostring(game.tick_paused))' % CAMERA).split()
-            want = players == '0'
-            if want != (paused == 'true'):
-                rcon.call(2, '/silent-command game.tick_paused = %s' % ('true' if want else 'false'))
-                print(time.strftime('%F %T'), 'пауза' if want else 'игра идёт', '(режим ожидания: боты остановлены; игроков: %s)' % players, flush=True)
-            time.sleep(5)
-            continue
-        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'ignore': [CAMERA]}}
+        hold = os.path.exists(HOLD)
+        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'ignore': [CAMERA], 'now': int(time.time()), 'bots_off': hold}}
         out = rcon.call(2, '/agent ' + json.dumps(req, ensure_ascii=False))
         try:
             r = json.loads(out)
@@ -73,7 +67,7 @@ while True:
             r = r['result']
             if r['changed']:
                 print(time.strftime('%F %T'), 'пауза' if r['paused'] else 'игра идёт',
-                      '(игроков: %s, занятых ботов: %s, отключённых с очередью: %s)' % (r['humans'], r['busy'], r.get('silent', 0)), flush=True)
+                      '(%sигроков: %s, занятых ботов: %s, отключённых с очередью: %s)' % ('режим ожидания; ' if hold else '', r['humans'], r['busy'], r.get('silent', 0)), flush=True)
         else:
             changed, why = legacy(rcon)
             if changed is not None:

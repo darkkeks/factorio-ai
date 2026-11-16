@@ -205,16 +205,22 @@ test('пауза: чтение не будит игру, действие буд
 });
 
 test('пауза: бот, от которого давно нет запросов, игру не держит; первый же его запрос это возвращает', async () => {
-  const w = await call(A, 'wait', { ticks: 600, wait: false });
-  await lua(`storage.agent.agents['bench-1'].seen = game.tick - 5 * 3600 - 10 return {}`);
-  let r = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'] });
+  const ignore = ['tester', 'camera'];
+  const now = Math.floor(Date.now() / 1000);
+  await call('t-admin', 'pause_if_idle', { ignore, now });
+  await call(A, 'wait', { ticks: 600, wait: false });
+  let r = await call('t-admin', 'pause_if_idle', { ignore, now: now + 200 });
+  ok(r.paused === false && r.busy === 1 && r.silent === 0, JSON.stringify(r));
+  r = await call('t-admin', 'pause_if_idle', { ignore, now: now + 301 }); // игра могла бы и стоять: молчание — по часам, не по тикам
   ok(r.paused === true && r.busy === 0 && r.silent === 1, JSON.stringify(r));
   await call(A, 'status'); // бот вернулся: чтение паузу не снимает, но сторож теперь видит его занятым
-  r = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'] });
+  r = await call('t-admin', 'pause_if_idle', { ignore, now: now + 305 });
   ok(r.paused === false && r.busy === 1 && r.silent === 0, JSON.stringify(r));
+  r = await call('t-admin', 'pause_if_idle', { ignore, now: now + 306, bots_off: true });
+  ok(r.paused === true && r.busy === 1, 'режим ожидания: боты игру не держат ' + JSON.stringify(r));
   await call(A, 'cancel');
-  r = await call('t-admin', 'pause_if_idle', { hold: true, ignore: ['tester', 'camera'] });
-  ok(r.paused === false, 'hold: паузу не ставить');
+  r = await call('t-admin', 'pause_if_idle', { ignore, now: now + 307, keep: true });
+  ok(r.paused === false, 'keep: паузу не ставить');
 });
 
 test('announce: объявление разработчиков попадает в ленту чата и в события ботов', async () => {

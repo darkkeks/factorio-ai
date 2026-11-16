@@ -320,15 +320,6 @@ const server = http.createServer(async (req, res) => {
   let op = m?.[1], who = null, body = {}, out, status = 200;
   try {
     if (!op) {
-      // Старый интерфейс (MCP и команда fx) слал сюда JSON-RPC: отвечаем в его же виде, чтобы скрипты показали причину.
-      if (req.method === 'POST' && !url.pathname.includes('/v2/')) {
-        // Номер запроса возвращаем тот же, иначе клиент MCP не сопоставит ответ и будет ждать до таймаута.
-        let rpc = null;
-        try { rpc = await readBody(req); } catch { /* не JSON */ }
-        const message = 'Интерфейс заменён: инструментов MCP и команды fx больше нет. Теперь это HTTP с JSON: описание — curl -s ${FX_URL}v2/help, правила — /home/robot/bots/RULES.md.';
-        send(res, 200, { jsonrpc: '2.0', id: rpc?.id ?? 1, error: { code: -32601, message } });
-        return;
-      }
       throw new GameError('unknown_op', 'адрес: POST /v2/<операция>, описание — GET /v2/help');
     }
     if (op === 'help' && req.method === 'GET') {

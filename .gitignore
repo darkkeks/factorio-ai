@@ -3,7 +3,7 @@ models
 workspace
 *.log
 rcon.json
-mcp-tokens.json
+bot-tokens.json
 state*.json
 feedback/queue.jsonl
 feedback/status.json

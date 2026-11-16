@@ -509,8 +509,8 @@ export const API = {
   pause_if_idle: {
     kind: 'control', admin: true,
     summary: 'Правило паузы одним шагом: пауза, если в игре нет людей и ни один подключённый бот ничего не делает; иначе игра идёт.',
-    params: { ignore: 'имена игроков, которых не считать людьми (клиент-камера)', hold: 'true — паузу не ставить (внешняя причина)' },
-    result: '{paused, changed, humans, busy, silent}', example: { ignore: ['camera'] },
+    params: { ignore: 'имена игроков, которых не считать людьми (клиент-камера)', now: 'настоящее время, секунды (по нему считается, подключён ли бот)', keep: 'true — паузу не ставить', bots_off: 'true — режим ожидания: боты игру не держат' },
+    result: '{paused, changed, humans, busy, silent}', example: { ignore: ['camera'], now: 1794839000 },
   },
   announce: {
     kind: 'control', admin: true,

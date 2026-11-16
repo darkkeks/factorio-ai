@@ -37,6 +37,6 @@ export const VAD_SILENCE_S = Number(env.VAD_SILENCE_S || 0.55);
 
 // Сервер ботов — отдельный процесс (v2/server/server.mjs): HTTP с JSON, операции — <адрес>v2/<операция>.
 // Сессии и скрипты ботов в контейнере ходят к нему по этому адресу (у них он в переменной FX_URL).
-export const API_URL = env.API_URL || env.MCP_URL || 'http://172.25.0.1:8765/';
+export const API_URL = env.API_URL || 'http://172.25.0.1:8765/';
 // Токены персонажей: { "токен": "имя персонажа" }. Имя файла историческое.
-export const TOKENS_FILE = path.join(ROOT, 'mcp-tokens.json');
+export const TOKENS_FILE = path.join(ROOT, 'bot-tokens.json');

@@ -52,6 +52,7 @@ local function handle(raw)
       if saved then return saved end
     end
     A.seen = game.tick
+    A.seen_at = storage.agent.now -- время по часам сторожа паузы: подключён ли бот (см. ops.lua)
   end
   local params = req.params
   if type(params) ~= 'table' then params = {} end

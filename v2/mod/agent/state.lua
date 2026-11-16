@@ -22,6 +22,7 @@ local function new_agent(name)
     next_action = 1,
     replies = {map = {}, order = {}, head = 1, tail = 0},
     seen = game.tick,    -- тик последнего запроса бота (для cancel_if_silent_s)
+    seen_at = storage.agent and storage.agent.now, -- то же по часам сторожа паузы (правило паузы)
     kit = false,         -- выдан ли стартовый набор
     deaths = 0,
   }
