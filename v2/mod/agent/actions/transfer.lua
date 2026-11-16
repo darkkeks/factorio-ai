@@ -11,7 +11,7 @@ local BELT = {['transport-belt'] = true, ['underground-belt'] = true, splitter =
 --- Инвентарь объекта по имени: fuel, input, output, modules, main, ammo, burnt или имя из defines.inventory.
 local function inventory(ent, name)
   local inv, unknown = Inv.named(ent, name)
-  if unknown then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt, rocket или имя из defines.inventory') end
+  if unknown then U.fail('bad_request', 'inventory: fuel, input, output, modules, main, ammo, burnt, rocket, robots или имя из defines.inventory') end
   return inv
 end
 
@@ -99,7 +99,13 @@ local function transfer_one(A, it)
       local insert = dst and function(sp) return dst.insert(sp) end or function(sp) return ent.insert(sp) end
       total = move(mine, insert, it.item, quality, limit, moved)
     end
-    if total == 0 then U.fail('no_space', ent.name .. ' не принимает ' .. it.item .. ' или в нём нет места', {item = it.item}) end
+    if total == 0 then
+      local hint = ''
+      if ent.type == 'roboport' and it.inventory then
+        hint = ' (у робопорта роботы кладутся в inventory: "robots", ремкомплекты — в "main"; без inventory игра выбирает сама)'
+      end
+      U.fail('no_space', ent.name .. ' не принимает ' .. it.item .. ' или в нём нет места' .. hint, {item = it.item})
+    end
   else
     local limit = it.count
     local insert = function(sp) return mine.insert(sp) end
@@ -128,7 +134,8 @@ local function transfer_one(A, it)
         sources[1] = src
       else
         -- Без inventory: выходной слот машины или содержимое сундука; у остальных (лаборатория, турель) — всё, что в них лежит.
-        local out = Inv.named(ent, 'output') or Inv.named(ent, 'main')
+        -- У робопорта забирается всё: и роботы, и ремкомплекты.
+        local out = ent.type ~= 'roboport' and (Inv.named(ent, 'output') or Inv.named(ent, 'main')) or nil
         if out then
           sources[1] = out
         else

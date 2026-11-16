@@ -123,7 +123,7 @@ export const API = {
     params: {
       target: 'объект: {x, y, name?}', direction: 'put — положить в объект, take — забрать из объекта',
       item: 'имя предмета (для take можно не указывать — забрать всё)', count: 'сколько (по умолчанию всё)',
-      inventory: 'fuel, input, output, modules, main, ammo, burnt, rocket (грузовой отсек ракеты в шахте: есть, когда ракета собрана; вместимость — по весу, см. inspect → rocket); по умолчанию put — как ctrl-клик (игра сама выбирает слот), take — выход машины или всё содержимое сундука',
+      inventory: 'fuel, input, output, modules, main, ammo, burnt, robots (слоты роботов робопорта; main у робопорта — слоты ремкомплектов), rocket (грузовой отсек ракеты в шахте: есть, когда ракета собрана; вместимость — по весу, см. inspect → rocket); по умолчанию put — как ctrl-клик (игра сама выбирает слот), take — выход машины или всё содержимое сундука',
       lane: 'left | right — полоса конвейера по ходу движения', quality: 'качество',
       items: 'или список таких же объектов', approach: 'true — самому обходить цели вне досягаемости',
     },
@@ -303,7 +303,7 @@ export const API = {
       'У рельса rail_ends — оба конца: [{x, y, heading, open, connected: [{name, x, y, direction, turn: left | straight | right}]}]; ' +
       'open: true — к концу ничего не пристыковано (разрыв или тупик). Призраки рельсов стыков не показывают — проверяй после постройки.',
     params: { target: '{x, y, name?}', targets: 'или список целей' },
-    result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo}, fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
+    result: '{found, name, type, unit, x, y, direction, health, status, recipe, inventory: {fuel, input, output, modules, main, ammo, robots}, slots, free_slots, robot_slots, free_robot_slots (робопорт: slots — ремкомплекты, robot_slots — роботы), fluids, lanes, wires, distance, in_reach, …} или {objects: [...]}',
     example: { target: { x: 10, y: 5 } },
   },
   area: {

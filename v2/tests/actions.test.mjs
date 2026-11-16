@@ -127,6 +127,27 @@ test('transfer: положить и забрать, выбор слота, от�
   ok(!out.ok && out.error.code === 'not_allowed', JSON.stringify(out));
 });
 
+test('transfer: робопорт — роботы в слоты роботов, ремкомплекты в свои', async () => {
+  await reset({ 'construction-robot': 10, 'repair-pack': 10 });
+  const rp = P(34, 16);
+  await world(`game.surfaces.nauvis.create_entity{name = 'roboport', position = {A.ox + 34, A.oy + 16}, force = 'player'} return true`);
+  let r = await call(A, 'transfer', { target: rp, direction: 'put', item: 'construction-robot', count: 2 });
+  ok(r.ok && r.moved === 2, JSON.stringify(r));
+  r = await call(A, 'transfer', { target: rp, direction: 'put', item: 'construction-robot', count: 3, inventory: 'robots' });
+  ok(r.ok && r.moved === 3, JSON.stringify(r));
+  r = await call(A, 'transfer', { target: rp, direction: 'put', item: 'construction-robot', count: 1, inventory: 'main' });
+  ok(!r.ok && r.error.code === 'no_space' && /robots/.test(r.error.message), JSON.stringify(r));
+  r = await call(A, 'transfer', { target: rp, direction: 'put', item: 'repair-pack', count: 4, inventory: 'main' });
+  ok(r.ok && r.moved === 4, JSON.stringify(r));
+  const i = await call(A, 'inspect', { target: rp });
+  ok(i.inventory.robots['construction-robot'] === 5 && i.inventory.main['repair-pack'] === 4, JSON.stringify(i));
+  ok(i.robot_slots === 7 && i.free_robot_slots === 6 && i.slots === 7 && i.free_slots === 6, JSON.stringify(i));
+  r = await call(A, 'transfer', { target: rp, direction: 'take' });
+  ok(r.ok && r.moved === 9, JSON.stringify(r));
+  const mine = await inv();
+  ok(mine['construction-robot'] === 10 && mine['repair-pack'] === 10, JSON.stringify(mine));
+});
+
 test('transfer: вне досягаемости без approach — out_of_reach, с approach — подходит', async () => {
   await reset({ coal: 10 }, 5.5, 15.5);
   await world(`game.surfaces.nauvis.create_entity{name = 'wooden-chest', position = {A.ox + 40.5, A.oy + 15.5}, force = 'player'} return true`);

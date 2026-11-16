@@ -12,7 +12,7 @@ local MAIN = {
 local AMMO = {['ammo-turret'] = 'turret_ammo', ['artillery-turret'] = 'artillery_turret_ammo', ['artillery-wagon'] = 'artillery_wagon_ammo',
   car = 'car_ammo', ['spider-vehicle'] = 'spider_ammo'}
 
-Inv.NAMES = {'fuel', 'burnt', 'input', 'output', 'modules', 'ammo', 'main', 'rocket'}
+Inv.NAMES = {'fuel', 'burnt', 'input', 'output', 'modules', 'ammo', 'main', 'rocket', 'robots'}
 
 --- Инвентарь по имени слота или nil, если у этого вида построек такого нет. unknown = true — имя не распознано.
 function Inv.named(ent, name)
@@ -34,6 +34,8 @@ function Inv.named(ent, name)
   if name == 'ammo' then return AMMO[t] and ent.get_inventory(defines.inventory[AMMO[t]]) or nil end
   -- Грузовой отсек ракеты в шахте: появляется, когда ракета собрана; вместимость — по весу.
   if name == 'rocket' then return t == 'rocket-silo' and ent.get_inventory(defines.inventory.rocket_silo_rocket) or nil end
+  -- У робопорта два ряда слотов: robots — сами роботы, main — ремкомплекты.
+  if name == 'robots' then return t == 'roboport' and ent.get_inventory(defines.inventory.roboport_robot) or nil end
   if name == 'main' then return MAIN[t] and ent.get_inventory(defines.inventory[MAIN[t]]) or nil end
   local id = defines.inventory[name]
   if not id then return nil, true end

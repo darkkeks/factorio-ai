@@ -115,6 +115,10 @@ local function full(e, force)
       r.free_slots = i.count_empty_stacks()
       if i.supports_bar() and i.get_bar() <= #i then r.bar = i.get_bar() - 1 end
     end
+    if name == 'robots' then
+      r.robot_slots = #i
+      r.free_robot_slots = i.count_empty_stacks()
+    end
   end
   if next(inv) then r.inventory = inv end
   if e.burner then
