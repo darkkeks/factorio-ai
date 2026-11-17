@@ -282,6 +282,36 @@ test('плитка: призраки плитки через ghost_place и buil
   eq(t.n, 6);
 });
 
+test('фильтры манипулятора в ghost_place: поверх стоящего и при постройке из призрака; имена, use_filter, выключенные', async () => {
+  await reset({ 'fast-inserter': 2 }, 22.5, 12.5);
+  await world(`local s = game.surfaces.nauvis
+    local e = s.create_entity{name = 'fast-inserter', position = {A.ox + 20.5, A.oy + 10.5}, direction = defines.direction.north, force = 'player'}
+    e.use_filters = true e.set_filter(1, {name = 'wood'}) return true`);
+  const state = () => world(`local out = {}
+    for _, e in pairs(game.surfaces.nauvis.find_entities_filtered{name = 'fast-inserter', area = {{A.ox + 19, A.oy + 9}, {A.ox + 27, A.oy + 12}}}) do
+      local f = e.get_filter(1)
+      out[tostring(e.position.x - A.ox)] = {use = e.use_filters, name = f and f.name, mode = e.inserter_filter_mode}
+    end
+    return out`);
+  const items = [
+    // Как в заявке: поля чертежа игры, но use_filter без «s».
+    { name: 'fast-inserter', ...P(20.5, 10.5), direction: 'north', filters: [{ index: 1, name: 'iron-plate', quality: 'normal', comparator: '=' }], use_filter: true, filter_mode: 'whitelist' },
+    { name: 'fast-inserter', ...P(22.5, 10.5), direction: 'north', filters: ['copper-plate'], filter_mode: 'blacklist' },
+    { name: 'fast-inserter', ...P(24.5, 10.5), direction: 'north', filters: ['coal'], use_filters: false },
+  ];
+  const r = await call(A, 'ghost_place', { plan: 'flt', items });
+  ok(r.ok && r.already === 1 && r.placed === 2, JSON.stringify(r));
+  let s = await state();
+  ok(s['20.5'].use === true && s['20.5'].name === 'iron-plate', 'стоящий: ' + JSON.stringify(s));
+  const b = await call(A, 'build_ghosts', { plan: 'flt' });
+  ok(b.ok && b.done === 2, JSON.stringify(b));
+  s = await state();
+  ok(s['22.5'].use === true && s['22.5'].name === 'copper-plate' && s['22.5'].mode === 'blacklist', 'из призрака: ' + JSON.stringify(s));
+  ok(s['24.5'].use === false, 'use_filters: false оставляет фильтр выключенным: ' + JSON.stringify(s));
+  const bad = await call(A, 'ghost_place', { items: [{ name: 'fast-inserter', ...P(26.5, 10.5), filters: ['нет-такого'] }] });
+  ok(!bad.ok && bad.error.code === 'bad_request', JSON.stringify(bad));
+});
+
 test('замена поверх лент (подземный конвейер, разделитель, быстрая лента, поворот): видна в ghosts плана и строится build_ghosts по плану', async () => {
   await reset({ 'underground-belt': 2, splitter: 1, 'fast-transport-belt': 1, 'wooden-chest': 1, 'transport-belt': 1 }, 24.5, 12.5);
   await world(`local s = game.surfaces.nauvis for i = 0, 7 do for _, y in pairs{10.5, 13.5} do s.create_entity{name = 'transport-belt', position = {A.ox + 20.5 + i, A.oy + y}, direction = defines.direction.east, force = 'player'} end end return true`);

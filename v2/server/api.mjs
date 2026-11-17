@@ -179,7 +179,10 @@ export const API = {
       'Исполняет план build_ghosts (и mine для прочего помеченного на снос).',
     params: {
       plan: 'имя плана — метка на поставленных призраках и пометках (по ней ghosts, build_ghosts, ghost_clear, mine)',
-      items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (filters, control_behavior, items)}; ' +
+      items: 'список построек {name (или item), x, y, direction?, recipe?, underground?: input | output, …поля чертежа игры (control_behavior, items)}; ' +
+        'манипулятору фильтры — filters: список имён предметов (или {index, name, quality?, comparator?}), filter_mode?: whitelist | blacklist; ' +
+        'фильтр включается сам (выключить — use_filters: false). Настройки из списка применяются и к уже стоящей такой же постройке (already): ' +
+        'так меняют фильтр издалека. В строке чертежа (string) поле игры называется use_filters — без него фильтры выключены; ' +
         'рельсы стоят на сетке 2×2 — центр прямого рельса в нечётных x и y, как у уже построенных. ' +
         'Поворот рельсов на 90° (стоимость — предметы rail):От последнего прямого рельса (x, y) direction north ' +
         'путь уходит на север и сворачивает на восток: curved-rail-a (x, y−3) northeast; curved-rail-b (x+2, y−8) northeast; curved-rail-b (x+6, y−12) west; ' +

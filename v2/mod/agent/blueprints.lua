@@ -216,6 +216,29 @@ function BP.from_list(stack, entities, tiles)
     c.position = {x = e.x, y = e.y}
     c.direction = U.dir(e.direction, 'entities[' .. i .. '].direction')
     if e.underground then c.type = e.underground end
+    local etype = prototypes.entity[name].type
+    if etype == 'inserter' then
+      -- Фильтры манипулятора в чертеже игры: filters = {{index, name, quality?, comparator?}}, use_filters, filter_mode.
+      -- Список бота принимает и просто имена; фильтры без use_filters игра хранит выключенными — включаем, раз они заданы.
+      if c.use_filters == nil then c.use_filters = c.use_filter end
+      c.use_filter = nil
+      if c.filters ~= nil then
+        if type(c.filters) ~= 'table' then U.fail('bad_request', 'entities[' .. i .. '].filters: список имён предметов или {index, name, quality?, comparator?}') end
+        local fl = {}
+        for k, f in ipairs(c.filters) do
+          if type(f) == 'string' then f = {name = f} end
+          if type(f) ~= 'table' or not prototypes.item[f.name or ''] then
+            U.fail('bad_request', 'entities[' .. i .. '].filters[' .. k .. ']: нет такого предмета: ' .. tostring(type(f) == 'table' and f.name or f))
+          end
+          local g = {}
+          for fk, fv in pairs(f) do g[fk] = fv end
+          g.index = g.index or k
+          fl[k] = g
+        end
+        c.filters = fl
+        if c.use_filters == nil and #fl > 0 then c.use_filters = true end
+      end
+    end
     ents[i] = c
   end
   for i, t in ipairs(tiles or {}) do

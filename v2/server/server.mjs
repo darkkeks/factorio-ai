@@ -159,7 +159,11 @@ const special = {
     const res = await settle(who.agent, ids, [], 0, 0);
     let pending = ids.filter((id) => !res.has(id));
     if (pending.length) {
-      const q = await game.call({ agent: who.agent, op: 'queue' });
+      // Бот вышел из игры (logout): очередь отменена целиком, итоги действий — в журнале, а не в ответе «offline».
+      const q = await game.call({ agent: who.agent, op: 'queue' }).catch((e) => {
+        if (e?.code !== 'offline') throw e;
+        return { queue: [] };
+      });
       const inQueue = new Set(q.queue.map((a) => a.action_id));
       const live = pending.filter((id) => inQueue.has(id));
       if (live.length && waitS > 0) {
