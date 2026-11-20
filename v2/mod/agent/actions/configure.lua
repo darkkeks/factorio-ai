@@ -7,6 +7,7 @@ local Tour = require('agent.actions.tour')
 local B = require('agent.actions.build')
 local Inv = require('agent.inv')
 local O = require('agent.ops')
+local Fog = require('agent.fog')
 
 local WIRE = {
   red = defines.wire_connector_id.circuit_red,
@@ -188,6 +189,7 @@ local function configure_one(A, it)
     local total, covered = request_items(e, ent, p.request_items)
     done.request_items = total
     if total then done.robots_in_range = covered end
+    if not e.can_reach_entity(ent) then done.remote = true end
   end
 
   if p.copy_from ~= nil then
@@ -469,6 +471,14 @@ local SETTINGS = {'copy_from', 'recipe', 'recipe_quality', 'direction', 'rotate'
   'output_priority', 'stack_size', 'bar', 'station', 'trains_limit', 'schedule', 'manual_mode', 'platform_requests', 'launch', 'control', 'wire',
   'request_items'}
 
+local function remote_only(p)
+  if p.request_items == nil then return false end
+  for _, k in ipairs(SETTINGS) do
+    if k ~= 'request_items' and p[k] ~= nil then return false end
+  end
+  return true
+end
+
 local function check_one(it, where)
   if type(it) ~= 'table' or type(it.target) ~= 'table' then U.fail('bad_request', where .. ': нужен target — {unit} или {x, y, name?}') end
   local any = false
@@ -498,7 +508,14 @@ Q.register('configure', Tour.action{
     if not it.entity.valid then U.fail('not_found', 'объекта уже нет') end
     return it.entity.position, A.entity.reach_distance
   end,
-  in_reach = function(A, it) return A.entity.can_reach_entity(it.entity) end,
+  -- Заявка роботам (request_items) без других настроек не требует досягаемости тела: игрок ставит её с карты
+  -- (удалённый вид) на любую свою постройку, которую видит вживую. Остальные настройки — только в досягаемости.
+  in_reach = function(A, it)
+    local e, ent = A.entity, it.entity
+    if e.can_reach_entity(ent) then return true end
+    if not remote_only(it.p) or ent.force ~= e.force then return false end
+    return Fog.state(ent.surface, e.force, ent.position.x, ent.position.y) == 'visible'
+  end,
   exec = configure_one,
   brief = function(it) return {x = it.target.x, y = it.target.y, unit = it.target.unit} end,
 })

@@ -466,6 +466,54 @@ test('configure request_items: заявка роботам на предметы
   ok(!ins.requests, 'заявка снята: ' + JSON.stringify(ins.requests));
 });
 
+test('configure request_items издалека: видимая постройка — без досягаемости, прочие настройки и туман — out_of_reach', async () => {
+  await reset({});
+  // Турель в 25 клетках: вне досягаемости, но в обзоре бота. Вторая — в открытом на карте, но не видимом чанке.
+  const far = await world(`local s, f = game.surfaces.nauvis, game.forces.player
+    s.create_entity{name = 'gun-turret', position = {A.ox + 55, A.oy + 5}, force = f}
+    local bots = {}
+    for _, a in pairs(storage.agent.agents) do if a.entity and a.entity.valid then bots[#bots + 1] = a.entity.position end end
+    for c in s.get_chunks() do
+      if f.is_chunk_charted(s, c) and not f.is_chunk_visible(s, c) then
+        local ok = true
+        for _, p in pairs(bots) do if math.abs(math.floor(p.x / 32) - c.x) <= 3 and math.abs(math.floor(p.y / 32) - c.y) <= 3 then ok = false end end
+        local pos = ok and s.find_non_colliding_position('gun-turret', {c.x * 32 + 16, c.y * 32 + 16}, 8, 1)
+        if pos then
+          local t = s.create_entity{name = 'gun-turret', position = pos, force = f}
+          return {x = t.position.x, y = t.position.y}
+        end
+      end
+    end
+    error('нет открытого чанка без обзора')`);
+  const turret = { ...P(55, 5), name: 'gun-turret' };
+  let ins = await call(A, 'inspect', { target: turret });
+  ok(ins.found && ins.in_reach === false, 'турель видна, но вне досягаемости: ' + JSON.stringify(ins));
+  let r = await call(A, 'configure', { target: turret, request_items: { 'piercing-rounds-magazine': 10 } });
+  ok(r.ok && r.remote === true && r.request_items['piercing-rounds-magazine'] === 10, JSON.stringify(r));
+  ins = await call(A, 'inspect', { target: turret });
+  ok(ins.requests && ins.requests['piercing-rounds-magazine'] === 10, 'заявка видна в inspect: ' + JSON.stringify(ins));
+  r = await call(A, 'configure', { target: turret, request_items: false });
+  ok(r.ok && r.request_items === false && r.remote === true, JSON.stringify(r));
+  // Заявка вместе с другой настройкой и другая настройка сама по себе — как раньше, нужна досягаемость.
+  r = await call(A, 'configure', { target: turret, request_items: { 'piercing-rounds-magazine': 10 }, direction: 'east' });
+  ok(!r.ok && r.error.code === 'out_of_reach', JSON.stringify(r));
+  r = await call(A, 'configure', { target: turret, direction: 'east' });
+  ok(!r.ok && r.error.code === 'out_of_reach', JSON.stringify(r));
+  ins = await call(A, 'inspect', { target: turret });
+  ok(!ins.requests, 'отказ ничего не оставил: ' + JSON.stringify(ins.requests));
+  // Список: далёкая заявка исполняется, далёкий поворот — нет.
+  r = await call(A, 'configure', { items: [{ target: turret, request_items: { 'firearm-magazine': 5 } }, { target: turret, rotate: true }] });
+  ok(r.ok && r.done === 1 && r.skipped === 1 && r.items[0].ok && r.items[0].remote === true && r.items[1].code === 'out_of_reach', JSON.stringify(r));
+  // Вне обзора заявку не поставить.
+  r = await call(A, 'configure', { target: { x: far.x, y: far.y, name: 'gun-turret' }, request_items: { 'firearm-magazine': 5 } });
+  ok(!r.ok && r.error.code === 'out_of_reach', JSON.stringify(r));
+  const left = await world(`local t = game.surfaces.nauvis.find_entity('gun-turret', {A.x, A.y})
+    local had = t.item_request_proxy ~= nil
+    t.destroy()
+    return {had = had}`, { x: far.x, y: far.y });
+  ok(left.had === false, 'на турели вне обзора заявки нет');
+});
+
 test('logistic_requests: личные запросы персонажа, роботы довозят до min', async () => {
   await reset({});
   const was = await world(`local f = game.forces.player local was = f.character_logistic_requests f.character_logistic_requests = false return {was = was}`);
