@@ -258,7 +258,9 @@ const LUA = {
   spectate: `
     local p = game.get_player(A.camera)
     if p and p.controller_type ~= defines.controllers.spectator then
-      local c = p.character
+      -- На новой карте первый вошедший смотрит вступительный ролик: персонаж на это время отцеплен от игрока
+      -- (cutscene_character) и без этого остался бы стоять на месте появления ничьим и неуязвимым.
+      local c = p.character or p.cutscene_character
       p.set_controller{type=defines.controllers.spectator}
       if c and c.valid then c.destroy() end
     end
