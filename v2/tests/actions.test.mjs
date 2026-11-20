@@ -198,6 +198,39 @@ test('craft: очередь ручного крафта, wait craft_empty, со�
   eq((await inv())['iron-plate'], 12);
 });
 
+test('технология-триггер: ручной крафт бота открывает технологию, отменённый — нет (fb-085)', async () => {
+  const T = 'automation-science-pack';
+  const tech = (code, args = {}) => lua(`local f = game.forces.player local t = f.technologies[A.t] ${code}`, { ...args, t: T });
+  const saved = await tech(`local pre = {} for n, p in pairs(t.prerequisites) do pre[n] = p.researched p.researched = true end
+    local was = t.researched t.researched = false storage.agent.trig.progress[A.t] = nil return {pre = pre, was = was}`);
+  const lab = { 'electronic-circuit': 10, 'iron-gear-wheel': 10, 'transport-belt': 4 };
+  try {
+    await reset(lab);
+    const info = await call(A, 'research_info', { name: T });
+    const tr = info.technology.trigger;
+    ok(tr && tr.type === 'craft-item' && tr.item === 'lab' && tr.count === 1, 'trigger в research_info: ' + JSON.stringify(info.technology));
+    const add = await call(A, 'research', { add: T });
+    ok(add.ok && add.skipped.length === 1 && /триггер/.test(add.skipped[0].reason), JSON.stringify(add));
+    // Отменённый крафт не считается.
+    const q = await call(A, 'craft', { item: 'lab' });
+    ok(q.ok && q.queued === 1, JSON.stringify(q));
+    await call(A, 'cancel_craft', {});
+    await call(A, 'wait', { ticks: 20 });
+    ok(!(await tech('return {r = t.researched}')).r, 'отменённый крафт не открыл технологию');
+    // Предпосылки есть: скрафченная руками лаба открывает технологию.
+    await reset(lab);
+    const s0 = (await call(A, 'events')).seq;
+    const r = await call(A, 'act', { actions: [{ type: 'craft', item: 'lab' }, { type: 'wait', until: 'craft_empty', max_ticks: 600 }] });
+    ok(r.ok && r.actions[1].state === 'done', JSON.stringify(r));
+    const ev = await call(A, 'events', { since: s0, wait_s: 3, types: ['research_finished'] });
+    ok(ev.events.some((e) => e.name === T || (e.data && e.data.name === T)), 'событие research_finished: ' + JSON.stringify(ev.events));
+    ok((await tech('return {r = t.researched}')).r, 'технология открыта');
+    eq((await inv()).lab, 1);
+  } finally {
+    await tech('t.researched = A.was for n, p in pairs(t.prerequisites) do p.researched = A.pre[n] == true end return true', saved);
+  }
+});
+
 test('wait: предел ожидания условия — max_ticks или ticks, ошибка timeout', async () => {
   await reset({});
   for (const lim of [{ max_ticks: 30 }, { ticks: 30 }]) {

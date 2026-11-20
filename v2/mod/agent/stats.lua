@@ -4,6 +4,7 @@ local T = require('agent.target')
 local O = require('agent.ops')
 local Fog = require('agent.fog')
 local Obs = require('agent.observe')
+local Trig = require('agent.triggers')
 
 local STATUS = {}
 for name, v in pairs(defines.entity_status) do STATUS[v] = name end
@@ -134,7 +135,7 @@ local function tech_info(t, force)
   local pre = {}
   for name, pr in pairs(t.prerequisites) do if not pr.researched then pre[#pre + 1] = name end end
   return {name = t.name, level = t.level, units = t.research_unit_count, seconds_per_unit = U.r2(t.research_unit_energy / 60),
-    ingredients = ing, missing_prerequisites = #pre > 0 and pre or nil}
+    ingredients = ing, missing_prerequisites = #pre > 0 and pre or nil, trigger = Trig.describe(t)}
 end
 
 O.register('research_info', {agent = true, fn = function(A, p)

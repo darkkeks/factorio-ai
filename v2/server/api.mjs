@@ -408,9 +408,13 @@ export const API = {
   research_info: {
     kind: 'query',
     summary: 'Окно исследований: текущее (с прогрессом), очередь, доступные сейчас технологии со стоимостью; с name — одна технология и что она открывает. ' +
-      'Менять очередь — действие research.',
+      'Менять очередь — действие research. Технология с trigger открывается не наукой, а действием, и в очередь не ставится: ' +
+      'craft-item — скрафтить count предметов item (руками через craft или в машинах), build-entity — поставить постройку entity, ' +
+      'mine-entity — добыть одно из entities, craft-fluid — получить жидкость в машинах. Ручной крафт и добыча ботов (craft, mine) ' +
+      'засчитываются, как у игрока: только когда предпосылки технологии уже исследованы (missing_prerequisites пуст) — сделанное раньше не в счёт, повтори.',
     params: { name: 'имя технологии', limit: 'сколько доступных показать (по умолчанию 30)' },
-    result: '{current: {name, progress, units, ingredients}, queue: [...], available: [{name, units, seconds_per_unit, ingredients}], technology?}',
+    result: '{current: {name, progress, units, ingredients}, queue: [...], available: [{name, units, seconds_per_unit, ingredients, ' +
+      'trigger?: {type, item?, count?, entity?, entities?, fluid?, amount?, quality?}}], technology?}',
     example: {},
   },
   chat: {

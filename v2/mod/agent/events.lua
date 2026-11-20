@@ -5,6 +5,7 @@ local Q = require('agent.queue')
 local S = require('agent.state')
 local Fog = require('agent.fog')
 local Gui = require('agent.gui')
+local Trig = require('agent.triggers')
 
 local E = {handlers = {}, nth = {}}
 
@@ -95,6 +96,7 @@ E.handlers[defines.events.on_entity_died] = function(ev)
       st.active[name] = nil
     end
     st.crafting[name] = nil
+    Trig.forget(name)
     st.by_unit[unit] = nil
     A.unit, A.entity = nil, nil
     local ok, err = pcall(S.spawn, A)
@@ -276,6 +278,7 @@ E.handlers[defines.events.on_tick] = function(ev)
     for name in pairs(st.crafting) do
       local A = st.agents[name]
       local e = A.entity
+      Trig.sync(A) -- скрафченное руками идёт в счёт технологий-триггеров
       if not (e and e.valid) or e.crafting_queue_size == 0 then
         st.crafting[name] = nil
         if e and e.valid then J.add('craft_done', name, {}) end

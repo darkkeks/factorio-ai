@@ -8,9 +8,10 @@ local Fog = require('agent.fog')
 local BP = require('agent.blueprints')
 local Gui = require('agent.gui')
 local Legacy = require('agent.legacy')
+local Trig = require('agent.triggers')
 
 local S = {}
-S.VERSION = 8
+S.VERSION = 9
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -137,6 +138,7 @@ function S.ensure()
   Fog.init(st)
   BP.init(st)
   Gui.init(st)
+  Trig.init(st)
   Gui.setup_players()
   if not st.legacy then
     st.legacy = 1

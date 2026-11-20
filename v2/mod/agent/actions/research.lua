@@ -45,6 +45,8 @@ Q.register('research', {
       local t = tech(force, n)
       if t.researched then skipped[#skipped + 1] = {name = n, reason = 'уже исследована'}
       elseif not t.enabled then skipped[#skipped + 1] = {name = n, reason = 'недоступна'}
+      elseif t.prototype.research_trigger then
+        skipped[#skipped + 1] = {name = n, reason = 'открывается не наукой, а действием (триггер): смотри trigger в research_info {name}'}
       elseif not force.add_research(t) then skipped[#skipped + 1] = {name = n, reason = 'игра не приняла: не исследованы предпосылки или очередь полна'} end
     end
     local q = queue_names(force)

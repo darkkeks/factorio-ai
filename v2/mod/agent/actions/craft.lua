@@ -2,6 +2,7 @@
 -- Тело крафт не занимает: действие мгновенное, о конце очереди приходит событие craft_done.
 local U = require('agent.util')
 local Q = require('agent.queue')
+local Trig = require('agent.triggers')
 
 local function by_hand(e, r)
   for cat in pairs(e.prototype.crafting_categories or {}) do
@@ -56,7 +57,9 @@ Q.register('craft', {
       end
       U.fail('no_item', 'не хватает ингредиентов для ' .. r.name, {ingredients = need})
     end
+    Trig.sync(A) -- уже скрафченное засчитать до того, как очередь изменится
     local n = e.begin_crafting{recipe = r, count = math.min(count, can), silent = true}
+    Trig.snapshot(A)
     if n > 0 then storage.agent.crafting[A.name] = true end
     return {recipe = r.name, queued = n, requested = count, queue_size = e.crafting_queue_size}
   end,
@@ -70,6 +73,7 @@ Q.register('cancel_craft', {
   start = function(A, act)
     local e, p = A.entity, act.p
     local cancelled = 0
+    Trig.sync(A) -- отменённое не должно сойти за скрафченное
     if p.index then
       local q = e.crafting_queue or {}
       local item = q[p.index]
@@ -87,6 +91,7 @@ Q.register('cancel_craft', {
         cancelled = cancelled + item.count
       end
     end
+    Trig.snapshot(A)
     return {cancelled = cancelled, queue_size = e.crafting_queue_size}
   end,
 })
