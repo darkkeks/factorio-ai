@@ -134,6 +134,12 @@
     robot/backup-map.py --list      # что хранится, по ступеням
     crontab -l                      # расписание
 
+Карта с 20.11.2026 — вторая: Space Age, настройки «rail world» (ресурсы реже и крупнее, враги не расширяются).
+Первая карта целиком лежит в `~/backups/factorio/archive/space-age-1-map1-20261120/` (последнее сохранение, автосохранения,
+история копий, тайлы веб-карты), чистая копия новой — `…/archive/space-age-1-map2-initial-20261120.zip`. Проверки мода
+идут на копии первой карты (`~/claude/factorio-v2-test/base-copy.zip`): на ней есть завод. При смене карты веб-карте
+нужен пустой кэш тайлов (`~/factorio-camera/tiles` убрать, сервис перезапустить).
+
 Восстановление: `docker exec robot supervisorctl stop factorio-space-age-1`, положить выбранную копию на место
 `~/robot/factorio/space-age-1/space-age-1.zip`, затем `… start factorio-space-age-1`. Отдельно от этого
 `v2/tools/update-game.sh` перед каждым обновлением мода кладёт копию в `~/robot/factorio/space-age-1/backups/`.
