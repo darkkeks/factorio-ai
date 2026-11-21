@@ -254,7 +254,8 @@ map.on('dragstart', () => setFollow(false));
 function onLive(m) {
   paused = m.ok && m.paused;
   $('st-pause').textContent = paused ? '⏸ игра на паузе' : '';
-  $('st-cam').textContent = m.ok && !m.camera ? 'камера не в игре — картинка не обновляется' : '';
+  // На долгой паузе камеру останавливают нарочно: картинка и так не меняется.
+  $('st-cam').textContent = m.ok && !m.camera && !m.sleep ? 'камера не в игре — картинка не обновляется' : '';
   $('st-conn').textContent = m.ok ? '' : 'сервер игры не отвечает';
   $('st-conn').className = m.ok ? '' : 'bad';
   actors = m.bots;
@@ -278,7 +279,7 @@ function showTarget(m) {
     const b = [ll(a.x - camSize.w / 2, a.y - camSize.h / 2), ll(a.x + camSize.w / 2, a.y + camSize.h / 2)];
     if (camFrame) camFrame.setBounds(b); else camFrame = L.rectangle(b, { color: '#ffcc33', weight: 1.5, fill: false, dashArray: '6 4', interactive: false }).addTo(map);
   }
-  if (!liveBroken) $('live-cap').textContent = !m.ok ? 'сервер игры не отвечает' : !m.camera ? 'камера не в игре' : t ? `камера следит за: ${t.name}${t.manual ? '' : ' (сама выбрала)'}` : 'камере не за кем следить';
+  if (!liveBroken) $('live-cap').textContent = !m.ok ? 'сервер игры не отвечает' : !m.camera ? (m.paused ? 'игра на паузе — камера просыпается…' : 'камера не в игре') : t ? `камера следит за: ${t.name}${t.manual ? '' : ' (сама выбрала)'}` : 'камере не за кем следить';
   syncTargets(m, t);
 }
 // Список «за кем следить» — чтобы выбирать, не закрывая видео во всё окно.

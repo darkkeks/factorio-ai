@@ -32,6 +32,7 @@ const CAMERA_DISPLAY = process.env.CAMERA_DISPLAY || ':96'; // дисплей Xv
 const CAMERA_DATA = process.env.CAMERA_DATA || path.join(CAMERA_DIR, 'factorio'); // папка данных клиента (config, script-output)
 const CAMERA_ZOOM = 0.75;                                  // масштаб живого окна: 24 пикселя на клетку, 53×30 клеток в кадре
 const CAMERA_START_MS = 180_000;                           // сколько ждать подключения после запуска
+const CAMERA_SLEEP_MS = Number(process.env.CAMERA_SLEEP_MS || 300_000); // игра на паузе дольше этого — клиент-камеру останавливаем
 const CAMERA_RETRY_MS = 900_000;                           // пауза после неудачного запуска (сервер не пускает); перезапуск сервера её сбрасывает
 const SHOT_DIR = 'map-shots';                              // подпапка script-output клиента
 const SHOTS = path.join(CAMERA_DATA, 'script-output', SHOT_DIR);
@@ -298,7 +299,7 @@ async function liveLoop() {
       if (!r.paused) pausedAt = 0;
       if (r.camera?.connected && !r.camera.spectator) { await lua(LUA.spectate, { camera: CAMERA }); log('камера переведена в режим зрителя'); }
       const was = live.camera;
-      live = { tick: r.tick, paused: r.paused, bots: here(r.bots), players: here(r.players), ok: true, camera: !!r.camera?.connected, target: live.target };
+      live = { tick: r.tick, paused: r.paused, bots: here(r.bots), players: here(r.players), ok: true, camera: !!r.camera?.connected, target: live.target, sleep: sleeping };
       if (live.camera && !was) targetSent = ''; // камера только что вошла: настроить заново
       await aimCamera();
       if (live.camera && viewers.size && !encoder) startVideo();
@@ -839,6 +840,14 @@ async function cameraLoop() {
       if (dying) continue; // новый клиент — только когда прежний ушёл
     }
     if (camera && !alive(camera.pid)) { log('клиент-камера больше не работает'); camera = null; }
+    // Игра давно на паузе, всё снято, живое окно никто не смотрит — клиенту нечего делать, а процессор он ест
+    // постоянно. Останавливаем его и запускаем снова, когда игра пойдёт или кто-то откроет живое окно.
+    if (live.ok) {
+      const idle = live.paused && pausedAt && now - pausedAt > CAMERA_SLEEP_MS && !viewers.size && chunksKnown && pick().length === 0;
+      if (idle && !sleeping) { sleeping = true; live.sleep = true; log('игра давно на паузе — клиент-камера остановлен до её продолжения'); stopCamera('игра на паузе'); }
+      else if (!idle && sleeping) { sleeping = false; live.sleep = false; nextStart = 0; log(`клиент-камера нужен снова (${!live.paused ? 'игра идёт' : viewers.size ? 'открыто живое окно' : 'есть что снять'})`); }
+    }
+    if (sleeping) continue;
     if (camera) {
       // О входе и обрыве судим по логу самого клиента: ответ сервера по RCON в момент перезапуска бывает устаревшим.
       const news = cameraLogNews();
@@ -861,6 +870,7 @@ async function cameraLoop() {
   }
 }
 let waitServer = false; // после неудачного входа ждём, пока сервер ответит по RCON
+let sleeping = false;   // клиент-камера остановлен, потому что игра давно на паузе
 
 // ---------- живое окно: видео из окна клиента-камеры ----------
 // ffmpeg снимает дисплей клиента и отдаёт H.264 во фрагментированном MP4; каждый фрагмент начинается с ключевого кадра,
