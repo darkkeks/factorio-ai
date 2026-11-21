@@ -90,6 +90,37 @@ test('wait: false возвращает номер сразу, wait_action дож
   ok(!s.walking && s.queue.length === 0, 'после отмены персонаж должен стоять');
 });
 
+test('задержки: replace отвечает за считаные тики, одновременные запросы одного бота не ждут друг друга', async () => {
+  await call(A, 'status');
+  await put('bench-1', open.x, open.y);
+  const med = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+  const fmt = (a) => a.map((x) => x.toFixed(0)).join(' ');
+  // Перехват тела: идёт walk_to другого запроса, replace ставит короткое действие — оба ответа приходят сразу,
+  // а не через период опроса журнала (на стенде он 100 мс).
+  const rep = [], walk = [];
+  for (let i = 0; i < 8; i++) {
+    const w = call(A, 'walk_to', { x: open.x + 30, y: open.y, wait_s: 20 });
+    await sleep(150);
+    const t0 = performance.now();
+    const r = await call(A, 'act', { replace: true, actions: [{ type: 'wait', ticks: 1 }] });
+    const c = await w;
+    walk.push(performance.now() - t0);
+    ok(r.ok && r.actions[0].state === 'done' && !c.ok && c.error.code === 'cancelled', JSON.stringify([r, c]));
+    rep.push(r.ms);
+  }
+  ok(med(rep) < 90, `replace с действием на 1 тик: ${fmt(rep)} мс`);
+  ok(med(walk) < 90, `отменённый walk_to узнал об отмене через ${fmt(walk)} мс`);
+  const par = [];
+  for (let i = 0; i < 15; i++) {
+    const t0 = performance.now();
+    const rs = await Promise.all([call(A, 'status'), call(A, 'status'), call(A, 'queue')]);
+    par.push(performance.now() - t0);
+    ok(rs.every((r) => r.ok));
+    await sleep(40);
+  }
+  ok(med(par) < 30 && par.filter((x) => x >= 40).length <= 2, `три запроса разом: ${fmt(par)} мс`);
+});
+
 test('повтор запроса с тем же id не исполняет действие дважды; разные id — оба', async () => {
   const count = async () => (await lua(`local n = 0 for _, m in pairs(storage.vb_chat.items) do if m.text == A.t then n = n + 1 end end return {n = n}`, { t: text })).n;
   const text = 'повтор-' + Date.now();

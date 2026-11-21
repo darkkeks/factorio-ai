@@ -2,7 +2,8 @@
 // У каждого персонажа своё соединение RCON, у опроса журнала — своё: запросы ботов не стоят в общей очереди.
 import { Rcon } from './rcon.mjs';
 
-const EMPTY = '\u0001[]'; // так мод помечает пустые списки (table_to_json превращает пустую таблицу в {})
+const POOL = 4; // соединений RCON на одного бота
+const EMPTY ='\u0001[]'; // так мод помечает пустые списки (table_to_json превращает пустую таблицу в {})
 
 function fixEmpty(v) {
   if (v === EMPTY) return [];
@@ -16,8 +17,11 @@ export class GameError extends Error {
 }
 
 export class Game {
-  constructor({ rcon, pollMs = 100, bufferSize = 20000, holdMs = 90000, log = () => {} }) {
+  constructor({ rcon, pollMs = 100, fastPollMs = 5, bufferSize = 20000, holdMs = 90000, log = () => {} }) {
     this.conf = rcon;
+    this.fastPollMs = fastPollMs; // опрос журнала, пока кто-то ждёт итога действия (примерно тик)
+    this.urgent = 0;              // сколько запросов сейчас ждут итога действия
+    this.kick = null;             // разбудить опрос журнала, не дожидаясь паузы
     this.holdMs = holdMs; // сколько запросы ждут возвращения сервера игры
     this.pollMs = pollMs;
     this.bufferSize = bufferSize;
@@ -39,13 +43,32 @@ export class Game {
     return c;
   }
 
+  /**
+   * Свободное соединение из нескольких с этим именем. Два ответа подряд в одном соединении игра шлёт двумя
+   * сегментами TCP, и второй ждёт подтверждения первого (~40 мс): одновременные запросы одного бота задерживали
+   * друг друга. Поэтому у каждого запроса в полёте — своё соединение (до POOL), дальше — наименее занятое.
+   */
+  free(name) {
+    let best = null;
+    for (let i = 0; i < POOL; i++) {
+      const c = this.conn(i ? `${name}#${i}` : name);
+      if (!c.busy) return c; // следующее соединение открывается, только когда прежние заняты
+      if (!best || c.busy < best.busy) best = c;
+    }
+    return best;
+  }
+
   /** Один запрос к моду без повторов. Возвращает result; ошибка мода — GameError(code, message, data). */
   async once(req, connName = req.agent ? `a:${req.agent}` : 'admin') {
     let raw;
+    const c = this.free(connName);
+    c.busy = (c.busy || 0) + 1;
     try {
-      raw = await this.conn(connName).command('/agent ' + JSON.stringify(req));
+      raw = await c.command('/agent ' + JSON.stringify(req));
     } catch (e) {
       throw new GameError('game_unavailable', `сервер игры недоступен: ${e.message}`);
+    } finally {
+      c.busy--;
     }
     let r;
     try { r = JSON.parse(raw); } catch {
@@ -141,7 +164,13 @@ export class Game {
         await new Promise((r) => setTimeout(r, 1000));
         continue;
       }
-      await new Promise((r) => setTimeout(r, this.pollMs));
+      // Пока кто-то ждёт итога действия, журнал читается раз в тик: иначе короткое действие (и отмена чужого
+      // при replace) отвечало бы с задержкой до pollMs. Новый ожидающий будит опрос сразу (kick).
+      await new Promise((r) => {
+        const t = setTimeout(r, this.urgent > 0 ? Math.min(this.fastPollMs, this.pollMs) : this.pollMs);
+        this.kick = () => { clearTimeout(t); r(); };
+      });
+      this.kick = null;
     }
   }
 
@@ -167,10 +196,11 @@ export class Game {
    * Ждать события: сначала из буфера (после since), потом новые. done(накопленные) → true, когда хватит.
    * Возвращает накопленные события; по истечении срока — то, что успело прийти.
    */
-  wait({ since, match, done, timeoutMs }) {
+  wait({ since, match, done, timeoutMs, fast = false }) {
     const got = this.since(since, match);
     if (done(got) || timeoutMs <= 0) return Promise.resolve(got);
     return new Promise((resolve) => {
+      if (fast) { this.urgent++; this.kick?.(); }
       const w = {
         match,
         push: (hit) => {
@@ -178,7 +208,7 @@ export class Game {
           if (done(got)) finish();
         },
       };
-      const finish = () => { clearTimeout(timer); this.waiters.delete(w); resolve(got); };
+      const finish = () => { clearTimeout(timer); if (this.waiters.delete(w) && fast) this.urgent--; resolve(got); };
       const timer = setTimeout(finish, timeoutMs);
       this.waiters.add(w);
     });

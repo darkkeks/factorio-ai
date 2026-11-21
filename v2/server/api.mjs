@@ -399,10 +399,15 @@ export const API = {
   },
   find: {
     kind: 'query',
-    summary: 'Поиск на карте по имени или типу в радиусе (до 300) вокруг точки или персонажа: ближайшие объекты и сводка по именам. Скрытое туманом не находится.',
+    summary: 'Поиск на карте по имени или типу в радиусе (до 300) вокруг точки или персонажа: ближайшие объекты и сводка по именам. Скрытое туманом не находится: ' +
+      'пустой ответ значит «никого нет» только там, где есть обзор. view — насколько радиус покрыт обзором: visible_percent — доля чанков, видимых вживую ' +
+      '(враги, персонажи и предметы на земле находятся только в них), charted_percent — открытых на карте (постройки и ресурсы по памяти карты), ' +
+      'nearest_hidden — ближайший к центру чанк без обзора (его центр, distance — от центра поиска до его края; state: charted — на карте, но не виден, unknown — не открыт): ' +
+      'ближе этого расстояния видно всё.',
     params: { name: 'имя объекта (iron-ore, stone-furnace, …)', names: 'или список имён', type: 'или тип (tree, resource, furnace, …)', ghost: 'true — искать призраки с таким именем',
       x: '', y: '', radius: 'по умолчанию 60', limit: 'по умолчанию 30' },
-    result: '{total, by_name: {имя: {count, nearest, x, y, amount?}}, objects: [{name, type, x, y, unit, distance, amount?, memory?}], more?}',
+    result: '{total, by_name: {имя: {count, nearest, x, y, amount?}}, objects: [{name, type, x, y, unit, distance, amount?, memory?}], more?, ' +
+      'view: {visible_percent, charted_percent, nearest_hidden?: {x, y, distance, state}}}',
     example: { name: 'iron-ore', radius: 150 },
   },
   production: {
@@ -441,9 +446,11 @@ export const API = {
   enemies: {
     kind: 'query',
     summary: 'Слой врагов на карте: гнёзда и черви на открытой карте, отряды — только в видимой зоне; эволюция и из чего она сложилась ' +
-      '(как в команде /evolution): evolution_by — доли в процентах от времени, загрязнения и уничтоженных гнёзд. Растёт ли kills после зачистки гнёзд, видно по сравнению до и после.',
+      '(как в команде /evolution): evolution_by — доли в процентах от времени, загрязнения и уничтоженных гнёзд. Растёт ли kills после зачистки гнёзд, видно по сравнению до и после. ' +
+      'view — насколько радиус покрыт обзором (как в find): при visible_percent < 100 units_total: 0 не значит, что врагов нет, — отряды дальше view.nearest_hidden.distance могут быть не видны.',
     params: { x: '', y: '', radius: 'по умолчанию 150 (до 500)' },
-    result: '{evolution (0…1), evolution_percent, evolution_by: {time, pollution, kills}, nests: [{name, x, y, distance, memory?}], worms, units: {имя: количество}, units_total, nearest_unit}',
+    result: '{evolution (0…1), evolution_percent, evolution_by: {time, pollution, kills}, nests: [{name, x, y, distance, memory?}], worms, units: {имя: количество}, units_total, nearest_unit, ' +
+      'view: {visible_percent, charted_percent, nearest_hidden?: {x, y, distance, state}}}',
     example: { radius: 300 },
   },
   logistics: {

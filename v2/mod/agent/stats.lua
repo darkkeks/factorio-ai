@@ -339,7 +339,8 @@ O.register('enemies', {agent = true, fn = function(A, p)
   return {center = U.pos(c), radius = radius, evolution = U.r2(enemy.get_evolution_factor(surface)),
     evolution_percent = math.floor(enemy.get_evolution_factor(surface) * 10000 + 0.5) / 100,
     evolution_by = {time = share(bt), pollution = share(bp), kills = share(bk)},
-    nests = U.list(nests), worms = U.list(worms), units = units, units_total = unit_count or 0, nearest_unit = nearest}
+    nests = U.list(nests), worms = U.list(worms), units = units, units_total = unit_count or 0, nearest_unit = nearest,
+    view = Fog.coverage(surface, force, c, radius, visible)}
 end})
 
 -- ── logistics: окно логистической сети ──

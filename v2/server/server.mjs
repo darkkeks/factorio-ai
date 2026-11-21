@@ -71,7 +71,7 @@ function auth(req) {
 if (conf.feedbackDir) process.env.FEEDBACK_DIR = resolve(conf.feedbackDir);
 const FB = await import('../../src/feedback.mjs');
 
-const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, holdMs: conf.holdMs ?? 90000, log });
+const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, fastPollMs: conf.fastPollMs ?? 5, holdMs: conf.holdMs ?? 90000, log });
 
 // ── Ожидание завершения действий ──
 const mine = (agent) => (ev) => ev.agent === agent || ev.agent == null;
@@ -87,6 +87,7 @@ async function settle(agent, ids, finished, since, waitS) {
       match: (ev) => ev.agent === agent && ev.type === 'action_done' && want.has(ev.action_id),
       done: (list) => list.length >= want.size,
       timeoutMs: waitS * 1000,
+      fast: true,
     });
     for (const ev of got) res.set(ev.action_id, { action_id: ev.action_id, action: ev.action, ok: ev.ok, result: ev.result, error: ev.error, ticks: ev.ticks });
   }

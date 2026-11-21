@@ -69,7 +69,39 @@ function Fog.area_charted(surface, force, area)
   return true
 end
 
---- Память чанка: {added = {номер → true}, removed = {…}} или nil, если с последнего обновления карты ничего не менялось.
+--- Насколько круг (c, radius) покрыт обзором: доли чанков, задевающих круг, которые видны вживую и открыты на карте,
+--- и ближайший к центру чанк без обзора. Игрок то же видит на карте: светлое — видно, затемнённое — нет.
+function Fog.coverage(surface, force, c, radius, visible)
+  visible = visible or Fog.viewer(surface, force)
+  local n, seen, charted = 0, 0, 0
+  local near_d2, near_cx, near_cy, near_charted
+  local r2 = radius * radius
+  for cx = math.floor((c.x - radius) / 32), math.floor((c.x + radius) / 32) do
+    local dx = math.max(cx * 32, math.min(c.x, cx * 32 + 32)) - c.x
+    for cy = math.floor((c.y - radius) / 32), math.floor((c.y + radius) / 32) do
+      local dy = math.max(cy * 32, math.min(c.y, cy * 32 + 32)) - c.y
+      local d2 = dx * dx + dy * dy
+      if d2 <= r2 then
+        n = n + 1
+        if visible(cx, cy) then
+          seen, charted = seen + 1, charted + 1
+        else
+          local ch = force.is_chunk_charted(surface, {cx, cy})
+          if ch then charted = charted + 1 end
+          if not near_d2 or d2 < near_d2 then near_d2, near_cx, near_cy, near_charted = d2, cx, cy, ch end
+        end
+      end
+    end
+  end
+  local out = {visible_percent = math.floor(seen / n * 100), charted_percent = math.floor(charted / n * 100)}
+  if near_d2 then
+    out.nearest_hidden = {x = near_cx * 32 + 16, y = near_cy * 32 + 16, distance = math.floor(math.sqrt(near_d2) * 10 + 0.5) / 10,
+      state = near_charted and 'charted' or 'unknown'}
+  end
+  return out
+end
+
+--- Память чанка:{added = {номер → true}, removed = {…}} или nil, если с последнего обновления карты ничего не менялось.
 function Fog.memory(surface, cx, cy)
   return storage.agent.fog.mem[key(surface.index, cx, cy)]
 end

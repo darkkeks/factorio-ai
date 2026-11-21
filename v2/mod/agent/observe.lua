@@ -601,7 +601,8 @@ O.register('find', {agent = true, fn = function(A, p)
     g.nearest = U.r2(math.sqrt(g.d2))
     g.d2 = nil
   end
-  return {center = U.pos(c), radius = radius, total = n, by_name = groups, objects = U.list(out), more = (n > limit) or nil}
+  return {center = U.pos(c), radius = radius, total = n, by_name = groups, objects = U.list(out), more = (n > limit) or nil,
+    view = Fog.coverage(surface, force, c, radius, visible)}
 end})
 
 return Obs

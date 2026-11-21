@@ -100,10 +100,15 @@ test('туман войны: объект вне обзора — по памя�
   ok(biter.found === false, 'враг вне обзора не виден: ' + JSON.stringify(biter));
   const en = await call(A, 'enemies', { x: F.x, y: F.y, radius: 20 });
   ok(en.units_total === 0 && en.nests.length === 1 && en.nests[0].memory === true, JSON.stringify(en));
+  // «Никого нет» и «не видно» различимы: радиус открыт на карте, но вживую не виден, ближайший невидимый чанк — сам центр.
+  ok(en.view && en.view.visible_percent < 100 && en.view.charted_percent > 0 && en.view.nearest_hidden.distance === 0 && en.view.nearest_hidden.state === 'charted', JSON.stringify(en.view));
   const by = en.evolution_by;
   ok(by && [by.time, by.pollution, by.kills].every((v) => v >= 0 && v <= 100) && typeof en.evolution_percent === 'number', 'разбивка эволюции: ' + JSON.stringify(by));
   const found = await call(A, 'find', { names: ['wooden-chest', 'iron-chest', 'small-biter'], x: F.x, y: F.y, radius: 20 });
   ok(found.total === 1 && found.objects[0].memory && found.objects[0].name === 'wooden-chest', JSON.stringify(found));
+  ok(found.view.visible_percent < 100 && found.view.nearest_hidden.distance === 0, JSON.stringify(found.view));
+  const blind = await call(A, 'find', { name: 'small-biter', x: F.x + 5000, y: F.y + 5000, radius: 40 });
+  ok(blind.total === 0 && blind.view.visible_percent === 0 && blind.view.charted_percent === 0 && blind.view.nearest_hidden.state === 'unknown', JSON.stringify(blind.view));
   const ar = await call(A, 'area', { area: { x1: F.x - 2, y1: F.y - 2, x2: F.x + 10, y2: F.y + 10 }, objects: true });
   ok(ar.fog_rows && ar.fog_rows[0][0] === 'm' && ar.objects.length === 1 && ar.objects[0].memory, JSON.stringify(ar).slice(0, 600));
   // Сундук разрушен без свидетелей: на карте он по-прежнему значится.
@@ -121,6 +126,7 @@ test('бот открывает карту вокруг себя, как игр�
   ok(gone.found === false, 'рядом видно, что сундука уже нет: ' + JSON.stringify(gone));
   const en = await call(A, 'enemies', { radius: 30 });
   ok(en.units_total >= 1 && en.nests.length === 1 && !en.nests[0].memory, JSON.stringify(en));
+  ok(en.view.visible_percent === 100 && en.view.charted_percent === 100 && !en.view.nearest_hidden, 'вблизи бота всё видно: ' + JSON.stringify(en.view));
   const ar = await call(A, 'area', { radius: 10 });
   ok(!ar.fog_rows && ar.rows.some((r) => r.includes('@')) && Object.values(ar.legend).includes('enemy:small-biter'), JSON.stringify(ar.legend));
   const far = await call(A, 'inspect', { target: { x: F.x + 2000.5, y: F.y + 2000.5 } });
