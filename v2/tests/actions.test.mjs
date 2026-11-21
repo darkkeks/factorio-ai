@@ -324,6 +324,70 @@ test('repair: чинит в темпе игры, тратит ресурс ре�
   eq((await call(A, 'repair', { target: P(34, 16), item: 'iron-plate' })).http, 400);
 });
 
+test('equip / unequip: оружие, патроны и броня между инвентарём и слотами; совместимость и место проверяются', async () => {
+  await reset();
+  // В основной инвентарь напрямую: e.insert сам разложил бы оружие и броню по слотам.
+  const give = (items) => world(`local m = storage.agent.agents[A.name].entity.get_main_inventory()
+    for n, c in pairs(A.items) do m.insert{name = n, count = c} end return true`, { name: NAME, items });
+  await give({ pistol: 1, shotgun: 1, 'firearm-magazine': 30, 'shotgun-shell': 20, 'light-armor': 1, 'modular-armor': 1 });
+  let st = await call(A, 'status');
+  ok(st.weapons.length === 3 && !st.weapons[0].gun && st.inventory.pistol === 1, JSON.stringify(st.weapons));
+  // Оружие — в первый свободный слот; патроны — только подходящие оружию в слоте.
+  let r = await call(A, 'equip', { item: 'pistol' });
+  ok(r.ok && r.kind === 'gun' && r.slot === 1 && r.weapons[0].gun === 'pistol', JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'shotgun-shell', slot: 1 });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'firearm-magazine', count: 7 });
+  ok(r.ok && r.slot === 1 && r.moved === 7 && r.weapons[0].ammo === 'firearm-magazine' && r.weapons[0].count === 7, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'firearm-magazine', slot: 1 });
+  ok(r.ok && r.moved === 23 && r.weapons[0].count === 30, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'firearm-magazine' });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  // Оружие в занятый слот с чужими патронами не встаёт; в свободный — встаёт.
+  r = await call(A, 'equip', { item: 'shotgun', slot: 1 });
+  ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'shotgun' });
+  ok(r.ok && r.slot === 2, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'shotgun-shell' });
+  ok(r.ok && r.slot === 2 && r.moved === 20, JSON.stringify(r));
+  st = await call(A, 'status');
+  ok(st.guns.pistol === 1 && st.guns.shotgun === 1 && st.ammo['firearm-magazine'] === 30 && st.ammo['shotgun-shell'] === 20
+    && !st.inventory.pistol && !st.inventory['firearm-magazine'], JSON.stringify(st));
+  // Снять: патроны частично и целиком, оружие.
+  r = await call(A, 'unequip', { item: 'firearm-magazine', count: 10 });
+  ok(r.ok && r.moved === 10 && r.weapons[0].count === 20, JSON.stringify(r));
+  r = await call(A, 'unequip', { item: 'firearm-magazine' });
+  ok(r.ok && r.moved === 20 && !r.weapons[0].ammo, JSON.stringify(r));
+  r = await call(A, 'unequip', { item: 'pistol' });
+  ok(r.ok && r.slot === 1 && !r.weapons[0].gun, JSON.stringify(r));
+  r = await call(A, 'unequip', { item: 'pistol' });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  let mine = await inv();
+  ok(mine.pistol === 1 && mine['firearm-magazine'] === 30, JSON.stringify(mine));
+  // Броня: надеть, поменять местами, снять; инвентарь растёт и сжимается без потерь.
+  r = await call(A, 'equip', { item: 'modular-armor' });
+  ok(r.ok && r.kind === 'armor' && r.inventory_slots === 90, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'modular-armor' });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'light-armor' });
+  ok(r.ok && r.replaced === 'modular-armor' && r.inventory_slots === 80, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'modular-armor' });
+  ok(r.ok && r.replaced === 'light-armor' && r.inventory_slots === 90, JSON.stringify(r));
+  // Инвентарь забит: ни снять броню с запасом слотов, ни сменить на меньшую — предметы на землю не сыплются.
+  await give({ 'iron-plate': 100000 });
+  r = await call(A, 'unequip', { item: 'modular-armor' });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'light-armor' });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  eq(await world(`return {n = game.surfaces.nauvis.count_entities_filtered{area = {{A.ox - 2, A.oy - 2}, {A.ox + 62, A.oy + 32}}, type = 'item-entity'}}`).then((x) => x.n), 0);
+  await world(`storage.agent.agents[A.name].entity.get_main_inventory().remove{name = 'iron-plate', count = 100000} return true`, { name: NAME });
+  r = await call(A, 'unequip', { item: 'modular-armor' });
+  ok(r.ok && r.inventory_slots === 80, JSON.stringify(r));
+  st = await call(A, 'status');
+  ok(st.inventory['modular-armor'] === 1 && st.inventory['light-armor'] === 1 && !st.armor['modular-armor'], JSON.stringify(st));
+  eq((await call(A, 'equip', { item: 'iron-plate' })).http, 400);
+});
+
 test('repair: область с подходом — только повреждённое своей команды; без подхода — out_of_reach', async () => {
   await reset({ 'repair-pack': 2 });
   await world(`

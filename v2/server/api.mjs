@@ -73,6 +73,27 @@ export const API = {
       'список или область: отчёт {done, skipped, left, total, items: [...]}',
     example: { area: { x1: 10, y1: -40, x2: 30, y2: -30 }, approach: true },
   },
+  equip: {
+    kind: 'action', instant: true,
+    summary: 'Надеть из инвентаря оружие, патроны или броню в слоты персонажа, как в окне персонажа. Вид слота определяется предметом. ' +
+      'Оружие: в slot или в первый свободный слот; занятый slot — оружие меняется местами (старое уходит в инвентарь, в ответе replaced). ' +
+      'Патроны: count штук (по умолчанию все) в slot или в первый подходящий слот; патроны должны подходить оружию в том же слоте, ' +
+      'в слот с другими патронами не кладутся (сначала unequip). Броня: слот один, надетая меняется местами с новой; ' +
+      'если у новой меньше запас слотов инвентаря, нужно столько же свободных слотов — иначе no_space. ' +
+      'Предметы, взятые в инвентарь (transfer take, добыча), игра часто надевает сама — смотри status → weapons, armor. ' +
+      'Действия «стрелять» пока нет: надетое оружие работает только у человека.',
+    params: { item: 'имя оружия, патронов или брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все', slot: '1…3 — номер слота оружия или патронов' },
+    result: '{item, kind: gun | ammo | armor, slot, moved, replaced?, already?, weapons: [{slot, gun?, ammo?, count?}], inventory_slots — для брони: размер инвентаря после}',
+    example: { item: 'firearm-magazine', count: 20, slot: 1 },
+  },
+  unequip: {
+    kind: 'action', instant: true,
+    summary: 'Снять надетое оружие, патроны или броню в инвентарь. Нет свободного слота — no_space; броня с запасом слотов инвентаря ' +
+      'требует столько же свободных слотов плюс один под себя (иначе лишнее высыпалось бы на землю).',
+    params: { item: 'имя надетого предмета', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все из слота', slot: '1…3 — из какого слота (по умолчанию первый с таким предметом)' },
+    result: '{item, kind, slot, moved, weapons?, inventory_slots?}',
+    example: { item: 'pistol' },
+  },
   craft: {
     kind: 'action', instant: true,
     summary: 'Ручной крафт: поставить рецепт в очередь крафта персонажа. Тело не занимает — можно идти и строить. ' +
@@ -491,7 +512,7 @@ export const API = {
     kind: 'query',
     summary: 'Свой персонаж: позиция, здоровье, инвентарь, экипировка, очередь крафта, очередь действий, дальности.',
     params: {},
-    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, crafting, queue, reach: {build, interact, resource}, tick, paused}',
+    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), crafting, queue, reach: {build, interact, resource}, tick, paused}',
     example: {},
   },
   agents: {

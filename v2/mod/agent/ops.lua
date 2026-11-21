@@ -6,6 +6,7 @@ local Q = require('agent.queue')
 local S = require('agent.state')
 local Gui = require('agent.gui')
 local BUILD = require('agent.build')
+local Equip = require('agent.actions.equip')
 
 local O = {list = {}}
 
@@ -104,6 +105,7 @@ O.register('status', {agent = true, fn = function(A)
     guns = U.contents(e.get_inventory(defines.inventory.character_guns)),
     ammo = U.contents(e.get_inventory(defines.inventory.character_ammo)),
     armor = U.contents(e.get_inventory(defines.inventory.character_armor)),
+    weapons = U.list(Equip.weapons(e)),
     crafting = U.list(crafting),
     queue = U.list(Q.view(A)),
     reach = {build = e.build_distance, interact = e.reach_distance, resource = e.resource_reach_distance},

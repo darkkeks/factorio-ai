@@ -11,7 +11,7 @@ local G = {handlers = {}}
 local BP_ROWS = 200
 
 local ACTIONS = {walk_to = 'идёт', mine = 'добывает', place = 'строит', build_ghosts = 'строит по плану', transfer = 'перекладывает',
-  configure = 'настраивает', repair = 'чинит', wait = 'ждёт', craft = 'крафтит', say = 'говорит', research = 'исследования'}
+  configure = 'настраивает', repair = 'чинит', equip = 'экипируется', unequip = 'снимает экипировку',wait = 'ждёт', craft = 'крафтит', say = 'говорит', research = 'исследования'}
 local TAG_EVERY = 120
 local TEXT_COLOR = {0.8, 0.9, 1}
 local LINE_COLOR = {0.4, 0.8, 1, 0.6}
