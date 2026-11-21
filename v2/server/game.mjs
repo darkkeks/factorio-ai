@@ -4,6 +4,11 @@ import dgram from 'node:dgram';
 import { Rcon } from './rcon.mjs';
 
 const POOL = 4; // соединений RCON на одного бота
+// Когда событие прочитано из журнала мода (performance.now()): по нему считается задержка выдачи ботам.
+// Символ, а не поле: в ответы ботам (JSON) не попадает.
+export const READ_AT = Symbol('readAt');
+const keep = (arr, v) => { arr.push(v); if (arr.length > 4000) arr.splice(0, 2000); };
+
 const EMPTY ='\u0001[]'; // так мод помечает пустые списки (table_to_json превращает пустую таблицу в {})
 
 function fixEmpty(v) {
@@ -26,6 +31,11 @@ export class Game {
     this.bellConf = bell === false ? null : { host: '127.0.0.1', port: 0, ...(bell || {}) };
     this.bell = { port: null, received: 0, pulls: 0, last: null }; // port — что сообщаем моду; счётчики — для metrics
     this.rung = false;            // звонок пришёл после начала текущего чтения журнала
+    // Замеры для metrics. lag — на сколько тиков игры позже создания событие прочитано, по причине чтения:
+    // udp — событие пришло само датаграммой (без чтения), bell — чтение по звонку, poll — по таймеру,
+    // direct — запрос бота сам дочитал журнал. rcon — время обмена с игрой, мс.
+    this.stats = { lag: { udp: [], bell: [], poll: [], direct: [] }, pulls: { udp: 0, bell: 0, poll: 0, direct: 0 }, found: { udp: 0, bell: 0, poll: 0, direct: 0 },
+      rcon: { agent: [], poll: [] } };
     this.conf = rcon;
     this.fastPollMs = fastPollMs; // опрос журнала, пока кто-то ждёт итога действия (примерно тик)
     this.urgent = 0;              // сколько запросов сейчас ждут итога действия
@@ -39,6 +49,7 @@ export class Game {
     this.seq = null;          // последний прочитанный номер; null — журнал ещё не читали
     this.first = 1;           // самый старый номер, который есть у мода
     this.waiters = new Set(); // ожидающие новых событий
+    this.epoch = 0;           // растёт, когда журнал мода начался заново (новая карта, откат сохранения)
     this.info = null;         // ответ ping
     this.ready = false;
     this.lastError = null;
@@ -71,8 +82,10 @@ export class Game {
     let raw;
     const c = this.free(connName);
     c.busy = (c.busy || 0) + 1;
+    const t0 = performance.now();
     try {
       raw = await c.command('/agent ' + JSON.stringify(req));
+      keep(this.stats.rcon[connName === 'poll' ? 'poll' : 'agent'], performance.now() - t0);
     } catch (e) {
       throw new GameError('game_unavailable', `сервер игры недоступен: ${e.message}`);
     } finally {
@@ -138,7 +151,7 @@ export class Game {
         try { sock.close(); } catch { /* уже закрыт */ }
         resolve();
       });
-      sock.on('message', (msg) => this.ring(Number(msg.toString('latin1', 0, 16))));
+      sock.on('message', (msg) => this.ring(msg));
       sock.bind(this.bellConf.port, this.bellConf.host, () => {
         this.sock = sock;
         sock.unref();
@@ -148,38 +161,74 @@ export class Game {
     });
   }
 
-  /** Звонок мода: в журнале есть запись с номером seq. Читаем сразу, только если её кто-то ждёт и её ещё нет. */
-  ring(seq) {
+  /**
+   * Датаграмма мода о новой записи журнала: само событие (JSON) или только его номер («звонок»).
+   * Событие, идущее сразу за последним известным, принимается как есть — без чтения журнала по RCON (оно стоит тик).
+   * Пропуск номера, большое событие или первое чтение — журнал дочитывается обычным порядком, если его кто-то ждёт.
+   */
+  ring(msg) {
     this.bell.received++;
     this.bell.last = Date.now();
+    const text = msg.toString('utf8');
+    let seq;
+    if (text[0] === '{') {
+      let ev = null;
+      try { ev = fixEmpty(JSON.parse(text)); } catch { /* обрезанная датаграмма — дочитаем журналом */ }
+      if (ev && typeof ev.seq === 'number') {
+        if (this.ready && this.seq !== null && ev.seq === this.seq + 1) {
+          this.stats.pulls.udp++;
+          this.ingest([ev], 'udp');
+          return;
+        }
+        seq = ev.seq;
+      }
+    } else {
+      seq = Number(text);
+    }
     if (!this.waiters.size || (this.seq !== null && seq <= this.seq)) return;
     this.rung = true;
     this.kick?.();
   }
 
+  /** Принять новые события (по возрастанию номеров): в буфер и ожидающим. Уже известные пропускаются. */
+  ingest(events, source) {
+    const at = performance.now();
+    const fresh = [];
+    for (const ev of events) {
+      if (this.seq !== null && ev.seq <= this.seq) continue; // уже пришло другим путём (датаграммой или чтением)
+      ev[READ_AT] = at;
+      // Опоздание в тиках считаем только на работающей связи: первое чтение поднимает старые записи журнала.
+      if (this.ready && typeof ev.tick === 'number') keep(this.stats.lag[source], source === 'udp' ? 0 : Math.max(0, (this.tick ?? ev.tick) - ev.tick));
+      this.events.push(ev);
+      this.seq = ev.seq;
+      fresh.push(ev);
+    }
+    if (!fresh.length) return;
+    this.stats.found[source]++;
+    if (this.events.length > this.bufferSize) this.events.splice(0, this.events.length - this.bufferSize);
+    this.notify(fresh);
+  }
+
   stop() { this.stopped = true; try { this.sock?.close(); } catch { /* уже закрыт */ } for (const c of this.conns.values()) c.close(); }
 
   /** Дочитать журнал мода до конца. Вызовы не накладываются: второй ждёт первого и читает дальше. */
-  pull() {
+  pull(source = 'direct') {
     const run = async () => {
       let more = true;
+      this.stats.pulls[source]++;
       while (more && !this.stopped) {
-        const r = await this.once({ op: 'journal', admin: true, params: { since: this.seq ?? 0, limit: 1000, bell: this.bell.port ?? undefined } }, 'poll');
-        if (this.seq !== null && r.seq < this.seq) { // карту откатили: журнал начался заново
-          this.log(`журнал мода откатился (${this.seq} → ${r.seq}), буфер сброшен`);
+        const asked = this.seq; // пока запрос в пути, события могут прийти датаграммами — сверяемся с тем, что спрашивали
+        const r = await this.once({ op: 'journal', admin: true, params: { since: asked ?? 0, limit: 1000, bell: this.bell.port ?? undefined } }, 'poll');
+        if (asked !== null && r.seq < asked) { // карту откатили: журнал начался заново
+          this.log(`журнал мода откатился (${asked} → ${r.seq}), буфер сброшен`);
+          this.epoch++; // потоки событий начинают отсчёт номеров заново
           this.events = [];
           this.seq = null;
           continue;
         }
         this.first = r.first;
-        if (r.events.length) {
-          for (const ev of r.events) this.events.push(ev);
-          this.seq = r.events[r.events.length - 1].seq;
-          if (this.events.length > this.bufferSize) this.events.splice(0, this.events.length - this.bufferSize);
-          this.notify(r.events);
-        } else if (this.seq === null) {
-          this.seq = r.seq;
-        }
+        if (r.events.length) this.ingest(r.events, source);
+        else if (this.seq === null) this.seq = r.seq;
         more = this.seq < r.seq;
       }
     };
@@ -194,8 +243,9 @@ export class Game {
           this.info = await this.once({ op: 'ping' }, 'poll');
           if (this.info.api !== 2) throw new GameError('incompatible', `несовместимая версия мода: api ${this.info.api}, нужен 2`);
         }
-        if (this.rung) { this.rung = false; this.bell.pulls++; }
-        await this.pull();
+        const byBell = this.rung;
+        if (byBell) { this.rung = false; this.bell.pulls++; }
+        await this.pull(byBell ? 'bell' : 'poll');
         if (!this.ready) { this.ready = true; this.lastError = null; this.log(`мод на связи: версия ${this.info.version}, событий в журнале ${this.events.length}, последний номер ${this.seq}`); }
       } catch (e) {
         if (this.ready || this.lastError !== e.message) this.log(`связь с игрой: ${e.message}`);
@@ -220,6 +270,13 @@ export class Game {
       const hit = batch.filter(w.match);
       if (hit.length) w.push(hit);
     }
+  }
+
+  /** Подписка на новые события (поток): push(события) на каждую порцию. Возвращает функцию отписки. */
+  subscribe(match, push) {
+    const w = { match, push };
+    this.waiters.add(w);
+    return () => this.waiters.delete(w);
   }
 
   /** События из буфера с номером больше since, подходящие под match. */

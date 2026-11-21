@@ -319,4 +319,74 @@ test('logout и login: персонаж исчезает из мира и воз
   ok(end.inventory['iron-plate'] + 2 * (end.inventory['iron-gear-wheel'] || 0) >= before.inventory['iron-plate'], 'пластины не пропали: ' + JSON.stringify(end.inventory));
 });
 
+// Поток событий: читаем text/event-stream до нужного числа событий (или до срока).
+function readStream(token, query, want, ms = 4000) {
+  return new Promise((resolve, reject) => {
+    const ctl = new AbortController();
+    const out = { status: 0, hello: null, events: [], pings: 0 };
+    const timer = setTimeout(() => { ctl.abort(); resolve(out); }, ms);
+    fetch(`${process.env.V2_API || 'http://127.0.0.1:8790'}/v2/stream${query}`, { headers: { authorization: `Bearer ${token}` }, signal: ctl.signal }).then(async (r) => {
+      out.status = r.status;
+      if (r.status !== 200) { clearTimeout(timer); resolve(out); return; }
+      const dec = new TextDecoder();
+      let buf = '';
+      for await (const chunk of r.body) {
+        buf += dec.decode(chunk, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i); buf = buf.slice(i + 2);
+          const type = /^event: (.*)$/m.exec(block)?.[1], data = /^data: (.*)$/m.exec(block)?.[1], id = /^id: (.*)$/m.exec(block)?.[1];
+          if (type === 'hello') out.hello = JSON.parse(data);
+          else if (data) out.events.push({ id: Number(id), type, ...JSON.parse(data) });
+          else out.pings++;
+          if (out.events.length >= want) { clearTimeout(timer); ctl.abort(); resolve(out); return; }
+        }
+      }
+    }).catch((e) => { if (e.name !== 'AbortError') reject(e); });
+  });
+}
+
+test('stream: события приходят в открытое соединение сразу; since отдаёт пропущенное; чужое и лишние виды не приходят', async () => {
+  ok((await readStream('no-such-token', '', 1, 500)).status === 401, 'без токена 401');
+  const s0 = (await call(A, 'events')).seq;
+  const live = readStream(A, '?types=action_done,chat', 3);
+  await sleep(150); // поток открыт
+  const t0 = performance.now();
+  const w = await call(A, 'wait', { ticks: 1, wait: false });
+  await call(B, 'say', { text: 'в поток' });
+  await call(B, 'wait', { ticks: 1 });             // чужое действие — не должно прийти
+  const w2 = await call(A, 'wait', { ticks: 1, wait: false });
+  const got = await live;
+  ok(got.hello && got.hello.agent === 'bench-1' && got.hello.since === s0, JSON.stringify(got.hello));
+  eq(got.events.length, 3);
+  const done = got.events.filter((e) => e.type === 'action_done'), chat = got.events.filter((e) => e.type === 'chat');
+  ok(done.length === 2 && done[0].action_id === w.action_id && done[1].action_id === w2.action_id && done.every((e) => e.id === e.seq && e.agent === 'bench-1'), JSON.stringify(done));
+  ok(chat.length === 1 && chat[0].text === 'в поток', JSON.stringify(chat));
+  ok(got.events.every((e, i) => i === 0 || e.seq > got.events[i - 1].seq), 'по порядку номеров');
+  ok(performance.now() - t0 < 1500, 'события пришли без задержек');
+  // Переподключение с since: всё пропущенное из буфера, сразу.
+  const again = await readStream(A, `?since=${s0}&types=action_done`, 2, 1500);
+  ok(again.events.length === 2 && again.events[0].action_id === w.action_id && again.events[1].action_id === w2.action_id, JSON.stringify(again.events));
+  ok((await call(A, 'stream')).error?.code === 'bad_request', 'POST stream — подсказка');
+  const m = (await call('t-admin', 'metrics')).latency;
+  ok(m.streams.opened >= 2 && m.delivery_ms.stream.n >= 5 && m.streams.open === 0, JSON.stringify(m.streams));
+});
+
+test('события приходят серверу датаграммой UDP — без чтения журнала (игра с --enable-lua-udp)', async () => {
+  const m0 = (await call('t-admin', 'metrics')).latency.reads;
+  await call(A, 'wait', { ticks: 2 });
+  await call(A, 'say', { text: 'по udp' });
+  await sleep(200);
+  const m1 = (await call('t-admin', 'metrics')).latency;
+  ok(m1.reads.udp[0] - m0.udp[0] >= 2, 'события пришли датаграммами: ' + JSON.stringify([m0, m1.reads]));
+  ok(m1.lag_ticks.udp.n > 0 && m1.lag_ticks.udp.max === 0, JSON.stringify(m1.lag_ticks));
+  // Большое событие уходит одним номером и дочитывается журналом — целиком.
+  const big = 'x'.repeat(9000); // событие длиннее 8000 байт
+  const s0 = (await call(B, 'events')).seq;
+  const waiting = call(B, 'events', { since: s0, wait_s: 5, types: ['chat'] });
+  ok((await call('t-admin', 'announce', { text: big })).sent, 'announce');
+  const ev = (await waiting).events[0];
+  ok(ev && ev.text === big, 'длинное событие дошло целиком: ' + (ev ? ev.text.length : 'нет'));
+});
+
 run(async () => { admin.close(); });

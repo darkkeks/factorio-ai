@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { Game, GameError } from './game.mjs';
+import { Game, GameError, READ_AT } from './game.mjs';
 import { API, helpDocument } from './api.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +51,16 @@ function record(entry, full) {
   fs.appendFile(path.join(LOG_DIR, `calls-${day}.log`), JSON.stringify(entry) + '\n', () => {});
   fs.appendFile(path.join(LOG_DIR, `full-${day}.jsonl`), JSON.stringify({ ...entry, ...full }) + '\n', () => {});
 }
+// Выдача событий ботам: сколько миллисекунд событие ждало между чтением из журнала мода и отправкой боту —
+// по долгому опросу (events) и по потоку (stream). У опроса сюда входит и пауза, пока бот открывал новый запрос.
+const delivery = { poll: [], stream: [] };
+const streams = { open: new Map(), opened: 0, sent: 0 }; // открытые потоки: ответ → {agent, since}
+function delivered(kind, events) {
+  const now = performance.now(), arr = delivery[kind];
+  for (const ev of events) if (ev[READ_AT] != null) arr.push(now - ev[READ_AT]);
+  if (arr.length > 4000) arr.splice(0, 2000);
+}
+const summary = (arr, digits = 1) => arr.length ? { n: arr.length, p50: +pct(arr, 0.5).toFixed(digits), p95: +pct(arr, 0.95).toFixed(digits), max: +Math.max(...arr).toFixed(digits) } : { n: 0 };
 const pct = (arr, p) => { if (!arr.length) return null; const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))]; };
 
 // ── Токены: файл { "токен": "имя персонажа" | {"admin": true} }, перечитывается при изменении ──
@@ -75,6 +85,10 @@ const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, fastPollMs:
 
 // ── Ожидание завершения действий ──
 const mine = (agent) => (ev) => ev.agent === agent || ev.agent == null;
+
+/** Какие события видит бот: свои и общие, нужных видов. Своё не приходит: собственные реплики в чате и сводки
+ *  о собственной стройке и сносе («кем-то другим»). */
+const eventMatch = (me, types) => (ev) => (me ? mine(me)(ev) : true) && (!types || types.has(ev.type)) && !(ev.type === 'chat' && ev.from === me) && !(ev.by === me && ev.agent == null);
 
 /** Итоги действий с номерами ids: из ответа мода (finished) и из журнала (action_done). */
 async function settle(agent, ids, finished, since, waitS) {
@@ -195,10 +209,10 @@ const special = {
     if (body.since == null || waitS === 0) await game.pull();
     if (body.since == null && waitS === 0) return { events: [], seq: game.seq ?? 0, first: game.first };
     const since = body.since == null ? (game.seq ?? 0) : Number(body.since);
-    // Своё не приходит: собственные реплики в чате и сводки о собственной стройке и сносе («кем-то другим»).
-    const match = (ev) => (me ? mine(me)(ev) : true) && (!types || types.has(ev.type)) && !(ev.type === 'chat' && ev.from === me) && !(ev.by === me && ev.agent == null);
+    const match = eventMatch(me, types);
     const got = await game.wait({ since, match, done: (l) => l.length > 0, timeoutMs: waitS * 1000 });
     const events = got.slice(0, limit);
+    delivered('poll', events);
     // seq — номер, с которого спрашивать дальше: если отдали не всё, это номер последнего отданного события.
     const seq = events.length < got.length ? events[events.length - 1].seq : Math.max(game.seq ?? 0, since);
     return { events, seq, first: game.first, more: events.length < got.length || undefined, missed: since < game.first - 1 ? true : undefined };
@@ -274,9 +288,79 @@ const special = {
     if (!who.admin) throw new GameError('forbidden', 'только администратору');
     const ops = {};
     for (const [k, c] of Object.entries(counters.ops)) ops[k] = { n: c.n, fail: c.fail, p50: pct(c.ms, 0.5), p95: pct(c.ms, 0.95), max: Math.max(...c.ms) };
-    return { uptime_s: Math.round((Date.now() - counters.started) / 1000), ops, errors: counters.errors, journal: { seq: game.seq, first: game.first, buffered: game.events.length }, bell: { port: game.bell.port, received: game.bell.received, pulls: game.bell.pulls, last_ms_ago: game.bell.last ? Date.now() - game.bell.last : null }, mod: game.info };
+    return { uptime_s: Math.round((Date.now() - counters.started) / 1000), ops, errors: counters.errors, journal: { seq: game.seq, first: game.first, buffered: game.events.length }, // Задержки. lag_ticks — на сколько тиков игры позже создания событие прочитано сервером, по причине чтения
+      // (udp — событие пришло само датаграммой, bell — чтение по звонку, poll — таймер, direct — запрос бота сам дочитал журнал); reads — сколько раз и сколько из них
+      // что-то нашли. delivery_ms — от чтения до отправки боту. rcon_ms — обмен с игрой (agent — запросы ботов, poll — журнал).
+      latency: {
+        lag_ticks: { udp: summary(game.stats.lag.udp, 0), bell: summary(game.stats.lag.bell, 0), poll: summary(game.stats.lag.poll, 0), direct: summary(game.stats.lag.direct, 0) },
+        reads: { udp: [game.stats.pulls.udp, game.stats.found.udp], bell: [game.stats.pulls.bell, game.stats.found.bell], poll: [game.stats.pulls.poll, game.stats.found.poll], direct: [game.stats.pulls.direct, game.stats.found.direct] },
+        delivery_ms: { poll: summary(delivery.poll), stream: summary(delivery.stream) },
+        rcon_ms: { agent: summary(game.stats.rcon.agent, 2), poll: summary(game.stats.rcon.poll, 2) },
+        streams: { open: streams.open.size, opened: streams.opened, events_sent: streams.sent, agents: [...new Set([...streams.open.values()].map((x) => x.agent))] },
+      },
+      bell: { port: game.bell.port, received: game.bell.received, pulls: game.bell.pulls, last_ms_ago: game.bell.last ? Date.now() - game.bell.last : null }, mod: game.info };
   },
 };
+
+// ── Поток событий: GET /v2/stream (text/event-stream) ──
+// Одно долгое соединение вместо опроса events: событие уходит боту сразу, как прочитано из журнала мода, и боту
+// не нужно переоткрывать запрос после каждого. Работает и снаружи (HTTPS, тот же токен). Обрыв — бот подключается
+// снова с since (или заголовком Last-Event-ID) и получает пропущенное из буфера.
+const STREAMS_PER_AGENT = 4, HEARTBEAT_MS = 15000;
+async function openStream(req, res, who, url) {
+  const me = who.agent;
+  if (!me) throw new GameError('forbidden', 'токен не привязан к персонажу');
+  const q = url.searchParams;
+  const types = q.get('types') ? new Set(q.get('types').split(',').map((t) => t.trim()).filter(Boolean)) : null;
+  const raw = q.get('since') ?? req.headers['last-event-id'];
+  let since = raw == null || raw === '' ? null : Number(raw);
+  if (since !== null && (!Number.isFinite(since) || since < 0)) throw new GameError('bad_request', 'since — номер события, с которого продолжать');
+  await game.pull().catch(() => {}); // «с этого момента» — точно с этого; игра недоступна — поток всё равно откроется и дождётся
+  if (since === null) since = game.seq ?? 0;
+  const own = [...streams.open.entries()].filter(([, x]) => x.agent === me);
+  if (own.length >= STREAMS_PER_AGENT) own[0][0].end(); // лишний поток закрывается: самый старый
+  res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no', connection: 'keep-alive' });
+  res.socket?.setNoDelay(true);
+  const match = eventMatch(me, types);
+  let last = since, epoch = game.epoch, sent = 0;
+  const write = (events) => {
+    if (game.epoch !== epoch) { // журнал начался заново (новая карта): номера событий пошли с начала
+      epoch = game.epoch; last = 0;
+      res.write(`event: reset\ndata: ${JSON.stringify({ seq: game.seq ?? 0 })}\n\n`);
+    }
+    let chunk = '';
+    const out = [];
+    for (const ev of events) {
+      if (ev.seq <= last) continue;
+      last = ev.seq;
+      out.push(ev);
+      chunk += `id: ${ev.seq}\nevent: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`;
+    }
+    if (!chunk) return;
+    res.write(chunk);
+    delivered('stream', out);
+    sent += out.length; streams.sent += out.length;
+  };
+  res.write(`event: hello\ndata: ${JSON.stringify({ agent: me, since, seq: game.seq ?? 0, first: game.first, missed: since < game.first - 1 ? true : undefined, heartbeat_s: HEARTBEAT_MS / 1000 })}\n\n`);
+  // Подписка и выдача накопленного — без пауз между ними: ничего не теряется и не дублируется (last).
+  const unsubscribe = game.subscribe(match, write);
+  write(game.since(since, match));
+  touch(me);
+  const beat = setInterval(() => { res.write(': ping\n\n'); touch(me); }, HEARTBEAT_MS); // открытый поток — бот на связи
+  const info = { agent: me, since, at: Date.now() };
+  streams.open.set(res, info);
+  streams.opened++;
+  log(`${me}: открыт поток событий (с ${since}${types ? ', виды: ' + [...types].join(',') : ''}), всего потоков ${streams.open.size}`);
+  const close = () => {
+    if (!streams.open.delete(res)) return;
+    clearInterval(beat);
+    unsubscribe();
+    log(`${me}: поток событий закрыт (${Math.round((Date.now() - info.at) / 1000)} с, событий ${sent})`);
+  };
+  req.on('close', close);
+  res.on('close', close);
+  res.on('error', close);
+}
 
 async function dispatch(who, op, body) {
   const spec = API[op];
@@ -335,6 +419,12 @@ const server = http.createServer(async (req, res) => {
     }
     who = auth(req);
     if (!who) throw new GameError('unauthorized', 'нужен заголовок Authorization: Bearer <токен>');
+    if (op === 'stream') {
+      if (req.method !== 'GET') throw new GameError('bad_request', 'stream — запрос GET: поток событий (text/event-stream); описание — в help');
+      if (!game.ready && !(await game.whenReady(req.headers['x-forwarded-for'] ? 40000 : undefined))) throw new GameError('game_unavailable', `игра недоступна: ${game.lastError || 'нет связи'}`);
+      await openStream(req, res, who, url);
+      return;
+    }
     if (req.method === 'POST') body = await readBody(req);
     else if (req.method === 'GET') for (const [k, v] of url.searchParams) { try { body[k] = JSON.parse(v); } catch { body[k] = v; } }
     else throw new GameError('bad_request', 'метод: POST (или GET для запросов без тела)');

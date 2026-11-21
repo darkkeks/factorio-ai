@@ -34,20 +34,22 @@ function J.add(kind, agent, data)
     j.items[j.first] = nil
     j.first = j.first + 1
   end
-  -- «Звонок» серверу ботов: первая запись тика шлёт датаграмму с номером, сервер по ней читает журнал сразу,
-  -- не дожидаясь опроса. Шлёт только сервер игры (for_player = 0) и только если он запущен с --enable-lua-udp;
-  -- иначе вызов ничего не делает и всё работает на опросе.
+  -- Серверу ботов — датаграммой UDP, сразу: само событие (JSON), чтобы ему не читать журнал по RCON — такое чтение
+  -- стоит лишний тик. Большое событие уходит одним номером («звонок»), сервер дочитает его сам. Шлёт только сервер игры
+  -- (for_player = 0) и только если он запущен с --enable-lua-udp; иначе вызов ничего не делает и всё работает на опросе.
   local b = storage.agent.bell
-  if b and (b.at ~= ev.tick or game.tick_paused) and ev.tick - b.seen <= J.BELL_TTL then
-    b.at = ev.tick
+  if b and ev.tick - b.seen <= J.BELL_TTL then
+    local data = helpers.table_to_json(ev)
+    if #data > J.BELL_MAX then data = tostring(j.seq) end
     -- Итог отправки в storage не пишется: у сервера и клиентов он разный. Отказ не должен ронять запись журнала.
-    local ok, err = pcall(helpers.send_udp, b.port, tostring(j.seq), 0)
-    if not ok and not bell_failed then bell_failed = true log('agent: звонок UDP не отправлен: ' .. tostring(err)) end
+    local ok, err = pcall(helpers.send_udp, b.port, data, 0)
+    if not ok and not bell_failed then bell_failed = true log('agent: событие по UDP не отправлено: ' .. tostring(err)) end
   end
   return ev
 end
 
 J.BELL_TTL = 3600 -- тиков без опроса журнала, после которых звонить некому
+J.BELL_MAX = 8000 -- байт: событие длиннее уходит одним номером
 
 --- Порт звонка сообщает сервер ботов при каждом чтении журнала; перестал читать — звонок сам смолкает (BELL_TTL).
 function J.bell(port)
