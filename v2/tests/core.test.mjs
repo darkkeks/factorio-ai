@@ -2,6 +2,7 @@
 // Каркас, очередь, ходьба, события, повтор запросов, перезапуск сервера на хосте.
 import { spawn, execSync } from 'node:child_process';
 import path from 'node:path';
+import { createSocket } from 'node:dgram';
 import { fileURLToPath } from 'node:url';
 import { call, lua, admin, sleep } from './lib.mjs';
 import { test, ok, eq, run } from './harness.mjs';
@@ -148,6 +149,26 @@ test('события: свои действия и чат приходят ож�
   ok(!mine.events.some((e) => e.type === 'chat' && e.from === 'bench-1'), 'свой чат себе не приходит');
   const other = await call(B, 'events', { since: s0 });
   ok(!other.events.some((e) => e.type === 'action_done'), 'чужие action_done не приходят');
+});
+
+test('звонок UDP: мод знает порт сервера ботов, датаграмма будит чтение журнала, без ключа игры всё работает на опросе', async () => {
+  const m0 = (await call('t-admin', 'metrics')).bell;
+  ok(m0 && m0.port >= 1024, JSON.stringify(m0));
+  await sleep(300);
+  eq(await lua(`return storage.agent.bell and storage.agent.bell.port`), m0.port, 'порт звонка в моде');
+  // Запись журнала при известном порте не роняет мод (ключ --enable-lua-udp на стенде может быть не задан).
+  ok((await call(A, 'say', { text: 'звонок' })).ok);
+  // Приёмник сервера: датаграмма с номером впереди журнала при ожидающем запросе — чтение без паузы.
+  const s0 = (await call(B, 'events')).seq;
+  const waiting = call(B, 'events', { since: s0, wait_s: 2, types: ['no-such-type'] });
+  await sleep(200);
+  const sock = createSocket('udp4');
+  await new Promise((r) => sock.send(String(s0 + 1000000), m0.port, '127.0.0.1', r));
+  await new Promise((r) => sock.send('мусор', m0.port, '127.0.0.1', r));
+  sock.close();
+  await waiting;
+  const m1 = (await call('t-admin', 'metrics')).bell;
+  ok(m1.received >= m0.received + 2 && m1.pulls >= m0.pulls + 1, JSON.stringify([m0, m1]));
 });
 
 test('два персонажа идут одновременно и опрашивают мир без взаимных задержек', async () => {

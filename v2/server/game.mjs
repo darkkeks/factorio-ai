@@ -1,5 +1,6 @@
 // Связь с модом в игре: запросы /agent по RCON и буфер журнала событий.
 // У каждого персонажа своё соединение RCON, у опроса журнала — своё: запросы ботов не стоят в общей очереди.
+import dgram from 'node:dgram';
 import { Rcon } from './rcon.mjs';
 
 const POOL = 4; // соединений RCON на одного бота
@@ -17,7 +18,14 @@ export class GameError extends Error {
 }
 
 export class Game {
-  constructor({ rcon, pollMs = 100, fastPollMs = 5, bufferSize = 20000, holdMs = 90000, log = () => {} }) {
+  constructor({ rcon, pollMs = 100, fastPollMs = 5, bufferSize = 20000, holdMs = 90000, bell, log = () => {} }) {
+    // «Звонок»: мод шлёт датаграмму UDP при новой записи журнала (игра с ключом --enable-lua-udp), и журнал
+    // читается сразу, без ожидания опроса. Опрос остаётся страховкой: без ключа или при потере датаграммы всё
+    // работает как прежде. bell: false — выключить; {host, port} — где слушать (по умолчанию 127.0.0.1, любой
+    // свободный порт); announce — какой порт назвать моду, если датаграммы до приёмника пересылаются.
+    this.bellConf = bell === false ? null : { host: '127.0.0.1', port: 0, ...(bell || {}) };
+    this.bell = { port: null, received: 0, pulls: 0, last: null }; // port — что сообщаем моду; счётчики — для metrics
+    this.rung = false;            // звонок пришёл после начала текущего чтения журнала
     this.conf = rcon;
     this.fastPollMs = fastPollMs; // опрос журнала, пока кто-то ждёт итога действия (примерно тик)
     this.urgent = 0;              // сколько запросов сейчас ждут итога действия
@@ -112,20 +120,51 @@ export class Game {
 
   // ── Журнал событий ──
   async start() {
+    await this.listen();
     this.loop();
     // Ждём первого удачного чтения, но не вечно: сервер игры может быть ещё не запущен.
     for (let i = 0; i < 50 && !this.ready; i++) await new Promise((r) => setTimeout(r, 100));
     return this.ready;
   }
 
-  stop() { this.stopped = true; for (const c of this.conns.values()) c.close(); }
+  /** Открыть приёмник звонков. Не открылся — работаем на одном опросе. */
+  listen() {
+    if (!this.bellConf) return Promise.resolve();
+    return new Promise((resolve) => {
+      const sock = dgram.createSocket('udp4');
+      sock.on('error', (e) => {
+        this.log(`звонок UDP: ${e.message}; остаётся опрос`);
+        this.bell.port = null;
+        try { sock.close(); } catch { /* уже закрыт */ }
+        resolve();
+      });
+      sock.on('message', (msg) => this.ring(Number(msg.toString('latin1', 0, 16))));
+      sock.bind(this.bellConf.port, this.bellConf.host, () => {
+        this.sock = sock;
+        sock.unref();
+        this.bell.port = this.bellConf.announce || sock.address().port;
+        resolve();
+      });
+    });
+  }
+
+  /** Звонок мода: в журнале есть запись с номером seq. Читаем сразу, только если её кто-то ждёт и её ещё нет. */
+  ring(seq) {
+    this.bell.received++;
+    this.bell.last = Date.now();
+    if (!this.waiters.size || (this.seq !== null && seq <= this.seq)) return;
+    this.rung = true;
+    this.kick?.();
+  }
+
+  stop() { this.stopped = true; try { this.sock?.close(); } catch { /* уже закрыт */ } for (const c of this.conns.values()) c.close(); }
 
   /** Дочитать журнал мода до конца. Вызовы не накладываются: второй ждёт первого и читает дальше. */
   pull() {
     const run = async () => {
       let more = true;
       while (more && !this.stopped) {
-        const r = await this.once({ op: 'journal', admin: true, params: { since: this.seq ?? 0, limit: 1000 } }, 'poll');
+        const r = await this.once({ op: 'journal', admin: true, params: { since: this.seq ?? 0, limit: 1000, bell: this.bell.port ?? undefined } }, 'poll');
         if (this.seq !== null && r.seq < this.seq) { // карту откатили: журнал начался заново
           this.log(`журнал мода откатился (${this.seq} → ${r.seq}), буфер сброшен`);
           this.events = [];
@@ -155,6 +194,7 @@ export class Game {
           this.info = await this.once({ op: 'ping' }, 'poll');
           if (this.info.api !== 2) throw new GameError('incompatible', `несовместимая версия мода: api ${this.info.api}, нужен 2`);
         }
+        if (this.rung) { this.rung = false; this.bell.pulls++; }
         await this.pull();
         if (!this.ready) { this.ready = true; this.lastError = null; this.log(`мод на связи: версия ${this.info.version}, событий в журнале ${this.events.length}, последний номер ${this.seq}`); }
       } catch (e) {
@@ -166,7 +206,8 @@ export class Game {
       }
       // Пока кто-то ждёт итога действия, журнал читается раз в тик: иначе короткое действие (и отмена чужого
       // при replace) отвечало бы с задержкой до pollMs. Новый ожидающий будит опрос сразу (kick).
-      await new Promise((r) => {
+      // Звонок во время чтения: запись могла появиться уже после него — читаем ещё раз без паузы.
+      if (!this.rung) await new Promise((r) => {
         const t = setTimeout(r, this.urgent > 0 ? Math.min(this.fastPollMs, this.pollMs) : this.pollMs);
         this.kick = () => { clearTimeout(t); r(); };
       });

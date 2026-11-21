@@ -71,7 +71,7 @@ function auth(req) {
 if (conf.feedbackDir) process.env.FEEDBACK_DIR = resolve(conf.feedbackDir);
 const FB = await import('../../src/feedback.mjs');
 
-const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, fastPollMs: conf.fastPollMs ?? 5, holdMs: conf.holdMs ?? 90000, log });
+const game = new Game({ rcon: conf.rcon, pollMs: conf.pollMs ?? 100, fastPollMs: conf.fastPollMs ?? 5, holdMs: conf.holdMs ?? 90000, bell: conf.bell, log });
 
 // ── Ожидание завершения действий ──
 const mine = (agent) => (ev) => ev.agent === agent || ev.agent == null;
@@ -274,7 +274,7 @@ const special = {
     if (!who.admin) throw new GameError('forbidden', 'только администратору');
     const ops = {};
     for (const [k, c] of Object.entries(counters.ops)) ops[k] = { n: c.n, fail: c.fail, p50: pct(c.ms, 0.5), p95: pct(c.ms, 0.95), max: Math.max(...c.ms) };
-    return { uptime_s: Math.round((Date.now() - counters.started) / 1000), ops, errors: counters.errors, journal: { seq: game.seq, first: game.first, buffered: game.events.length }, mod: game.info };
+    return { uptime_s: Math.round((Date.now() - counters.started) / 1000), ops, errors: counters.errors, journal: { seq: game.seq, first: game.first, buffered: game.events.length }, bell: { port: game.bell.port, received: game.bell.received, pulls: game.bell.pulls, last_ms_ago: game.bell.last ? Date.now() - game.bell.last : null }, mod: game.info };
   },
 };
 

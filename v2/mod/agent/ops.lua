@@ -27,6 +27,7 @@ end})
 O.register('legacy_report', {admin = true, fn = function() return storage.agent.legacy_report or {} end})
 
 O.register('journal', {admin = true, fn = function(_, p)
+  J.bell(p.bell)
   local items, seq, first = J.read(p.since or 0, math.min(p.limit or 500, 2000))
   return {events = U.list(items), seq = seq, first = first}
 end})

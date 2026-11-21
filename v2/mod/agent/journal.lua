@@ -22,6 +22,8 @@ function J.chat(from, text, bot)
   J.add('chat', nil, {from = from, text = text, bot = bot or nil})
 end
 
+local bell_failed = false -- только чтобы не повторять строку в журнале сервера; на игру не влияет
+
 function J.add(kind, agent, data)
   local j = storage.agent.journal
   local ev = data or {}
@@ -32,7 +34,28 @@ function J.add(kind, agent, data)
     j.items[j.first] = nil
     j.first = j.first + 1
   end
+  -- «Звонок» серверу ботов: первая запись тика шлёт датаграмму с номером, сервер по ней читает журнал сразу,
+  -- не дожидаясь опроса. Шлёт только сервер игры (for_player = 0) и только если он запущен с --enable-lua-udp;
+  -- иначе вызов ничего не делает и всё работает на опросе.
+  local b = storage.agent.bell
+  if b and (b.at ~= ev.tick or game.tick_paused) and ev.tick - b.seen <= J.BELL_TTL then
+    b.at = ev.tick
+    -- Итог отправки в storage не пишется: у сервера и клиентов он разный. Отказ не должен ронять запись журнала.
+    local ok, err = pcall(helpers.send_udp, b.port, tostring(j.seq), 0)
+    if not ok and not bell_failed then bell_failed = true log('agent: звонок UDP не отправлен: ' .. tostring(err)) end
+  end
   return ev
+end
+
+J.BELL_TTL = 3600 -- тиков без опроса журнала, после которых звонить некому
+
+--- Порт звонка сообщает сервер ботов при каждом чтении журнала; перестал читать — звонок сам смолкает (BELL_TTL).
+function J.bell(port)
+  local st = storage.agent
+  if type(port) ~= 'number' or port % 1 ~= 0 or port < 1024 or port > 65535 then return end
+  local b = st.bell
+  if b and b.port == port then b.seen = game.tick
+  else st.bell = {port = port, seen = game.tick, at = -1} end
 end
 
 --- Не чаще раза в `ticks` на ключ: true, если событие пора писать.

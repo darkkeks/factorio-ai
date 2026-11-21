@@ -631,7 +631,7 @@ export const API = {
     result: '{shown}', example: { player: 'darkkeks', what: 'camera', agent: 'darkkeks-бот' },
   },
   legacy_report: { kind: 'control', admin: true, summary: 'Что перенесено со старой системы при первом запуске мода на карте.', params: {}, result: '{plans, ghosts, done, marks, blueprints}', example: {} },
-  metrics: { kind: 'control', admin: true, summary: 'Счётчики вызовов и времени ответа по операциям.', params: {}, result: '{ops, errors, journal}', example: {} },
+  metrics: { kind: 'control', admin: true, summary: 'Счётчики вызовов и времени ответа по операциям.', params: {}, result: '{ops, errors, journal, bell: {port, received, pulls, last_ms_ago} — «звонки» мода по UDP (received 0 — игра запущена без --enable-lua-udp или датаграммы не доходят: работает опрос)}', example: {} },
   pause_if_idle: {
     kind: 'control', admin: true,
     summary: 'Правило паузы одним шагом: пауза, если в игре нет людей и ни один подключённый бот ничего не делает; иначе игра идёт.',
