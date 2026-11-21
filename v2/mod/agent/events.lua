@@ -54,11 +54,28 @@ local function who(cause)
   return cause.name
 end
 
-local HEALTH_MARKS = {25, 50, 75} -- от нижнего: одно попадание через несколько порогов даёт одно событие
+-- Турель команды попала по врагу — как тревога игрока «турель ведёт огонь»: не чаще раза в 10 секунд на квадрат 32 × 32.
+local TURRETS = {['ammo-turret'] = true, ['electric-turret'] = true, ['fluid-turret'] = true, ['artillery-turret'] = true}
+local ENGAGED_EVERY = 600
+
+local function turret_engaged(ev, e)
+  local c = ev.cause
+  if not (c and c.valid) or not TURRETS[c.type] or c.force.name ~= 'player' then return end
+  local pos = c.position
+  if not J.due('tf' .. math.floor(pos.x / 32) .. ',' .. math.floor(pos.y / 32), ENGAGED_EVERY) then return end
+  J.add('turret_engaged', nil, {name = c.name, unit = c.unit_number, position = U.pos(pos),
+    target = {name = e.name, x = U.r2(e.position.x), y = U.r2(e.position.y)}})
+end
+
+local HEALTH_MARKS ={25, 50, 75} -- от нижнего: одно попадание через несколько порогов даёт одно событие
 
 E.handlers[defines.events.on_entity_damaged] = function(ev)
   local e = ev.entity
-  if not e.valid or e.force.name ~= 'player' then return end
+  if not e.valid then return end
+  if e.force.name ~= 'player' then
+    if e.force.name == 'enemy' then turret_engaged(ev, e) end
+    return
+  end
   local unit = e.unit_number
   if not unit then return end
   local st = storage.agent
@@ -183,13 +200,40 @@ E.handlers[defines.events.on_robot_built_entity] = function(ev) tally('entities_
 E.handlers[defines.events.on_robot_mined_entity] = function(ev) tally('entities_removed', 'robots', ev.entity) end
 
 -- Угрозы: отряд врагов собрался в атаку; враги построили новую базу на открытой карте.
-E.handlers[defines.events.on_unit_group_finished_gathering] = function(ev)
+-- Отряды собираются у гнёзд, обычно вне обзора, поэтому событие сбора само в журнал не идёт: отряд запоминается,
+-- а событие attack_group пишется, когда он, уже выступив, оказался в видимой зоне (игрок видит его на карте),
+-- и повторяется раз в 10 секунд, пока он виден. Цель отряда игроку не видна — отдаём только наблюдаемое движение.
+local GROUP_EVERY = 600
+local GROUP_STATE = {}
+for k, v in pairs(defines.group_state) do GROUP_STATE[v] = k end
+
+local function track_group(ev)
   local g = ev.group
-  if not (g and g.valid) or g.force.name ~= 'enemy' then return end
+  if not (g and g.valid) or not g.is_unit_group or g.force.name ~= 'enemy' then return end
+  local groups = storage.agent.groups
+  if not groups[g.unique_id] then groups[g.unique_id] = {g = g} end
+end
+E.handlers[defines.events.on_unit_group_created] = track_group
+E.handlers[defines.events.on_unit_group_finished_gathering] = track_group
+
+local function scan_groups()
+  local groups = storage.agent.groups
   local force = game.forces.player
-  local pos = g.position
-  if not force.is_chunk_charted(g.surface, {math.floor(pos.x / 32), math.floor(pos.y / 32)}) then return end
-  if J.due('group', 600) then J.add('attack_group', nil, {size = #g.members, position = U.pos(pos)}) end
+  local now = game.tick
+  for id, rec in pairs(groups) do
+    local g = rec.g
+    if not g.valid then
+      groups[id] = nil
+    elseif g.state ~= defines.group_state.gathering and (not rec.at or now - rec.at >= GROUP_EVERY) then
+      local pos = g.position
+      local size = #g.members
+      if size > 0 and force.is_chunk_visible(g.surface, {math.floor(pos.x / 32), math.floor(pos.y / 32)}) then
+        local prev = rec.at and {x = rec.x, y = rec.y, ticks_ago = now - rec.at} or nil
+        rec.at, rec.x, rec.y = now, U.r2(pos.x), U.r2(pos.y)
+        J.add('attack_group', nil, {group = id, size = size, position = U.pos(pos), state = GROUP_STATE[g.state], prev = prev})
+      end
+    end
+  end
 end
 E.handlers[defines.events.on_biter_base_built] = function(ev)
   local e = ev.entity
@@ -332,8 +376,9 @@ E.handlers[defines.events.on_tick] = function(ev)
   end
   if ev.tick % 30 == 3 then Gui.tick(ev.tick - 3) end
   if ev.tick % 30 == 7 then scan_threats() end
+  if ev.tick % 30 == 22 then scan_groups() end
   if ev.tick % 300 == 13 then scan_turrets() end
-  if ev.tick % 3600 == 0 then J.prune_throttle(DAMAGE_EVERY) end
+  if ev.tick % 3600 == 0 then J.prune_throttle(3600) end
 end
 
 return E

@@ -1042,4 +1042,60 @@ test('события боя: enemies_near при появлении и при р
   await calm();
 });
 
+test('события нападения: turret_engaged при огне турели; attack_group — когда выступивший отряд виден, с номером и prev', async () => {
+  await reset({}, 20.5, 15.5);
+  await calm();
+  const evs = async (since, type) => (await call(A, 'events', { since, types: [type] })).events;
+  let s0 = (await call(A, 'events')).seq;
+  // Турель с патронами и враг в её дальности: событие с турелью и целью, повтор — не чаще раза в 10 секунд на квадрат.
+  const t = await world(`local s = game.surfaces.nauvis
+    local t = s.create_entity{name = 'gun-turret', position = {A.ox + 40, A.oy + 10}, force = 'player'}
+    t.insert{name = 'firearm-magazine', count = 20}
+    for i = 1, 3 do local b = s.create_entity{name = 'small-biter', position = {A.ox + 46.5 + i, A.oy + 10.5}, force = 'enemy'} b.disabled_by_script = true end
+    return {unit = t.unit_number}`);
+  const te = await until(async () => (await evs(s0, 'turret_engaged')).find((e) => e.unit === t.unit), 5000);
+  ok(te && te.name === 'gun-turret' && te.target.name === 'small-biter' && te.position.x === O.x + 40, JSON.stringify(te));
+  await sleep(1500);
+  eq((await evs(s0, 'turret_engaged')).filter((e) => e.unit === t.unit).length, 1, 'огонь продолжается — событие одно');
+  await calm();
+  // Отряд вне видимой зоны: события нет, пока его не видно.
+  s0 = (await call(A, 'events')).seq;
+  const far = await world(`local s, f = game.surfaces.nauvis, game.forces.player
+    for d = 400, 3000, 100 do
+      for _, p in pairs{{A.ox + d, A.oy}, {A.ox - d, A.oy}, {A.ox, A.oy + d}, {A.ox, A.oy - d}} do
+        local c = {math.floor(p[1] / 32), math.floor(p[2] / 32)}
+        if s.is_chunk_generated(c) and not f.is_chunk_visible(s, c) then
+          local pos = s.find_non_colliding_position('small-biter', p, 10, 1)
+          if pos then
+            local g = s.create_unit_group{position = pos, force = 'enemy'}
+            for i = 1, 3 do local b = s.create_entity{name = 'small-biter', position = pos, force = 'enemy'} if b then g.add_member(b) end end
+            g.set_command{type = defines.command.wander}
+            g.start_moving()
+            storage.test_group = g
+            return {id = g.unique_id}
+          end
+        end
+      end
+    end
+    return {id = false}`);
+  if (far.id) {
+    await sleep(2000);
+    ok(!(await evs(s0, 'attack_group')).some((e) => e.group === far.id), 'невидимый отряд в события не попадает');
+    await world(`local g = storage.test_group if g and g.valid then for _, m in pairs(g.members) do m.destroy() end end storage.test_group = nil return true`);
+  }
+  // Отряд в видимой зоне: событие, когда он выступил; пока виден — повтор раз в 10 секунд с prev.
+  const near = await world(`local s = game.surfaces.nauvis
+    local g = s.create_unit_group{position = {A.ox + 45.5, A.oy + 20.5}, force = 'enemy'}
+    for i = 1, 4 do g.add_member(s.create_entity{name = 'small-biter', position = {A.ox + 44.5 + i, A.oy + 20.5}, force = 'enemy'}) end
+    g.set_command{type = defines.command.go_to_location, destination = {A.ox + 30.5, A.oy + 25.5}, radius = 2}
+    g.start_moving()
+    return {id = g.unique_id}`);
+  const mine = async () => (await evs(s0, 'attack_group')).filter((e) => e.group === near.id);
+  const ag = await until(async () => (await mine())[0], 5000);
+  ok(ag && ag.size === 4 && ag.state !== 'gathering' && ag.prev === undefined && Math.abs(ag.position.x - (O.x + 45.5)) < 12, JSON.stringify(ag));
+  await sleep(1500);
+  eq((await mine()).length, 1, 'сразу не повторяется');
+  await calm();
+});
+
 run(async () => { admin.close(); });

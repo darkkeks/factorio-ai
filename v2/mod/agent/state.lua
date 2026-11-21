@@ -11,7 +11,7 @@ local Legacy = require('agent.legacy')
 local Trig = require('agent.triggers')
 
 local S = {}
-S.VERSION = 12
+S.VERSION = 13
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}

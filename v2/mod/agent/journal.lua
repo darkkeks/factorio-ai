@@ -10,6 +10,7 @@ function J.init(st)
   st.tally = st.tally or {}
   st.watch = st.watch or {i = 1, bad = {}, pending = {}}
   st.corpses = st.corpses or {}        -- трупы персонажей ботов: место → {agent, tick, by}
+  st.groups = st.groups or {}          -- отряды врагов: номер → {g, at — тик прошлого события, x, y}
 end
 
 --- Сообщение игрового чата: в журнал событий и в ленту чата (последние 200 сообщений людей и ботов).

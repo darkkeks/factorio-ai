@@ -677,7 +677,11 @@ export const EVENT_TYPES = {
     '(одно попадание через несколько порогов — одно событие с нижним)',
   shooting_done: 'огонь (shoot) прекращён: {reason: duration | no_ammo | target_dead | stopped | replaced | died | logout, action_id, mode, killed, kills: {имя врага: число}, seconds, ammo_left, health, position}',
   throw_done: 'серия бросков (throw) закончена не в ответе на команду: {reason: done | no_item | target_dead | out_of_range | no_cliff | full_health | stopped | replaced | died | logout, action_id, item, thrown, count, left, health, position}',
-  attack_group:'отряд врагов собрался в атаку: {size, position}',
+  attack_group: 'отряд врагов выступил и виден на карте (в видимой зоне — обзор персонажей, радаров, построек): {group — номер отряда, size, position, ' +
+    'state: moving | attacking_target | attacking_distraction | pathfinding | wander_in_group | finished, prev?: {x, y, ticks_ago} — где он был в прошлом событии}. ' +
+    'Приходит, когда отряд вошёл в видимую зону (где бы он ни собрался), и повторяется раз в 10 секунд, пока он виден; направление — по position и prev. ' +
+    'Цель отряда игра не показывает. Чем раньше нужен сигнал, тем дальше должен быть обзор (радары)',
+  turret_engaged: 'турель команды ведёт огонь (попала по врагу) — как тревога игрока: {name, unit, position, target: {name, x, y}}; не чаще раза в 10 секунд на квадрат карты 32 × 32',
   enemy_base_built: 'враги построили новую базу на открытой карте: {name, position}',
   turret_no_ammo: 'турель без патронов: {name, unit, position}; по одной турели не чаще раза в минуту',
   alert: 'у машин кончилось топливо или пропала энергия: {status: no_fuel | no_power, count, examples: [{name, unit, x, y}]}',
