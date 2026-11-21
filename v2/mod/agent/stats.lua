@@ -65,6 +65,8 @@ end})
 local POWERED = {'accumulator', 'assembling-machine', 'furnace', 'mining-drill', 'lab', 'radar', 'pump', 'beacon', 'roboport',
   'electric-turret', 'rocket-silo', 'lamp'}
 
+local GENERATORS = {'generator', 'burner-generator', 'solar-panel', 'fusion-generator', 'lightning-attractor'}
+
 -- ── power: окно электросети ──
 O.register('power', {agent = true, fn = function(A, p)
   local e = A.entity
@@ -78,7 +80,12 @@ O.register('power', {agent = true, fn = function(A, p)
       local d = U.dist(c.position, e.position)
       if not bd or d < bd then pole, bd = c, d end
     end
-    if not pole then U.fail('not_found', 'в радиусе 80 клеток нет ни одного столба; укажи target') end
+    if not pole then
+      -- Сети рядом нет — обычный ответ с нулями: планировщику не нужно разбирать ошибку.
+      return {pole = nil, network = nil, window = '5s', production = U.list({}), production_kw = 0, consumption = U.list({}), consumption_kw = 0,
+        generators = U.list({}), capacity_kw = 0, machines = {ok = 0, low_power = 0, no_power = 0, radius = 0}, satisfied = false,
+        problems = U.list({}), note = 'в радиусе 80 клеток нет ни одного столба; укажи target'}
+    end
   end
   if Fog.state(e.surface, e.force, pole.position.x, pole.position.y) ~= 'visible' then U.fail('not_visible', 'столб вне обзора') end
   local st = pole.electric_network_statistics
@@ -121,7 +128,29 @@ O.register('power', {agent = true, fn = function(A, p)
       end
     end
   end
-  if cap > 0 then r.accumulators = {charge = U.r2(acc / cap), capacity_mj = U.r2(cap / 1e6)} end
+  if cap > 0 then r.accumulators = {charge = U.r2(acc / cap), capacity_mj = U.r2(cap / 1e6), charge_mj = U.r2(acc / 1e6)} end
+  -- Установленная мощность: генераторы этой сети в том же радиусе, максимум по прототипу (как полоса в окне сети).
+  local net = pole.electric_network_id
+  local gens, by_name, capacity = {}, {}, 0
+  local solar = e.surface.solar_power_multiplier
+  for _, c in pairs(e.surface.find_entities_filtered{position = pole.position, radius = radius, force = e.force, type = GENERATORS}) do
+    if c.electric_network_id == net then
+      local w = c.prototype.get_max_energy_production(c.quality) * 60
+      if c.type == 'solar-panel' then w = w * solar end
+      local g = by_name[c.name]
+      if not g then
+        g = {name = c.name, count = 0, w = 0}
+        by_name[c.name] = g
+        gens[#gens + 1] = g
+      end
+      g.count, g.w = g.count + 1, g.w + w
+      capacity = capacity + w
+    end
+  end
+  table.sort(gens, function(a, b) return a.w > b.w end)
+  for _, g in ipairs(gens) do g.max_kw, g.w = U.r2(g.w / 1000), nil end
+  r.generators = U.list(gens)
+  r.capacity_kw = U.r2(capacity / 1000)
   r.machines = {ok = ok, low_power = low, no_power = none, radius = radius}
   r.satisfied = low == 0 and none == 0
   r.problems = U.list(problems)
@@ -159,6 +188,20 @@ O.register('research_info', {agent = true, fn = function(A, p)
     info.unlocks = U.list(unlocks)
     r.technology = info
     return r
+  end
+  if p.researched then
+    -- Изученное, как в окне исследований: у бесконечной технологии — сколько уровней уже пройдено.
+    local done = {}
+    for name, t in pairs(force.technologies) do
+      if t.researched then
+        done[#done + 1] = {name = name, level = t.level}
+      elseif t.level > t.prototype.level then
+        done[#done + 1] = {name = name, level = t.level - 1, infinite = true}
+      end
+    end
+    table.sort(done, function(a, b) return a.name < b.name end)
+    r.researched = U.list(done)
+    r.researched_total = #done
   end
   -- Доступные: предпосылки исследованы, сама ещё нет.
   local avail = {}

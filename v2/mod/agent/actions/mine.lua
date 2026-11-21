@@ -12,7 +12,7 @@ local J = require('agent.journal')
 local in_reach, reach_of -- определены ниже
 
 local IDLE_LIMIT = 90   -- тиков без добычи, после которых разбираемся, почему движок её остановил
-local STALL_LIMIT = 300 -- тиков без единого добытого предмета (ни один ресурс руками не добывается так долго)
+local STALL_LIMIT = 300 -- тиков без движения: ни добытого предмета, ни роста полосы добычи
 
 -- Сколько у персонажа продуктов добычи этого объекта (руда, дерево, камень). Считаем именно их:
 -- общий счёт инвентаря сбивает идущий параллельно ручной крафт.
@@ -63,10 +63,14 @@ end
 local function step(A, it)
   local e, ent = A.entity, it.entity
   local total = product_count(e, it)
-  if total > it.last_total then
+  -- Продвижение — это добытый предмет или рост полосы добычи: долгую цель (огромный камень, 360 тиков)
+  -- игра добывает дольше STALL_LIMIT.
+  local progress = e.character_mining_progress
+  if total > it.last_total or progress > (it.last_progress or 0) then
     it.last_gain = game.tick
     it.last_total = total
   end
+  it.last_progress = progress
   local gained = total - it.start_total
   if not ent.valid then
     stop_mining(e)

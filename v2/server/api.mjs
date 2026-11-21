@@ -167,11 +167,13 @@ export const API = {
     params: {
       target: 'объект: {x, y, name?}', direction: 'put — положить в объект, take — забрать из объекта',
       item: 'имя предмета (для take можно не указывать — забрать всё)', count: 'сколько (по умолчанию всё)',
+      keep: 'для put патронов: сколько оставить в своих слотах патронов (по умолчанию 0). Патроны берутся из основного инвентаря, а при нехватке до count — из слотов патронов ' +
+        '(в ответе from_ammo); без count надетые берутся, только если в инвентаре нет ни одного',
       inventory: 'fuel, input, output, modules, main, ammo, burnt, robots (слоты роботов робопорта; main у робопорта — слоты ремкомплектов), rocket (грузовой отсек ракеты в шахте: есть, когда ракета собрана; вместимость — по весу, см. inspect → rocket); по умолчанию put — как ctrl-клик (игра сама выбирает слот), take — выход машины или всё содержимое сундука',
       lane: 'left | right — полоса конвейера по ходу движения', quality: 'качество',
       items: 'или список таких же объектов', approach: 'true — самому обходить цели вне досягаемости',
     },
-    result: 'один перенос: {moved, items: {предмет: количество}}; список: {done, skipped, left, total, items: [...]}',
+    result: 'один перенос: {moved, items: {предмет: количество}, from_ammo? — сколько из них взято из слотов патронов}; список: {done, skipped, left, total, items: [...]}',
     example: { items: [{ target: { x: 10, y: 5 }, direction: 'put', item: 'coal', count: 5 }, { target: { x: 10, y: 5 }, direction: 'take', inventory: 'output' }], approach: true },
   },
   configure: {
@@ -389,9 +391,13 @@ export const API = {
   },
   power: {
     kind: 'query',
-    summary: 'Окно электросети столба (по умолчанию ближайшего в 80 клетках): выработка и потребление по видам машин, аккумуляторы, машины без питания.',
-    params: { target: 'столб: {x, y}', radius: 'в каком радиусе от столба искать машины без питания (по умолчанию 48)' },
-    result: '{pole, network, production_kw, production: [{name, kw}], consumption_kw, consumption, accumulators: {charge, capacity_mj}, machines: {ok, low_power, no_power}, satisfied, problems: [{name, x, y, status}]}',
+    summary: 'Окно электросети столба (по умолчанию ближайшего в 80 клетках): выработка и потребление по видам машин, установленная мощность, аккумуляторы, машины без питания. ' +
+      'capacity_kw и generators — максимум генераторов этой сети, стоящих в radius от столба (электростанция дальше — увеличь radius или укажи столб у неё): ' +
+      'паровые двигатели и турбины — по паспорту (при полном снабжении паром), солнечные панели — дневной максимум. Запас сети — capacity_kw минус consumption_kw. ' +
+      'Столба в 80 клетках нет — ответ с network: null, нулями и note.',
+    params: { target: 'столб: {x, y}', radius: 'в каком радиусе от столба искать генераторы, аккумуляторы и машины без питания (по умолчанию 48, до 150)' },
+    result: '{pole, network, production_kw, production: [{name, kw}], consumption_kw, consumption, capacity_kw, generators: [{name, count, max_kw}], ' +
+      'accumulators: {charge — доля, charge_mj, capacity_mj}, machines: {ok, low_power, no_power}, satisfied, problems: [{name, x, y, status}]}',
     example: {},
   },
   alerts: {
@@ -458,9 +464,10 @@ export const API = {
       'craft-item — скрафтить count предметов item (руками через craft или в машинах), build-entity — поставить постройку entity, ' +
       'mine-entity — добыть одно из entities, craft-fluid — получить жидкость в машинах. Ручной крафт и добыча ботов (craft, mine) ' +
       'засчитываются, как у игрока: только когда предпосылки технологии уже исследованы (missing_prerequisites пуст) — сделанное раньше не в счёт, повтори.',
-    params: { name: 'имя технологии', limit: 'сколько доступных показать (по умолчанию 30)' },
+    params: { name: 'имя технологии', limit: 'сколько доступных показать (по умолчанию 30)',
+      researched: 'true — добавить список изученного: researched [{name, level, infinite?}] (у бесконечной технологии level — сколько уровней уже пройдено)' },
     result: '{current: {name, progress, units, ingredients}, queue: [...], available: [{name, units, seconds_per_unit, ingredients, ' +
-      'trigger?: {type, item?, count?, entity?, entities?, fluid?, amount?, quality?}}], technology?}',
+      'trigger?: {type, item?, count?, entity?, entities?, fluid?, amount?, quality?}}], researched?: [{name, level, infinite?}], researched_total?, technology?}',
     example: {},
   },
   chat: {

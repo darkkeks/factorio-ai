@@ -162,8 +162,33 @@ test('окна игры: производство, энергия, исслед�
   const base = await lua(`local p = game.surfaces.nauvis.find_entities_filtered{type = 'electric-pole', force = 'player', position = {0, 0}, radius = 100, limit = 1}[1] return {x = p.position.x, y = p.position.y}`);
   const pw = await call(A, 'power', { target: base });
   ok(pw.ok && pw.production_kw >= 0 && Array.isArray(pw.consumption) && pw.machines, JSON.stringify(pw).slice(0, 200));
+  ok(Array.isArray(pw.generators) && pw.capacity_kw >= 0, JSON.stringify(pw).slice(0, 400));
+  // Установленная мощность: паровой двигатель 900 кВт и солнечная панель 60 кВт в сети отдельного столба; без столба — нули.
+  const me = (await call(A, 'status')).position;
+  const far = await lua(`
+    local s, f = game.surfaces.nauvis, game.forces.player
+    local x, y = A.x + 3000, A.y
+    storage.test_pw = {}
+    for _, d in pairs{{'small-electric-pole', 0, 0}, {'steam-engine', 0, 3}, {'solar-panel', 3, -1}, {'accumulator', -3, -1}} do
+      storage.test_pw[#storage.test_pw + 1] = s.create_entity{name = d[1], position = {x + d[2], y + d[3]}, force = f}
+    end
+    local e = storage.agent.agents[A.n].entity
+    e.teleport({x - 2, y - 2})
+    return {x = x, y = y, connected = storage.test_pw[2].electric_network_id == storage.test_pw[1].electric_network_id}`, { n: NAME, x: me.x, y: me.y });
+  const cap = await call(A, 'power', { radius: 10 });
+  ok(far.connected && cap.ok && cap.capacity_kw === 960 && cap.generators.length === 2 && cap.generators[0].name === 'steam-engine'
+    && cap.generators[0].max_kw === 900 && cap.generators[1].count === 1 && cap.accumulators.capacity_mj === 5, JSON.stringify(cap));
+  await lua(`for _, e in pairs(storage.test_pw) do if e.valid then e.destroy() end end storage.test_pw = nil return true`);
+  const none = await call(A, 'power');
+  ok(none.ok && none.network == null && none.capacity_kw === 0 && none.production_kw === 0 && none.note, JSON.stringify(none));
+  await lua(`storage.agent.agents[A.n].entity.teleport({A.x, A.y}) return true`, { n: NAME, x: me.x, y: me.y });
   const rs = await call(A, 'research_info');
-  ok(rs.ok && Array.isArray(rs.queue) && Array.isArray(rs.available), JSON.stringify(rs).slice(0, 200));
+  ok(rs.ok && Array.isArray(rs.queue) && Array.isArray(rs.available) && rs.researched === undefined, JSON.stringify(rs).slice(0, 200));
+  const done = await call(A, 'research_info', { researched: true });
+  const truth = await lua(`local n = 0 for _, t in pairs(game.forces.player.technologies) do if t.researched or t.level > t.prototype.level then n = n + 1 end end
+    return {n = n, automation = game.forces.player.technologies['automation'].researched}`);
+  ok(done.ok && done.researched_total === truth.n && done.researched.length === truth.n && truth.n > 0, JSON.stringify(done).slice(0, 300));
+  eq(done.researched.some((t) => t.name === 'automation' && t.level === 1), truth.automation);
   const rc = await call(A, 'recipes', { name: 'electronic-circuit' });
   ok(rc.recipes[0].ingredients['copper-cable'] === 3 && rc.recipes[0].by_hand === true, JSON.stringify(rc));
   const pt = await call(A, 'prototypes', { name: 'stone-furnace' });

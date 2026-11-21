@@ -276,6 +276,50 @@ test('mine: деревья и камни — вплотную; помеченн�
   ok(i.wood >= 12 && i.stone > 0, JSON.stringify(i));
 });
 
+test('mine: огромный камень добывается дольше предела простоя (fb-088)', async () => {
+  await reset({}, 30.5, 15.5);
+  await world(`game.surfaces.nauvis.create_entity{name = 'huge-rock', position = {A.ox + 32.5, A.oy + 15.5}} return true`);
+  const r = await call(A, 'mine', { target: { ...P(32.5, 15.5), name: 'huge-rock' }, wait_s: 30 });
+  ok(r.ok && r.gone && r.gained >= 48, JSON.stringify(r));
+  const i = await inv();
+  ok(i.stone >= 24 && i.coal >= 24, JSON.stringify(i));
+});
+
+test('transfer put: патроны берутся из инвентаря, при нехватке — из слотов патронов, keep оставляет надетое (fb-093)', async () => {
+  await reset({ 'gun-turret': 1, 'submachine-gun': 1, 'wooden-chest': 1 });
+  const t = P(33, 15), c = P(36.5, 15.5);
+  await call(A, 'place', { item: 'gun-turret', ...t });
+  await call(A, 'place', { item: 'wooden-chest', ...c });
+  // Магазины игра сама надевает в слот патронов.
+  await world(`local e = storage.agent.agents[A.name].entity e.insert{name = 'firearm-magazine', count = 30} return true`, { name: NAME });
+  let st = await call(A, 'status');
+  eq([st.ammo['firearm-magazine'], st.inventory['firearm-magazine'] || 0], [30, 0], 'магазины надеты');
+  let r = await call(A, 'transfer', { target: t, direction: 'put', item: 'firearm-magazine', count: 10, keep: 30 });
+  ok(!r.ok && r.error.code === 'no_item' && /keep/.test(r.error.message), JSON.stringify(r));
+  r = await call(A, 'transfer', { target: t, direction: 'put', item: 'firearm-magazine', count: 10 });
+  ok(r.ok && r.moved === 10 && r.from_ammo === 10, JSON.stringify(r));
+  // В инвентаре 5, просим 8: 5 из инвентаря и 3 из слотов.
+  await world(`local e = storage.agent.agents[A.name].entity e.get_main_inventory().insert{name = 'firearm-magazine', count = 5} return true`, { name: NAME });
+  r = await call(A, 'transfer', { target: c, direction: 'put', item: 'firearm-magazine', count: 8 });
+  ok(r.ok && r.moved === 8 && r.from_ammo === 3, JSON.stringify(r));
+  // Без count при непустом инвентаре надетое не трогается.
+  await world(`local e = storage.agent.agents[A.name].entity e.get_main_inventory().insert{name = 'firearm-magazine', count = 2} return true`, { name: NAME });
+  r = await call(A, 'transfer', { target: c, direction: 'put', item: 'firearm-magazine' });
+  ok(r.ok && r.moved === 2 && r.from_ammo === undefined, JSON.stringify(r));
+  // keep: из 17 надетых отдать можно только 12.
+  r = await call(A, 'transfer', { target: c, direction: 'put', item: 'firearm-magazine', count: 50, keep: 5 });
+  ok(r.ok && r.moved === 12 && r.from_ammo === 12, JSON.stringify(r));
+  st = await call(A, 'status');
+  eq(st.ammo['firearm-magazine'], 5);
+  const w = await world(`local s = game.surfaces.nauvis
+    return {turret = s.find_entity('gun-turret', {A.ox + 33, A.oy + 15}).get_item_count('firearm-magazine'),
+      chest = s.find_entity('wooden-chest', {A.ox + 36.5, A.oy + 15.5}).get_item_count('firearm-magazine')}`);
+  eq(w, { turret: 10, chest: 22 });
+  // Не патроны из слотов не берутся и работают как раньше.
+  r = await call(A, 'transfer', { target: c, direction: 'put', item: 'coal' });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+});
+
 test('mine: отмена во время пакета возвращает отчёт о сделанном', async () => {
   await reset({});
   await world(`local s = game.surfaces.nauvis for i = 0, 5 do s.create_entity{name = 'iron-ore', position = {A.ox + 31.5, A.oy + 13.5 + i}, amount = 500} end return true`);

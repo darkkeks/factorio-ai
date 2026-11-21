@@ -70,16 +70,27 @@ local function transfer_one(A, it)
   local mine = e.get_main_inventory()
   local quality = it.quality
   local moved = {}
-  local total
+  local total, from_ammo
 
   if it.direction == 'put' then
-    local have = mine.get_item_count(quality and {name = it.item, quality = quality} or it.item)
-    if have == 0 then U.fail('no_item', 'в инвентаре нет ' .. U.item_key(it.item, quality), {item = it.item}) end
-    local limit = it.count or have
+    local spec = quality and {name = it.item, quality = quality} or it.item
+    local have = mine.get_item_count(spec)
+    -- Патроны игрок перекладывает и из слотов патронов (подобранные магазины игра надевает сама): сначала основной
+    -- инвентарь, при нехватке — надетые, но не ниже keep. Без count надетые берутся, только если в инвентаре нет ни одного.
+    local ammo = prototypes.item[it.item].type == 'ammo' and e.get_inventory(defines.inventory.character_ammo) or nil
+    local kept = ammo and ammo.get_item_count(spec) or 0
+    local worn = math.max(0, kept - (it.keep or 0))
+    if it.count then worn = math.min(worn, math.max(0, it.count - have)) elseif have > 0 then worn = 0 end
+    if have + worn == 0 then
+      U.fail('no_item', 'в инвентаре нет ' .. U.item_key(it.item, quality)
+        .. (kept > 0 and (' (в слотах патронов ' .. kept .. ', но keep велит их оставить)') or ''), {item = it.item})
+    end
+    local limit = it.count and math.min(it.count, have) or have
+    local insert
     if BELT[ent.type] then
       -- На клетку конвейера предметы кладутся по одному, пока на полосе есть место.
       local lines = lanes_of(ent, it.lane)
-      total = move(mine, function(sp)
+      insert = function(sp)
         local n = 0
         for _ = 1, sp.count do
           local placed = false
@@ -93,7 +104,7 @@ local function transfer_one(A, it)
           n = n + 1
         end
         return n
-      end, it.item, quality, limit, moved)
+      end
     else
       local dst
       if it.inventory then
@@ -102,8 +113,13 @@ local function transfer_one(A, it)
         if not dst then U.fail('not_found', 'у ' .. ent.name .. ' нет инвентаря ' .. it.inventory) end
       end
       -- Без inventory предмет кладётся как у игрока по ctrl-клику: игра сама выбирает слот (топливо, сырьё, патроны).
-      local insert = dst and function(sp) return dst.insert(sp) end or function(sp) return ent.insert(sp) end
-      total = move(mine, insert, it.item, quality, limit, moved)
+      insert = dst and function(sp) return dst.insert(sp) end or function(sp) return ent.insert(sp) end
+    end
+    total = limit > 0 and move(mine, insert, it.item, quality, limit, moved) or 0
+    if worn > 0 and total >= limit then
+      local n = move(ammo, insert, it.item, quality, worn, moved)
+      total = total + n
+      if n > 0 then from_ammo = n end
     end
     if total == 0 then
       local hint = ''
@@ -166,7 +182,7 @@ local function transfer_one(A, it)
       U.fail('no_item', 'в ' .. ent.name .. ' нет ' .. (it.item or 'предметов'), {item = it.item})
     end
   end
-  return {moved = total, items = moved}
+  return {moved = total, items = moved, from_ammo = from_ammo}
 end
 
 local function check_one(it, where)
@@ -176,12 +192,13 @@ local function check_one(it, where)
   if it.direction == 'put' then U.arg(it.item, 'string', where .. '.item') else U.arg(it.item, 'string', where .. '.item', true) end
   if it.item and not prototypes.item[it.item] then U.fail('bad_request', where .. ': нет такого предмета: ' .. it.item) end
   if it.count ~= nil and (type(it.count) ~= 'number' or it.count % 1 ~= 0 or it.count < 1) then U.fail('bad_request', where .. '.count: целое от 1') end
+  if it.keep ~= nil and (type(it.keep) ~= 'number' or it.keep % 1 ~= 0 or it.keep < 0) then U.fail('bad_request', where .. '.keep: целое от 0') end
   if it.lane ~= nil and it.lane ~= 'left' and it.lane ~= 'right' then U.fail('bad_request', where .. '.lane: left или right') end
   U.arg(it.inventory, 'string', where .. '.inventory', true)
   if it.quality ~= nil and not prototypes.quality[it.quality] then U.fail('bad_request', where .. ': нет такого качества') end
 end
 
-local FIELDS = {'target', 'direction', 'item', 'count', 'inventory', 'quality', 'lane'}
+local FIELDS = {'target', 'direction', 'item', 'count', 'inventory', 'quality', 'lane', 'keep'}
 
 Q.register('transfer', Tour.action{
   check = function(p)
