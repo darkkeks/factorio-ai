@@ -19,7 +19,16 @@ const O = await lua(`
 await call(A, 'status'); // создать персонажа, если его ещё нет
 
 // Подготовка (только тестовый экземпляр): очистить площадку, поставить персонажа, выдать предметы.
-const reset = (items = {}, dx = 30.5, dy = 15.5) => lua(`
+const reset = async (items = {}, dx = 30.5, dy = 15.5) => {
+  // Погибший в прошлой проверке возрождается не сразу: дождаться.
+  for (let i = 0; i < 20; i++) {
+    const st = await call(A, 'status');
+    if (!st.dead) break;
+    await sleep(Math.min(st.respawn_in, 2) * 1000 + 200);
+  }
+  return resetNow(items, dx, dy);
+};
+const resetNow = (items, dx, dy) => lua(`
   local s = game.surfaces.nauvis
   local A_ = storage.agent.agents[A.name]
   local e = A_.entity
@@ -159,12 +168,31 @@ test('transfer: вне досягаемости без approach — out_of_reach
 
 test('гибель: agent_died с перечнем потерянного, труп в inspect, corpse_gone, когда его опустошили', async () => {
   await reset({ coal: 10, 'iron-plate': 5 }, 20.5, 15.5);
+  const before = (await call(A, 'events')).seq;
   await world(`local e = storage.agent.agents[A.name].entity
     e.get_inventory(defines.inventory.character_guns).insert{name = 'pistol', count = 1}
     e.die() return true`, { name: NAME });
   const s0 = (await call(A, 'events')).seq;
   const died = (await call(A, 'events', { since: s0 - 20, types: ['agent_died'] })).events.pop();
   ok(died && died.lost.coal === 10 && died.lost['iron-plate'] === 5 && died.lost.pistol === 1, JSON.stringify(died));
+  // Возрождение не мгновенное: 10 секунд игры персонажа нет, как у игрока в сетевой игре.
+  ok(died.respawned === false && died.respawn_in > 8 && died.respawn_in <= 10 && died.respawn_position, JSON.stringify(died));
+  const dead = await call(A, 'status');
+  ok(dead.ok && dead.dead === true && dead.respawn_in > 0 && dead.respawn_in <= 10 && !dead.position && dead.died_position, JSON.stringify(dead));
+  const walk = await call(A, 'walk_to', P(25.5, 15.5));
+  ok(!walk.ok && walk.error.code === 'dead' && walk.error.data.respawn_in > 0, JSON.stringify(walk));
+  ok((await call(A, 'inspect', { target: P(20.5, 15.5) })).error?.code === 'dead', 'запрос о мире до возрождения');
+  ok((await call(A, 'queue')).ok && (await call(A, 'chat')).ok, 'queue и chat работают и у погибшего');
+  const me = (await call(A, 'agents')).agents.find((a) => a.name === NAME);
+  ok(me.dead === true && me.alive === false && me.respawn_in > 0, JSON.stringify(me));
+  ok((await call(A, 'busy')).busy >= 1, 'погибший держит игру от паузы, пока не возродится');
+  const n0 = await world(`return {n = game.surfaces.nauvis.count_entities_filtered{type = 'character', force = 'player'}}`);
+  const back = (await call(A, 'events', { since: before, wait_s: 15, types: ['agent_respawned'] })).events.pop();
+  ok(back && back.dead_ticks >= 600 && back.dead_ticks < 700 && back.position && back.died_position, JSON.stringify(back));
+  const n1 = await world(`return {n = game.surfaces.nauvis.count_entities_filtered{type = 'character', force = 'player'}}`);
+  eq(n1.n, n0.n + 1, 'появился ровно один новый персонаж');
+  const alive = await call(A, 'status');
+  ok(alive.ok && !alive.dead && alive.health > 0 && alive.free_slots > 0, JSON.stringify(alive).slice(0, 200));
   await world(`storage.agent.agents[A.name].entity.teleport({A.ox + 22.5, A.oy + 15.5}) return true`, { name: NAME });
   const target = { ...P(20.5, 15.5), name: 'character-corpse' };
   const i = await call(A, 'inspect', { target });

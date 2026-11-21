@@ -121,9 +121,11 @@ E.handlers[defines.events.on_entity_died] = function(ev)
     Trig.forget(name)
     st.by_unit[unit] = nil
     A.unit, A.entity = nil, nil
-    local ok, err = pcall(S.spawn, A)
-    J.add('agent_died', name, {position = where, by = who(ev.cause), respawned = ok,
-      respawn_position = ok and U.pos(A.entity.position) or nil, lost = lost})
+    -- Возрождение — не сразу, а как у игрока в сетевой игре: через время возрождения (см. state.lua).
+    S.died(A, where)
+    J.add('agent_died', name, {position = where, by = who(ev.cause), respawned = false,
+      respawn_in = U.r2(S.respawn_in(A) / 60), respawn_tick = A.dead.respawn_tick,
+      respawn_position = U.pos(e.force.get_spawn_position(game.surfaces.nauvis)), lost = lost})
   elseif unit and e.type ~= 'character' then
     J.add('entity_died', nil, {name = e.name, unit = unit, position = U.pos(e.position), by = who(ev.cause),
       by_force = ev.force and ev.force.name or nil})
@@ -306,6 +308,10 @@ E.handlers[defines.events.on_tick] = function(ev)
   end
   for name in pairs(st.throwing) do
     Throw.tick(st.agents[name])
+  end
+  for name in pairs(st.dead) do
+    local A = st.agents[name]
+    if A and A.dead then S.respawn(A) else st.dead[name] = nil end
   end
   if ev.tick % 6 == 0 then
     -- Конец ручного крафта: у персонажа без игрока событий крафта нет, поэтому сверяем очередь.

@@ -53,6 +53,8 @@ local function busy_count()
   for name in pairs(st.crafting) do if not st.active[name] then count(name) end end
   for name in pairs(st.firing) do if not st.active[name] and not st.crafting[name] then count(name) end end
   for name in pairs(st.throwing) do if not st.active[name] and not st.crafting[name] and not st.firing[name] then count(name) end end
+  -- Погибший ждёт возрождения: время до него должно идти (очередь, крафт и огонь у него уже сняты).
+  for name in pairs(st.dead) do count(name) end
   return n, silent
 end
 O.busy_count = busy_count
@@ -84,6 +86,9 @@ O.register('agents', {fn = function()
       r.position = U.pos(e.position)
       r.health = U.r2(e.health)
       r.action = A.queue[1] and A.queue[1].type or nil
+    elseif A.dead then
+      r.dead = true
+      r.respawn_in = U.r2(S.respawn_in(A) / 60)
     end
     out[#out + 1] = r
   end
@@ -91,7 +96,13 @@ O.register('agents', {fn = function()
   return {agents = U.list(out)}
 end})
 
-O.register('status', {agent = true, fn = function(A)
+O.register('status', {agent = true, dead = true, fn = function(A)
+  if A.dead then
+    -- Между гибелью и возрождением персонажа нет: только сколько осталось ждать и где он погиб.
+    return {name = A.name, dead = true, respawn_in = U.r2(S.respawn_in(A) / 60), respawn_tick = A.dead.respawn_tick,
+      died_position = A.dead.position, respawn_position = U.pos(game.forces.player.get_spawn_position(game.surfaces.nauvis)),
+      queue = U.list({}), tick = game.tick, paused = game.tick_paused, deaths = A.deaths}
+  end
   local e = A.entity
   local main = e.get_main_inventory()
   local crafting = {}
@@ -121,7 +132,7 @@ O.register('status', {agent = true, fn = function(A)
   }
 end})
 
-O.register('queue', {agent = true, fn = function(A)
+O.register('queue', {agent = true, dead = true, fn = function(A)
   return {queue = U.list(Q.view(A))}
 end})
 
@@ -136,12 +147,12 @@ O.register('act', {agent = true, write = true,
   return {actions = queued, finished = U.list(finished), running = A.queue[1] and A.queue[1].id or nil, queue_length = #A.queue}
 end})
 
-O.register('cancel', {agent = true, write = true, fn = function(A, p)
+O.register('cancel', {agent = true, write = true, dead = true, fn = function(A, p)
   local id = Q.cancel(A, p.action_id)
   return {cancelled = id, queue_length = #A.queue}
 end})
 
-O.register('clear', {agent = true, write = true, fn = function(A)
+O.register('clear', {agent = true, write = true, dead = true, fn = function(A)
   return {cancelled = Q.clear(A)}
 end})
 
@@ -236,6 +247,6 @@ O.register('announce', {admin = true, fn = function(_, p)
 end})
 
 -- Бот жив: сервер на хосте шлёт это, когда запросы бота до мода не доходят (чтение буфера событий).
-O.register('touch', {agent = true, offline = true, fn = function() return {} end})
+O.register('touch', {agent = true, offline = true, dead = true, fn = function() return {} end})
 
 return O

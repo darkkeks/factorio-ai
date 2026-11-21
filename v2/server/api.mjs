@@ -572,14 +572,15 @@ export const API = {
     kind: 'query',
     summary: 'Свой персонаж: позиция, здоровье, инвентарь, экипировка, очередь крафта, очередь действий, дальности.',
     params: {},
-    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), throwing: {item, thrown, count, next_in_ticks, target?, at?} — если идёт серия бросков (throw),crafting, queue, reach: {build, interact, resource}, tick, paused}',
+    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), throwing: {item, thrown, count, next_in_ticks, target?, at?} — если идёт серия бросков (throw),crafting, queue, reach: {build, interact, resource}, tick, paused, deaths}. ' +
+      'Между гибелью и возрождением персонажа нет, ответ другой: {name, dead: true, respawn_in — секунд игры до возрождения, respawn_tick, died_position — где труп, respawn_position, deaths, tick, paused}',
     example: {},
   },
   agents: {
     kind: 'query', agent: false,
     summary: 'Все боты: имя, жив ли, позиция, здоровье, текущее действие, длина очереди.',
     params: {},
-    result: '{agents: [{name, alive, position, health, action, queue}]}',
+    result: '{agents: [{name, alive, position, health, action, queue, dead? — погиб и ждёт возрождения, respawn_in? — через сколько секунд}]}',
     example: {},
   },
   events: {
@@ -650,9 +651,12 @@ export const EVENT_TYPES = {
   queue_empty: 'своя очередь действий опустела',
   craft_done: 'очередь ручного крафта опустела',
   agent_damaged: 'свой персонаж получил урон: {health, damage, by, position}; не чаще раза в 5 секунд',
-  agent_died: 'свой персонаж погиб: {position — место трупа, by, respawn_position, lost: {предмет: количество} — что осталось в трупе}; новый персонаж — у точки возрождения, ' +
-    'с пустым инвентарём. Труп лежит, пока из него не заберут всё (сам не исчезает, старый с новым не сливается, враги его не трогают): inspect с target {x, y, name: "character-corpse"} → ' +
+  agent_died: 'свой персонаж погиб: {position — место трупа, by, respawn_in — через сколько секунд игры возродится (10, как у игрока в сетевой игре), respawn_tick, respawn_position — точка возрождения, ' +
+    'lost: {предмет: количество} — что осталось в трупе}. Возрождение само, по времени; ускорить или отложить его нельзя. До него персонажа нет: status отвечает {dead: true, respawn_in}, ' +
+    'действия и запросы о мире — ошибкой dead (в data — respawn_in), работают status, queue, chat, events, help. Жди событие agent_respawned (events с wait_s). ' +
+    'Новый персонаж — у точки возрождения, с пустым инвентарём; если там враги, он может погибнуть снова — сразу после agent_respawned смотри enemies / enemies_near и уходи. Труп лежит, пока из него не заберут всё (сам не исчезает, старый с новым не сливается, враги его не трогают): inspect с target {x, y, name: "character-corpse"} → ' +
     '{items, bot — чей, died_tick}; забрать — transfer take с той же целью',
+  agent_respawned: 'свой персонаж возродился после гибели: {position — где появился, died_position — где труп, dead_ticks — сколько тиков его не было}',
   corpse_gone: 'труп своего персонажа исчез: {position, reason: emptied — из него забрали всё | mined — снят человеком | expired, by? — бот, последним бравший из трупа, или человек, снявший его, ' +
     'died_tick, items_left? — что пропало вместе с трупом}. Если вещи забрал человек через окно трупа, by нет',
   entity_damaged: 'постройка команды повреждена: {name, unit, position, health, max_health, by}; по одному объекту не чаще раза в 5 секунд',
@@ -699,7 +703,7 @@ export const ERROR_CODES = {
   off_path: 'снесло с пути',
   damaged: 'действие прервано уроном',
   busy: 'поисковик пути игры занят, повтори',
-  dead: 'персонаж погиб во время действия',
+  dead: 'персонаж погиб во время действия либо ещё не возродился после гибели (data: {respawn_in — секунд до возрождения, respawn_tick, position — где труп}); жди событие agent_respawned',
   paused: 'игра остановлена людьми (режим ожидания): действия не принимаются, чтение работает; ping показывает hold: true, пока режим не снят',
   cancelled: 'действие отменено (ботом, остановкой очереди или сторожем cancel_if_silent_s)',
   timeout: 'условие ожидания не выполнилось за отведённое время',

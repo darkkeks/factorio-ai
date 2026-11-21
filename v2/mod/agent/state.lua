@@ -11,7 +11,7 @@ local Legacy = require('agent.legacy')
 local Trig = require('agent.triggers')
 
 local S = {}
-S.VERSION = 11
+S.VERSION = 12
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -74,6 +74,41 @@ function S.spawn(A)
   return e
 end
 
+-- Возрождение после гибели — как у игрока в сетевой игре: не сразу, а через время возрождения из прототипа
+-- персонажа (10 секунд), само, у точки возрождения команды. Пока A.dead задан, персонажа в мире нет.
+function S.respawn_ticks()
+  local t = prototypes.entity.character.respawn_time -- в секундах
+  return (t and t > 0) and t * 60 or 600
+end
+
+--- Погибший: запомнить, когда возродится. Сам персонаж появится в S.respawn (по тику или при запросе бота).
+function S.died(A, where)
+  local now = game.tick
+  A.dead = {tick = now, respawn_tick = now + S.respawn_ticks(), position = where}
+  storage.agent.dead[A.name] = true
+  if storage.vb then storage.vb[A.name] = nil end
+end
+
+--- Возродить погибшего, если время вышло. Нет места у точки возрождения — повтор через секунду.
+function S.respawn(A)
+  local d = A.dead
+  if not d or game.tick < d.respawn_tick then return false end
+  local ok = pcall(S.spawn, A)
+  if not ok then
+    d.respawn_tick = game.tick + 60
+    return false
+  end
+  A.dead = nil
+  storage.agent.dead[A.name] = nil
+  J.add('agent_respawned', A.name, {position = U.pos(A.entity.position), died_position = d.position, dead_ticks = game.tick - d.tick})
+  return true
+end
+
+--- Сколько тиков до возрождения (0 — вот-вот).
+function S.respawn_in(A)
+  return math.max(0, A.dead.respawn_tick - game.tick)
+end
+
 --- Запись бота по имени; create — завести нового («первое обращение токена»).
 function S.agent(name, create)
   local st = storage.agent
@@ -85,7 +120,8 @@ function S.agent(name, create)
     J.add('agent_created', nil, {name = name})
   end
   -- Вышедшего из игры (logout) не возрождаем: его персонаж цел и ждёт на скрытой поверхности.
-  if not A.offline and not (A.entity and A.entity.valid) then S.spawn(A) end
+  -- Погибший возрождается по времени (S.respawn), а не по запросу.
+  if not A.offline and not A.dead and not (A.entity and A.entity.valid) then S.spawn(A) end
   return A
 end
 
@@ -134,6 +170,7 @@ function S.ensure()
   st.crafting = st.crafting or {}      -- имена ботов с непустой очередью ручного крафта
   st.firing = st.firing or {}          -- имена ботов, у которых зажат огонь (actions/shoot.lua)
   st.throwing = st.throwing or {}      -- имена ботов с недобросанной серией капсул (actions/throw.lua)
+  st.dead = st.dead or {}              -- имена погибших ботов, ждущих возрождения
   st.path_requests = st.path_requests or {}
   J.init(st)
   Plans.init(st)

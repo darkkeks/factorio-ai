@@ -59,6 +59,13 @@ local function handle(raw)
     end
     A.seen = game.tick
     A.seen_at = storage.agent.now -- время по часам сторожа паузы: подключён ли бот (см. ops.lua)
+    -- Погибший ждёт возрождения: персонажа нет, работают только операции без тела (status, queue, чат).
+    if A.dead and not S.respawn(A) and op.agent and not op.dead then
+      local left = S.respawn_in(A)
+      return reply(false, {code = 'dead', message = 'персонаж погиб и ещё не возродился: до возрождения ' .. math.ceil(left / 60) ..
+        ' с (status → dead, respawn_in; событие agent_respawned)',
+        data = {respawn_in = U.r2(left / 60), respawn_tick = A.dead.respawn_tick, position = A.dead.position}})
+    end
   end
   local params = req.params
   if type(params) ~= 'table' then params = {} end

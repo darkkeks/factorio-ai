@@ -507,7 +507,7 @@ O.register('prototypes', {agent = true, fn = function(A, p)
 end})
 
 -- ── chat: игровой чат (люди и боты) ──
-O.register('chat', {agent = true, fn = function(A, p)
+O.register('chat', {agent = true, dead = true, fn = function(A, p)
   local c = storage.agent.chat
   local since = p.since or 0
   local out = {}

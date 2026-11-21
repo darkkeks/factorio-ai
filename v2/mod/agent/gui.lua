@@ -40,7 +40,10 @@ end
 --- Чем занят бот — короткой строкой.
 function G.describe(A)
   local e = A.entity
-  if not (e and e.valid) then return 'нет персонажа' end
+  if not (e and e.valid) then
+    if A.dead then return 'погиб, возродится через ' .. math.ceil(math.max(0, A.dead.respawn_tick - game.tick) / 60) .. ' с' end
+    return 'нет персонажа'
+  end
   local act = A.queue[1]
   local text
   if act then

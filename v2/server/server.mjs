@@ -162,7 +162,7 @@ const special = {
     if (pending.length) {
       // Бот вышел из игры (logout): очередь отменена целиком, итоги действий — в журнале, а не в ответе «offline».
       const q = await game.call({ agent: who.agent, op: 'queue' }).catch((e) => {
-        if (e?.code !== 'offline') throw e;
+        if (e?.code !== 'offline' && e?.code !== 'dead') throw e;
         return { queue: [] };
       });
       const inQueue = new Set(q.queue.map((a) => a.action_id));
@@ -217,6 +217,7 @@ const special = {
     } else if (p.radius != null) {
       let c = { x: p.x, y: p.y };
       if (typeof c.x !== 'number' || typeof c.y !== 'number') c = (await game.call({ agent: who.agent, op: 'status' })).position;
+      if (!c) throw new GameError('dead', 'персонаж погиб и ещё не возродился: задай x, y или дождись возрождения (status → respawn_in)');
       [x1, y1, x2, y2] = [Math.floor(c.x - p.radius), Math.floor(c.y - p.radius), Math.ceil(c.x + p.radius), Math.ceil(c.y + p.radius)];
     } else throw new GameError('bad_request', 'нужна area {x1, y1, x2, y2} или radius (вокруг x, y или вокруг персонажа)');
     const w = x2 - x1, h = y2 - y1;
