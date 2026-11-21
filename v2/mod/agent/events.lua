@@ -6,6 +6,7 @@ local S = require('agent.state')
 local Fog = require('agent.fog')
 local Gui = require('agent.gui')
 local Trig = require('agent.triggers')
+local Shoot = require('agent.actions.shoot')
 
 local E = {handlers = {}, nth = {}}
 
@@ -74,8 +75,14 @@ end
 
 E.handlers[defines.events.on_entity_died] = function(ev)
   local e = ev.entity
-  if not e.valid or e.force.name ~= 'player' then return end
+  if not e.valid then return end
   local st = storage.agent
+  -- Убитое выстрелом бота идёт в итог его стрельбы.
+  local cause = ev.cause
+  if cause and cause.valid and cause.unit_number and st.by_unit[cause.unit_number] then
+    Shoot.kill(st.agents[st.by_unit[cause.unit_number]], e)
+  end
+  if e.force.name ~= 'player' then return end
   local unit = e.unit_number
   local name = unit and st.by_unit[unit]
   if name then
@@ -96,6 +103,7 @@ E.handlers[defines.events.on_entity_died] = function(ev)
       st.active[name] = nil
     end
     st.crafting[name] = nil
+    Shoot.stop(A, 'died')
     Trig.forget(name)
     st.by_unit[unit] = nil
     A.unit, A.entity = nil, nil
@@ -175,7 +183,7 @@ E.handlers[defines.events.on_biter_base_built] = function(ev)
   end
 end
 
--- Раз в 2 секунды: враги рядом с персонажем бота (в пределах экрана).
+-- Дважды в секунду: враги рядом с персонажем бота (в пределах экрана) — чтобы бот успел ответить огнём.
 local function scan_threats()
   local st = storage.agent
   for name, A in pairs(st.agents) do
@@ -273,6 +281,9 @@ E.handlers[defines.events.on_tick] = function(ev)
   for name in pairs(st.active) do
     Q.pump(st.agents[name])
   end
+  for name in pairs(st.firing) do
+    Shoot.tick(st.agents[name])
+  end
   if ev.tick % 6 == 0 then
     -- Конец ручного крафта: у персонажа без игрока событий крафта нет, поэтому сверяем очередь.
     for name in pairs(st.crafting) do
@@ -291,7 +302,7 @@ E.handlers[defines.events.on_tick] = function(ev)
     scan_alerts()
   end
   if ev.tick % 30 == 3 then Gui.tick(ev.tick - 3) end
-  if ev.tick % 120 == 7 then scan_threats() end
+  if ev.tick % 30 == 7 then scan_threats() end
   if ev.tick % 300 == 13 then scan_turrets() end
   if ev.tick % 3600 == 0 then J.prune_throttle(DAMAGE_EVERY) end
 end

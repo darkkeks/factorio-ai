@@ -719,4 +719,131 @@ test('immediate: мгновенное действие исполняется, �
   await call(A, 'clear');
 });
 
+// --- стрельба ---
+// Враги для проверок: заморожены (не кусаются и не убегают), если не сказано иное. Возвращает число созданных.
+const enemies = (name, list, frozen = true) => world(`
+  local s, n = game.surfaces.nauvis, 0
+  storage.test_enemies = {}
+  for _, d in pairs(A.list) do
+    local b = s.create_entity{name = A.enemy, position = {A.ox + d[1], A.oy + d[2]}, force = 'enemy'}
+    if b then n = n + 1 b.disabled_by_script = A.frozen storage.test_enemies[#storage.test_enemies + 1] = b end
+  end
+  return {n = n}`, { enemy: name, list, frozen }).then((r) => r.n);
+// Образцовая карта живая: дикие кусаки приходят на выстрелы и портят счёт. Перед проверкой стрельбы убираем врагов в округе.
+const calm = () => world(`for _, x in pairs(game.surfaces.nauvis.find_entities_filtered{force = 'enemy', position = {A.ox + 30, A.oy + 15}, radius = 250}) do x.destroy() end return true`);
+const alive = () => world(`local n, hp = 0, 0 for _, b in pairs(storage.test_enemies or {}) do if b.valid then n = n + 1 hp = hp + b.health end end return {n = n, hp = hp}`);
+// Оружие и патроны прямо в слоты (подготовка): [[оружие, патроны, сколько], …].
+const arm = (slots) => world(`local e = storage.agent.agents[A.name].entity
+  local g, a = e.get_inventory(defines.inventory.character_guns), e.get_inventory(defines.inventory.character_ammo)
+  g.clear() a.clear()
+  for i, s in pairs(A.slots) do g[i].set_stack{name = s[1], count = 1} if s[2] then a[i].set_stack{name = s[2], count = s[3]} end end
+  e.selected_gun_index = 1 return true`, { name: NAME, slots });
+const until = async (fn, ms = 6000) => { const t0 = Date.now(); for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) return null; await sleep(100); } };
+const shotEvent = async (since, id) => until(async () => (await call(A, 'events', { since, types: ['shooting_done'] })).events.find((e) => e.action_id === id));
+
+test('shoot: огонь по ближайшим врагам в дальности, итог — убитые и остаток патронов; без оружия — отказ', async () => {
+  await reset();
+  await calm();
+  let r = await call(A, 'shoot', {});
+  ok(!r.ok && r.error.code === 'no_item' && r.error.data.weapons.length === 3, JSON.stringify(r));
+  await arm([['submachine-gun', 'firearm-magazine', 10]]);
+  eq(await enemies('small-biter', [[38.5, 15.5], [40.5, 13.5], [40.5, 18.5]]), 3);
+  const s0 = (await call(A, 'events')).seq;
+  r = await call(A, 'shoot', { duration_s: 30 });
+  ok(r.ok && r.shooting && r.mode === 'enemies' && r.gun === 'submachine-gun' && r.range === 18 && r.enemies_in_range === 3 && r.ammo_count === 10, JSON.stringify(r));
+  ok(r.ms < 100, `shoot отвечает сразу: ${r.ms} мс`);
+  await until(async () => (await alive()).n === 0);
+  const st = await call(A, 'status');
+  ok(st.shooting && st.shooting.killed === 3 && st.shooting.mode === 'enemies' && st.shooting.seconds_left > 20, JSON.stringify([st.shooting, await alive()]));
+  eq((await alive()).n, 0);
+  // Огонь зажат и без врагов: патроны не тратятся, игра на паузу не встаёт.
+  const busy = await call('t-admin', 'pause_if_idle', { ignore: ['tester', 'camera'] });
+  ok(busy.paused === false && busy.busy >= 1, 'зажатый огонь держит игру ' + JSON.stringify(busy));
+  r = await call(A, 'stop_shooting');
+  ok(r.ok && r.shooting === false && r.reason === 'stopped' && r.killed === 3 && r.kills['small-biter'] === 3 && r.ammo_left['firearm-magazine'] >= 8, JSON.stringify(r));
+  const ev = await shotEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'stopped' && ev.killed === 3, JSON.stringify(ev));
+  ok((await call(A, 'stop_shooting')).already === true, 'повторный stop_shooting');
+  ok((await call(A, 'status')).shooting === undefined, 'status без shooting');
+});
+
+test('shoot target: вне дальности выстрелов нет, огонь начинается на ходу; цель убита — конец; по своим и деревьям нельзя', async () => {
+  await reset({}, 5.5, 15.5);
+  await calm();
+  await arm([['submachine-gun', 'firearm-magazine', 10]]);
+  eq(await enemies('small-biter', [[35.5, 15.5]]), 1); // 30 клеток при дальности 18
+  await world(`game.surfaces.nauvis.create_entity{name = 'wooden-chest', position = {A.ox + 8.5, A.oy + 15.5}, force = 'player'} return true`);
+  let r = await call(A, 'shoot', { target: P(8.5, 15.5) });
+  ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
+  r = await call(A, 'shoot', { target: P(50.5, 2.5) });
+  ok(!r.ok && r.error.code === 'not_found', JSON.stringify(r));
+  const s0 = (await call(A, 'events')).seq;
+  r = await call(A, 'shoot', { target: { ...P(35.5, 15.5), name: 'small-biter' }, duration_s: 60 });
+  ok(r.ok && r.mode === 'target' && r.in_range === false && Math.abs(r.distance - 30) < 0.1 && r.target.name === 'small-biter', JSON.stringify(r));
+  await sleep(700);
+  eq((await alive()).n, 1); // далеко: жив и цел
+  ok((await alive()).hp === 15, 'цель вне дальности не задета');
+  // Идём к цели, не отпуская огня: ходьба — в очереди действий, огонь — мимо неё.
+  const w = await call(A, 'walk_to', { ...P(25.5, 17.5), wait: false });
+  ok(w.ok, JSON.stringify(w));
+  const ev = await shotEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'target_dead' && ev.killed === 1, JSON.stringify(ev));
+  const st = await call(A, 'status');
+  ok(st.walking === true || st.queue.length > 0 || Math.abs(st.position.x - (O.x + 25.5)) < 1, 'ходьба продолжается: ' + JSON.stringify(st.position));
+  await call(A, 'clear');
+});
+
+test('shoot: прицел в точку, гнёзда — тоже цель; патроны кончились — следующее оружие, потом no_ammo; срок вышел — duration', async () => {
+  await reset({}, 20.5, 15.5);
+  await calm();
+  await arm([['pistol', 'firearm-magazine', 1], ['submachine-gun', 'firearm-magazine', 1]]);
+  eq(await enemies('biter-spawner', [[30.5, 15.5]]), 1);
+  const full = (await alive()).hp;
+  let s0 = (await call(A, 'events')).seq;
+  let r = await call(A, 'shoot', { at: P(30.5, 15.5), duration_s: 60 });
+  ok(r.ok && r.mode === 'enemies' && r.slot === 1 && r.gun === 'pistol' && r.enemies_in_range === 1, JSON.stringify(r));
+  let ev = await shotEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'no_ammo' && Object.keys(ev.ammo_left).length === 0, JSON.stringify(ev));
+  ok((await alive()).hp < full, 'гнездо получило урон');
+  ok((await call(A, 'status')).weapons.every((w) => !w.ammo), 'оба слота пусты: стрелял и автомат');
+  // Нет врагов и короткий срок: огонь отпускается сам, патроны целы.
+  await reset();
+  await arm([['submachine-gun', 'firearm-magazine', 5]]);
+  s0 = (await call(A, 'events')).seq;
+  r = await call(A, 'shoot', { duration_s: 0.5 });
+  ev = await shotEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'duration' && ev.killed === 0 && ev.ammo_left['firearm-magazine'] === 5, JSON.stringify(ev));
+  r = await call(A, 'shoot', { duration_s: 500 });
+  ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+  // Повторный shoot сменяет прежний и продлевает огонь.
+  s0 = (await call(A, 'events')).seq;
+  const first = await call(A, 'shoot', { duration_s: 5 });
+  const second = await call(A, 'shoot', { duration_s: 5, slot: 1 });
+  ev = await shotEvent(s0, first.action_id);
+  ok(ev && ev.reason === 'replaced' && second.ok, JSON.stringify(ev));
+  await call(A, 'stop_shooting');
+});
+
+test('shoot: стая живых кусак нападает — бот отстреливается и остаётся жив; команда исполняется, пока тело занято', async () => {
+  await reset({ 'iron-plate': 10 }, 10.5, 15.5);
+  await calm();
+  await arm([['submachine-gun', 'firearm-magazine', 20]]);
+  // Тело занято долгим действием: огонь должен открыться сразу, а не после него.
+  const w = await call(A, 'wait', { ticks: 1200, wait: false });
+  eq(await enemies('small-biter', [[30.5, 12.5], [30.5, 14.5], [30.5, 16.5], [30.5, 18.5], [32.5, 15.5], [33.5, 13.5]], false), 6);
+  const s0 = (await call(A, 'events')).seq;
+  const r = await call(A, 'shoot', { duration_s: 60 });
+  ok(r.ok && r.ms < 100, JSON.stringify(r));
+  await world(`for _, b in pairs(storage.test_enemies) do if b.valid then b.commandable.set_command{type = defines.command.attack, target = storage.agent.agents[A.name].entity} end end return true`, { name: NAME });
+  const gone = await until(async () => (await alive()).n === 0, 15000);
+  ok(gone, 'кусаки убиты: осталось ' + JSON.stringify(await alive()));
+  const st = await call(A, 'status');
+  ok(st.deaths === (await call(A, 'status')).deaths && st.health > 0 && st.shooting.killed === 6, JSON.stringify([st.health, st.shooting]));
+  ok(st.queue.length === 1 && st.queue[0].action_id === w.action_id, 'действие тела не прервано огнём');
+  const end = await call(A, 'stop_shooting');
+  ok(end.killed === 6 && end.kills['small-biter'] === 6, JSON.stringify(end));
+  ok(await shotEvent(s0, r.action_id), 'событие shooting_done');
+  await call(A, 'clear');
+});
+
 run(async () => { admin.close(); });

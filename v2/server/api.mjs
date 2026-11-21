@@ -73,6 +73,29 @@ export const API = {
       'список или область: отчёт {done, skipped, left, total, items: [...]}',
     example: { area: { x1: 10, y1: -40, x2: 30, y2: -30 }, approach: true },
   },
+  shoot: {
+    kind: 'action', instant: true,
+    summary: 'Открыть огонь из надетого оружия — как игрок, зажавший кнопку огня. Исполняется сразу, в том же тике, и не занимает очередь действий: ' +
+      'стрелять можно на ходу, отступая и строя (walk_to отдельным запросом; чтобы урон не прерывал ходьбу — stop_on_damage: false). Без параметров прицел сам переходит на ближайшего к тебе врага в дальности оружия ' +
+      '(кусаки, плеваки, черви, гнёзда) и так по каждому следующему, пока враги есть; темп стрельбы, расход патронов и урон считает движок. ' +
+      'at {x, y} — то же, но ближайший к этой точке враг. target {x, y, name?} — прицел следует за этим врагом, ' +
+      'пока тот жив; он должен быть виден вживую. Вне дальности выстрелов нет — огонь остаётся зажатым и начнётся, когда враг подойдёт или подойдёшь ты ' +
+      '(в ответе range, а для target — distance и in_range). Огонь держится duration_s секунд (по умолчанию 20, не больше 120) и продлевается повторным shoot; ' +
+      'раньше кончается сам, когда нет патронов ни в одном слоте, цель target убита, персонаж погиб или вызван stop_shooting. Кончились патроны в слоте — ' +
+      'игра переходит на следующее оружие с патронами. Итог приходит событием shooting_done. Пока огонь зажат, игра не встаёт на паузу. ' +
+      'Чтобы успеть ответить на нападение, слушай события enemies_near и agent_damaged из параллельного скрипта и держи оружие с патронами надетым (equip).',
+    params: { target: 'конкретный враг {x, y, name?}', at: 'точка прицела {x, y}; без target и at — прицел на себе', slot: 'слот оружия 1…3; без него — выбранное оружие, а если в нём нет патронов — первое с патронами',
+      duration_s: 'сколько секунд держать огонь (по умолчанию 20, не больше 120)' },
+    result: '{shooting: true, mode: enemies | target, slot, gun, ammo, ammo_count, range, seconds, enemies_in_range, target?, distance?, in_range?}',
+    example: { duration_s: 30 },
+  },
+  stop_shooting: {
+    kind: 'action', instant: true,
+    summary: 'Прекратить огонь. Исполняется сразу, не дожидаясь очереди действий.',
+    params: {},
+    result: '{shooting: false, reason: "stopped", killed, kills: {имя врага: число}, seconds, ammo_left, health, position}; огня не было — {shooting: false, already: true}',
+    example: {},
+  },
   equip: {
     kind: 'action', instant: true,
     summary: 'Надеть из инвентаря оружие, патроны или броню в слоты персонажа, как в окне персонажа. Вид слота определяется предметом. ' +
@@ -81,7 +104,7 @@ export const API = {
       'в слот с другими патронами не кладутся (сначала unequip). Броня: слот один, надетая меняется местами с новой; ' +
       'если у новой меньше запас слотов инвентаря, нужно столько же свободных слотов — иначе no_space. ' +
       'Предметы, взятые в инвентарь (transfer take, добыча), игра часто надевает сама — смотри status → weapons, armor. ' +
-      'Действия «стрелять» пока нет: надетое оружие работает только у человека.',
+      'Стрелять — shoot.',
     params: { item: 'имя оружия, патронов или брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все', slot: '1…3 — номер слота оружия или патронов' },
     result: '{item, kind: gun | ammo | armor, slot, moved, replaced?, already?, weapons: [{slot, gun?, ammo?, count?}], inventory_slots — для брони: размер инвентаря после}',
     example: { item: 'firearm-magazine', count: 20, slot: 1 },
@@ -512,7 +535,7 @@ export const API = {
     kind: 'query',
     summary: 'Свой персонаж: позиция, здоровье, инвентарь, экипировка, очередь крафта, очередь действий, дальности.',
     params: {},
-    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), crafting, queue, reach: {build, interact, resource}, tick, paused}',
+    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), crafting, queue, reach: {build, interact, resource}, tick, paused}',
     example: {},
   },
   agents: {
@@ -606,7 +629,8 @@ export const EVENT_TYPES = {
   agent_login: 'бот вернулся в игру (login): {name}',
   entities_built: 'кто-то другой (человек, бот, роботы) построил: {by, count, names: {имя: количество}, area}; сводка раз в секунду',
   entities_removed: 'кто-то другой снял постройки: {by, count, names, area}',
-  enemies_near: 'враги в 32 клетках от твоего персонажа: {count, nearest: {name, x, y, distance}}; не чаще раза в 10 секунд',
+  enemies_near: 'враги в 32 клетках от твоего персонажа: {count, nearest: {name, x, y, distance}}; проверка дважды в секунду, событие не чаще раза в 10 секунд',
+  shooting_done: 'огонь (shoot) прекращён: {reason: duration | no_ammo | target_dead | stopped | replaced | died | logout, action_id, mode, killed, kills: {имя врага: число}, seconds, ammo_left, health, position}',
   attack_group: 'отряд врагов собрался в атаку: {size, position}',
   enemy_base_built: 'враги построили новую базу на открытой карте: {name, position}',
   turret_no_ammo: 'турель без патронов: {name, unit, position}; по одной турели не чаще раза в минуту',
@@ -659,7 +683,7 @@ export function helpDocument(info, publicUrl) {
         'по умолчанию 30, не больше 110; через внешний адрес — не больше 50). С wait: false или по истечении срока ответ — {ok: true, running: true, action_id}; действие продолжает исполняться, ' +
         'итог — событием action_done или вызовом wait_action. Обрыв соединения действие не отменяет.',
       instant: 'Мгновенные действия (instant) исполняются в том же тике, если очередь пуста; иначе встают в очередь по порядку. ' +
-        'Несколько действий подряд — одним запросом act. Действия, которые не занимают тело, — say, craft, cancel_craft, research и всё планирование ' +
+        'Несколько действий подряд — одним запросом act. Действия, которые не занимают тело, — say, craft, cancel_craft, research, shoot, stop_shooting и всё планирование ' +
         '(ghost_place, ghost_clear, mark_deconstruct, mark_upgrade) — отдельным запросом исполняются сразу, даже когда персонаж идёт или строит; ' +
         'внутри act вместе с действиями тела они идут по порядку списка (например walk_to, затем say).',
       idempotency: 'К пишущему запросу можно приложить свой "id" (строка). Повтор с тем же id вернёт сохранённый ответ и ничего не выполнит второй раз ' +
