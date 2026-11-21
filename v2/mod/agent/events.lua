@@ -7,6 +7,7 @@ local Fog = require('agent.fog')
 local Gui = require('agent.gui')
 local Trig = require('agent.triggers')
 local Shoot = require('agent.actions.shoot')
+local Throw = require('agent.actions.throw')
 
 local E = {handlers = {}, nth = {}}
 
@@ -53,6 +54,8 @@ local function who(cause)
   return cause.name
 end
 
+local HEALTH_MARKS = {25, 50, 75} -- от нижнего: одно попадание через несколько порогов даёт одно событие
+
 E.handlers[defines.events.on_entity_damaged] = function(ev)
   local e = ev.entity
   if not e.valid or e.force.name ~= 'player' then return end
@@ -61,6 +64,16 @@ E.handlers[defines.events.on_entity_damaged] = function(ev)
   local st = storage.agent
   local name = st.by_unit[unit]
   if name then
+    -- Здоровье упало через порог 75 / 50 / 25 %: событие сразу, мимо ограничения частоты — по нему бот решает отступать.
+    local max = e.max_health
+    local before = ev.final_health + ev.final_damage_amount
+    for _, t in ipairs(HEALTH_MARKS) do
+      if ev.final_health > 0 and ev.final_health <= max * t / 100 and before > max * t / 100 then
+        J.add('agent_health', name, {health = U.r2(ev.final_health), max_health = max, threshold = t,
+          by = who(ev.cause), position = U.pos(e.position)})
+        break
+      end
+    end
     if J.due('a' .. unit, DAMAGE_EVERY) then
       J.add('agent_damaged', name, {health = U.r2(ev.final_health), damage = U.r2(ev.final_damage_amount),
         by = who(ev.cause), position = U.pos(e.position)})
@@ -104,6 +117,7 @@ E.handlers[defines.events.on_entity_died] = function(ev)
     end
     st.crafting[name] = nil
     Shoot.stop(A, 'died')
+    Throw.stop(A, 'died')
     Trig.forget(name)
     st.by_unit[unit] = nil
     A.unit, A.entity = nil, nil
@@ -190,13 +204,19 @@ local function scan_threats()
     local e = A.entity
     if e and e.valid then
       local units = e.surface.find_enemy_units(e.position, 32, e.force)
-      if #units > 0 and J.due('near' .. name, 600) then
+      -- Событие: враги появились (не чаще раза в 2 секунды), их стало заметно больше, чем в прошлом событии
+      -- (в полтора раза и хотя бы на 2; не чаще раза в секунду), или прошло 10 секунд, а они всё ещё рядом.
+      local n, last, age = #units, A.near_n, game.tick - (A.near_tick or -600)
+      if n == 0 then
+        A.near_n = nil
+      elseif age >= 600 or (not last and age >= 120) or (last and age >= 60 and n >= last + math.max(2, math.ceil(last / 2))) then
+        A.near_n, A.near_tick = n, game.tick
         local best, bd
         for _, u in pairs(units) do
           local d = U.dist(u.position, e.position)
           if not bd or d < bd then best, bd = u, d end
         end
-        J.add('enemies_near', name, {count = #units, nearest = {name = best.name, x = U.r2(best.position.x), y = U.r2(best.position.y), distance = U.r2(bd)}})
+        J.add('enemies_near', name, {count = n, prev_count = last, nearest = {name = best.name, x = U.r2(best.position.x), y = U.r2(best.position.y), distance = U.r2(bd)}})
       end
     end
   end
@@ -283,6 +303,9 @@ E.handlers[defines.events.on_tick] = function(ev)
   end
   for name in pairs(st.firing) do
     Shoot.tick(st.agents[name])
+  end
+  for name in pairs(st.throwing) do
+    Throw.tick(st.agents[name])
   end
   if ev.tick % 6 == 0 then
     -- Конец ручного крафта: у персонажа без игрока событий крафта нет, поэтому сверяем очередь.

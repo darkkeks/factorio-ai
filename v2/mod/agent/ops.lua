@@ -8,6 +8,7 @@ local Gui = require('agent.gui')
 local BUILD = require('agent.build')
 local Equip = require('agent.actions.equip')
 local Shoot = require('agent.actions.shoot')
+local Throw = require('agent.actions.throw')
 
 local O = {list = {}}
 
@@ -51,6 +52,7 @@ local function busy_count()
   for name in pairs(st.active) do count(name) end
   for name in pairs(st.crafting) do if not st.active[name] then count(name) end end
   for name in pairs(st.firing) do if not st.active[name] and not st.crafting[name] then count(name) end end
+  for name in pairs(st.throwing) do if not st.active[name] and not st.crafting[name] and not st.firing[name] then count(name) end end
   return n, silent
 end
 O.busy_count = busy_count
@@ -109,6 +111,7 @@ O.register('status', {agent = true, fn = function(A)
     armor = U.contents(e.get_inventory(defines.inventory.character_armor)),
     weapons = U.list(Equip.weapons(e)),
     shooting = Shoot.view(A),
+    throwing = Throw.view(A),
     crafting = U.list(crafting),
     queue = U.list(Q.view(A)),
     reach = {build = e.build_distance, interact = e.reach_distance, resource = e.resource_reach_distance},
@@ -173,6 +176,7 @@ O.register('logout', {agent = true, write = true, offline = true, fn = function(
   local st, e = storage.agent, A.entity
   local cancelled = Q.clear(A, 'бот вышел из игры')
   Shoot.stop(A, 'logout')
+  Throw.stop(A, 'logout')
   if e.driving then e.driving = false end
   e.walking_state = {walking = false, direction = e.walking_state.direction}
   e.mining_state = {mining = false}

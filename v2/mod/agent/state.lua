@@ -11,7 +11,7 @@ local Legacy = require('agent.legacy')
 local Trig = require('agent.triggers')
 
 local S = {}
-S.VERSION = 10
+S.VERSION = 11
 S.REPLIES = 512 -- сколько ответов с идентификатором хранить на персонажа
 
 local LABEL_COLOR = {1, 0.8, 0.2}
@@ -133,6 +133,7 @@ function S.ensure()
   st.active = st.active or {}          -- имена ботов с непустой очередью
   st.crafting = st.crafting or {}      -- имена ботов с непустой очередью ручного крафта
   st.firing = st.firing or {}          -- имена ботов, у которых зажат огонь (actions/shoot.lua)
+  st.throwing = st.throwing or {}      -- имена ботов с недобросанной серией капсул (actions/throw.lua)
   st.path_requests = st.path_requests or {}
   J.init(st)
   Plans.init(st)

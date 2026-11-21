@@ -96,6 +96,29 @@ export const API = {
     result: '{shooting: false, reason: "stopped", killed, kills: {имя врага: число}, seconds, ammo_left, health, position}; огня не было — {shooting: false, already: true}',
     example: {},
   },
+  throw: {
+    kind: 'action', instant: true,
+    summary: 'Бросить капсулу из инвентаря в точку — как игрок, щёлкнувший капсулой по земле: grenade, cluster-grenade, poison-capsule, slowdown-capsule, ' +
+      'боевые дроны defender-capsule / distractor-capsule / destroyer-capsule (дроны-спутники летят за тобой, их число ограничено исследованиями), ' +
+      'cliff-explosives (рядом с точкой должна быть скала). raw-fish — съесть и подлечиться: без at и target, при полном здоровье — not_allowed. ' +
+      'Исполняется сразу, в том же тике, и не занимает очередь действий: бросать можно на ходу и стреляя. Снаряд, урон по площади и расход предмета считает движок; ' +
+      'урон по площади задевает и тебя, и свои постройки. Дальность — по капсуле (в ответе range; граната 15, кластерная и defender 20, остальные 25; cliff-explosives 10): ' +
+      'дальше — out_of_range с distance, подойди. Перезарядка между бросками — как у игрока (cooldown_ticks, обычно 30 тиков): брошенное раньше не отказывает, ' +
+      'а летит, как только перезарядка пройдёт (в ответе done: false и next_in_ticks). count — серия из нескольких капсул в ту же точку (или в ту же цель target: ' +
+      'каждая летит туда, где цель сейчас) по одной за перезарядку; итог серии — событие throw_done. Серия кончается раньше, если капсулы кончились, цель погибла, ' +
+      'ты ушёл дальше дальности, пришёл новый throw (сменяет серию) или stop_throwing. target должен быть виден вживую; at — любая точка в дальности.',
+    params: { item: 'имя капсулы', quality: 'качество (по умолчанию любое)', at: 'точка {x, y}', target: 'объект {x, y, name?} — бросок в него', count: 'сколько капсул подряд, 1…20 (по умолчанию 1)' },
+    result: '{item, kind: throw | use-on-self | destroy-cliffs, range, cooldown_ticks, at, distance, target?, count, thrown — сколько уже брошено, done, reason? — при done: true, ' +
+      'next_in_ticks? — через сколько тиков следующий бросок, left — сколько таких капсул осталось, health? — после рыбы, replaced? — номер сменённой серии}',
+    example: { item: 'grenade', at: { x: 120.5, y: -40.5 }, count: 3 },
+  },
+  stop_throwing: {
+    kind: 'action', instant: true,
+    summary: 'Прервать серию бросков (throw с count). Исполняется сразу, не дожидаясь очереди действий.',
+    params: {},
+    result: '{throwing: false, reason: "stopped", item, thrown, count, left, health, position}; серии не было — {throwing: false, already: true}',
+    example: {},
+  },
   equip: {
     kind: 'action', instant: true,
     summary: 'Надеть из инвентаря оружие, патроны или броню в слоты персонажа, как в окне персонажа. Вид слота определяется предметом. ' +
@@ -104,7 +127,7 @@ export const API = {
       'в слот с другими патронами не кладутся (сначала unequip). Броня: слот один, надетая меняется местами с новой; ' +
       'если у новой меньше запас слотов инвентаря, нужно столько же свободных слотов — иначе no_space. ' +
       'Предметы, взятые в инвентарь (transfer take, добыча), игра часто надевает сама — смотри status → weapons, armor. ' +
-      'Стрелять — shoot.',
+      'Стрелять — shoot; гранаты и капсулы надевать не нужно — throw бросает их из инвентаря.',
     params: { item: 'имя оружия, патронов или брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все', slot: '1…3 — номер слота оружия или патронов' },
     result: '{item, kind: gun | ammo | armor, slot, moved, replaced?, already?, weapons: [{slot, gun?, ammo?, count?}], inventory_slots — для брони: размер инвентаря после}',
     example: { item: 'firearm-magazine', count: 20, slot: 1 },
@@ -542,7 +565,7 @@ export const API = {
     kind: 'query',
     summary: 'Свой персонаж: позиция, здоровье, инвентарь, экипировка, очередь крафта, очередь действий, дальности.',
     params: {},
-    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), crafting, queue, reach: {build, interact, resource}, tick, paused}',
+    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), throwing: {item, thrown, count, next_in_ticks, target?, at?} — если идёт серия бросков (throw),crafting, queue, reach: {build, interact, resource}, tick, paused}',
     example: {},
   },
   agents: {
@@ -636,9 +659,14 @@ export const EVENT_TYPES = {
   agent_login: 'бот вернулся в игру (login): {name}',
   entities_built: 'кто-то другой (человек, бот, роботы) построил: {by, count, names: {имя: количество}, area}; сводка раз в секунду',
   entities_removed: 'кто-то другой снял постройки: {by, count, names, area}',
-  enemies_near: 'враги в 32 клетках от твоего персонажа: {count, nearest: {name, x, y, distance}}; проверка дважды в секунду, событие не чаще раза в 10 секунд',
+  enemies_near: 'враги в 32 клетках от твоего персонажа: {count, prev_count?, nearest: {name, x, y, distance}}; проверка дважды в секунду. Событие приходит, когда враги появились ' +
+    '(после того как их не было; не чаще раза в 2 секунды), когда их стало заметно больше, чем в прошлом событии (в полтора раза и хотя бы на 2 — подошла новая группа; ' +
+    'prev_count — сколько было; не чаще раза в секунду) и раз в 10 секунд, пока они рядом',
+  agent_health: 'здоровье твоего персонажа упало через порог 75, 50 или 25 %: {health, max_health, threshold, by, position}; приходит сразу, без ограничения частоты ' +
+    '(одно попадание через несколько порогов — одно событие с нижним)',
   shooting_done: 'огонь (shoot) прекращён: {reason: duration | no_ammo | target_dead | stopped | replaced | died | logout, action_id, mode, killed, kills: {имя врага: число}, seconds, ammo_left, health, position}',
-  attack_group: 'отряд врагов собрался в атаку: {size, position}',
+  throw_done: 'серия бросков (throw) закончена не в ответе на команду: {reason: done | no_item | target_dead | out_of_range | no_cliff | full_health | stopped | replaced | died | logout, action_id, item, thrown, count, left, health, position}',
+  attack_group:'отряд врагов собрался в атаку: {size, position}',
   enemy_base_built: 'враги построили новую базу на открытой карте: {name, position}',
   turret_no_ammo: 'турель без патронов: {name, unit, position}; по одной турели не чаще раза в минуту',
   alert: 'у машин кончилось топливо или пропала энергия: {status: no_fuel | no_power, count, examples: [{name, unit, x, y}]}',
@@ -690,7 +718,7 @@ export function helpDocument(info, publicUrl) {
         'по умолчанию 30, не больше 110; через внешний адрес — не больше 50). С wait: false или по истечении срока ответ — {ok: true, running: true, action_id}; действие продолжает исполняться, ' +
         'итог — событием action_done или вызовом wait_action. Обрыв соединения действие не отменяет.',
       instant: 'Мгновенные действия (instant) исполняются в том же тике, если очередь пуста; иначе встают в очередь по порядку. ' +
-        'Несколько действий подряд — одним запросом act. Действия, которые не занимают тело, — say, craft, cancel_craft, research, shoot, stop_shooting и всё планирование ' +
+        'Несколько действий подряд — одним запросом act. Действия, которые не занимают тело, — say, craft, cancel_craft, research, shoot, stop_shooting, throw, stop_throwing и всё планирование ' +
         '(ghost_place, ghost_clear, mark_deconstruct, mark_upgrade) — отдельным запросом исполняются сразу, даже когда персонаж идёт или строит; ' +
         'внутри act вместе с действиями тела они идут по порядку списка (например walk_to, затем say).',
       idempotency: 'К пишущему запросу можно приложить свой "id" (строка). Повтор с тем же id вернёт сохранённый ответ и ничего не выполнит второй раз ' +

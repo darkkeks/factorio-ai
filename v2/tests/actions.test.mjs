@@ -890,4 +890,128 @@ test('shoot: стая живых кусак нападает — бот отст
   await call(A, 'clear');
 });
 
+const throwEvent = async (since, id) => until(async () => (await call(A, 'events', { since, types: ['throw_done'] })).events.find((e) => e.action_id === id));
+
+test('throw: граната летит в точку и убивает; дальность и перезарядка — по капсуле; не капсула и нет предмета — отказ', async () => {
+  await reset({ grenade: 5, 'iron-plate': 5 }, 20.5, 15.5);
+  await calm();
+  let r = await call(A, 'throw', { item: 'iron-plate', at: P(30.5, 15.5) });
+  ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+  r = await call(A, 'throw', { item: 'poison-capsule', at: P(30.5, 15.5) });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  r = await call(A, 'throw', { item: 'grenade' });
+  ok(!r.ok && r.error.code === 'bad_request', JSON.stringify(r));
+  r = await call(A, 'throw', { item: 'grenade', at: P(40.5, 15.5) }); // 20 клеток при дальности 15
+  ok(!r.ok && r.error.code === 'out_of_range' && r.error.data.range === 15 && r.error.data.distance === 20, JSON.stringify(r));
+  eq((await inv()).grenade, 5);
+  eq(await enemies('small-biter', [[30.5, 15.5], [31.5, 15.5], [30.5, 16.5]]), 3);
+  // Тело занято: бросок всё равно исполняется сразу.
+  const w = await call(A, 'wait', { ticks: 600, wait: false });
+  r = await call(A, 'throw', { item: 'grenade', at: P(30.5, 15.5) });
+  ok(r.ok && r.thrown === 1 && r.done === true && r.reason === 'done' && r.left === 4 && r.range === 15 && r.cooldown_ticks === 30 && r.distance === 10 && r.kind === 'throw', JSON.stringify(r));
+  ok(r.ms < 100, `throw отвечает сразу: ${r.ms} мс`);
+  // Второй бросок сразу следом: не отказ, а ожидание перезарядки; предмет тратится только при броске.
+  const s0 = (await call(A, 'events')).seq;
+  const r2 = await call(A, 'throw', { item: 'grenade', at: P(30.5, 15.5) });
+  ok(r2.ok && r2.thrown === 0 && r2.done === false && r2.next_in_ticks > 0 && r2.next_in_ticks <= 30 && r2.left === 4, JSON.stringify(r2));
+  const ev = await throwEvent(s0, r2.action_id);
+  ok(ev && ev.reason === 'done' && ev.thrown === 1 && ev.left === 3, JSON.stringify(ev));
+  ok(await until(async () => (await alive()).n === 0), 'кусаки убиты гранатами: ' + JSON.stringify(await alive()));
+  const st = await call(A, 'status');
+  ok(st.throwing === undefined && st.queue.length === 1 && st.queue[0].action_id === w.action_id, 'действие тела не прервано: ' + JSON.stringify(st.queue));
+  await call(A, 'clear');
+});
+
+test('throw count: серия по одной за перезарядку в цель; цель погибла — конец; stop_throwing и замена серии', async () => {
+  await reset({ grenade: 10 }, 20.5, 15.5);
+  await calm();
+  await call(A, 'stop_throwing');
+  await sleep(700); // перезарядка после прошлой проверки
+  eq(await enemies('biter-spawner', [[31.5, 15.5]]), 1);
+  const full = (await alive()).hp;
+  let s0 = (await call(A, 'events')).seq;
+  const t0 = (await call(A, 'status')).tick;
+  let r = await call(A, 'throw', { item: 'grenade', target: { ...P(31.5, 15.5), name: 'biter-spawner' }, count: 4 });
+  ok(r.ok && r.thrown === 1 && r.done === false && r.count === 4 && r.target.name === 'biter-spawner' && r.left === 9, JSON.stringify(r));
+  let st = await call(A, 'status');
+  ok(st.throwing && st.throwing.count === 4 && st.throwing.item === 'grenade', JSON.stringify(st.throwing));
+  let ev = await throwEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'done' && ev.thrown === 4 && ev.left === 6, JSON.stringify(ev));
+  const t1 = (await call(A, 'events', { since: s0, types: ['throw_done'] })).events.find((e) => e.action_id === r.action_id).tick;
+  ok(t1 - t0 >= 90, `три перезарядки по 30 тиков: прошло ${t1 - t0}`);
+  ok(await until(async () => (await alive()).hp < full - 50), 'гнездо получило урон: ' + JSON.stringify(await alive()));
+  // Серия прерывается stop_throwing, новая команда сменяет прежнюю.
+  s0 = (await call(A, 'events')).seq;
+  r = await call(A, 'throw', { item: 'grenade', at: P(30.5, 15.5), count: 6 });
+  const r2 = await call(A, 'throw', { item: 'grenade', at: P(30.5, 14.5), count: 6 });
+  ok(r2.ok && r2.replaced === r.action_id, JSON.stringify(r2));
+  ev = await throwEvent(s0, r.action_id);
+  ok(ev && ev.reason === 'replaced', JSON.stringify(ev));
+  const stop = await call(A, 'stop_throwing');
+  ok(stop.ok && stop.throwing === false && stop.reason === 'stopped' && stop.thrown < 6 && stop.left >= 3, JSON.stringify(stop));
+  ok((await call(A, 'stop_throwing')).already === true, 'повторный stop_throwing');
+  // Цель должна быть видна и существовать.
+  r = await call(A, 'throw', { item: 'grenade', target: P(50.5, 2.5) });
+  ok(!r.ok && r.error.code === 'not_found', JSON.stringify(r));
+});
+
+test('throw: рыба лечит (при полном здоровье — отказ), дрон-защитник летит за персонажем, взрывчатка сносит скалу', async () => {
+  await reset({ 'raw-fish': 3, 'defender-capsule': 2, 'cliff-explosives': 2 }, 20.5, 15.5);
+  await calm();
+  await call(A, 'stop_throwing');
+  await sleep(700);
+  let r = await call(A, 'throw', { item: 'raw-fish' });
+  ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
+  eq((await inv())['raw-fish'], 3);
+  await world(`storage.agent.agents[A.name].entity.health = 100 return true`, { name: NAME });
+  r = await call(A, 'throw', { item: 'raw-fish' });
+  ok(r.ok && r.kind === 'use-on-self' && r.thrown === 1 && r.done && r.left === 2 && r.health > 150, JSON.stringify(r));
+  await sleep(700);
+  r = await call(A, 'throw', { item: 'defender-capsule', at: P(25.5, 15.5) });
+  ok(r.ok && r.thrown === 1 && r.range === 20 && r.left === 1, JSON.stringify(r));
+  const robot = await until(() => world(`local e = storage.agent.agents[A.name].entity
+    for _, x in pairs(e.surface.find_entities_filtered{type = 'combat-robot', position = e.position, radius = 15}) do
+      if x.combat_robot_owner == e then return {name = x.name} end
+    end return false`, { name: NAME }));
+  ok(robot && robot.name === 'defender', 'дрон следует за персонажем: ' + JSON.stringify(robot));
+  // Взрывчатка: без скалы — отказ и предмет цел, со скалой — скалы нет.
+  r = await call(A, 'throw', { item: 'cliff-explosives', at: P(26.5, 15.5) });
+  ok(!r.ok && r.error.code === 'not_found', JSON.stringify(r));
+  eq((await inv())['cliff-explosives'], 2);
+  const cliff = await world(`local c = game.surfaces.nauvis.create_entity{name = 'cliff', position = {A.ox + 26, A.oy + 16}, cliff_orientation = 'west-to-east'} return {x = c.position.x, y = c.position.y}`);
+  eq(await count('cliff'), 1);
+  await sleep(700);
+  r = await call(A, 'throw', { item: 'cliff-explosives', at: cliff });
+  ok(r.ok && r.kind === 'destroy-cliffs' && r.thrown === 1 && r.left === 1 && r.range === 10, JSON.stringify(r));
+  ok(await until(async () => (await count('cliff')) === 0), 'скала снесена');
+});
+
+test('события боя: enemies_near при появлении и при росте числа врагов; agent_health на порогах 75 / 50 / 25 %', async () => {
+  await reset({}, 20.5, 15.5);
+  await calm();
+  await sleep(2600); // врагов нет: прошлое «рядом» забыто
+  const evs = async (since, type) => (await call(A, 'events', { since, types: [type] })).events;
+  let s0 = (await call(A, 'events')).seq;
+  eq(await enemies('small-biter', [[35.5, 15.5], [36.5, 15.5]]), 2);
+  let ev = await until(async () => (await evs(s0, 'enemies_near'))[0], 3000);
+  ok(ev && ev.count === 2 && ev.prev_count === undefined && ev.nearest.name === 'small-biter', JSON.stringify(ev));
+  // Подошла вторая группа: событие приходит через секунду-другую, а не через 10.
+  await world(`for i = 1, 4 do local b = game.surfaces.nauvis.create_entity{name = 'small-biter', position = {A.ox + 30.5 + i, A.oy + 20.5}, force = 'enemy'} b.disabled_by_script = true end return true`);
+  const grown = await until(async () => (await evs(s0, 'enemies_near'))[1], 4000);
+  ok(grown && grown.count === 6 && grown.prev_count === 2, JSON.stringify(grown));
+  await sleep(1500);
+  eq((await evs(s0, 'enemies_near')).length, 2, 'без роста событие не повторяется сразу');
+  // Здоровье: 250 → 180 (порог 75), → 170 (без события), → 50 (пороги 50 и 25 разом — одно событие с нижним).
+  s0 = (await call(A, 'events')).seq;
+  const hit = (n) => world(`local e = storage.agent.agents[A.name].entity e.damage(A.n, 'enemy', 'impact') return {health = e.health}`, { name: NAME, n });
+  await world(`local e = storage.agent.agents[A.name].entity e.health = e.max_health return true`, { name: NAME });
+  const h1 = (await hit(70)).health;
+  await hit(10);
+  const h3 = (await hit(120)).health;
+  const hs = await evs(s0, 'agent_health');
+  ok(hs.length === 2 && hs[0].threshold === 75 && hs[0].max_health === 250 && Math.abs(hs[0].health - h1) < 0.01 && hs[1].threshold === 25 && Math.abs(hs[1].health - h3) < 0.01,
+    JSON.stringify([hs, h1, h3]));
+  await calm();
+});
+
 run(async () => { admin.close(); });
