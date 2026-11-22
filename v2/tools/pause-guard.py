@@ -13,6 +13,10 @@ import json, os, socket, struct, time
 # Режим ожидания (v2/tools/hold.sh): файл ставят люди, когда никто не играет. Действия ботов сервер ботов в это время
 # не принимает, а игра стоит на паузе, пока в ней нет людей, — очереди ботов не учитываются.
 HOLD = os.path.expanduser('~/hold')
+# «Не ставить паузу» (v2/tools/keep-running.sh): пока есть этот файл, игра идёт всегда — и без людей, и без занятых
+# ботов. Нужно, когда мир должен жить сам (например, для разработки веб-карты). С режимом ожидания совместимо:
+# боты не играют, а игра идёт.
+KEEP = os.path.expanduser('~/keep-running')
 PASSWORD = os.environ['RCON_PASSWORD']
 PORT = int(os.environ.get('RCON_PORT', '27015'))
 # Клиент-камера веб-карты — не человек: с ним одним игра должна вставать на паузу.
@@ -57,7 +61,8 @@ while True:
     try:
         rcon = rcon or Rcon()
         hold = os.path.exists(HOLD)
-        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'ignore': [CAMERA], 'now': int(time.time()), 'bots_off': hold}}
+        keep = os.path.exists(KEEP)
+        req = {'op': 'pause_if_idle', 'admin': True, 'params': {'ignore': [CAMERA], 'now': int(time.time()), 'bots_off': hold, 'keep': keep}}
         out = rcon.call(2, '/agent ' + json.dumps(req, ensure_ascii=False))
         try:
             r = json.loads(out)
@@ -67,7 +72,7 @@ while True:
             r = r['result']
             if r['changed']:
                 print(time.strftime('%F %T'), 'пауза' if r['paused'] else 'игра идёт',
-                      '(%sигроков: %s, занятых ботов: %s, отключённых с очередью: %s)' % ('режим ожидания; ' if hold else '', r['humans'], r['busy'], r.get('silent', 0)), flush=True)
+                      '(%s%sигроков: %s, занятых ботов: %s, отключённых с очередью: %s)' % ('пауза запрещена; ' if keep else '', 'режим ожидания; ' if hold else '', r['humans'], r['busy'], r.get('silent', 0)), flush=True)
         else:
             changed, why = legacy(rcon)
             if changed is not None:
