@@ -49,7 +49,7 @@ const JPEG_QUALITY = 75;
 const FRESH_MS = 5_000;        // цель для участков вокруг ботов и игроков
 const VIEW_MS = 2_000;         // цель для того, на что смотрят зрители (сколько успеет камера)
 const SWEEP_MS = 600_000;      // цель полного фонового обхода
-const BATCH = 8;               // снимков в одной команде RCON
+const BATCH = Number(process.env.MAP_BATCH || 16);               // снимков в одной команде RCON
 const PAUSE_MS = 20;           // пауза между пачками
 const SHOT_TIMEOUT_MS = 20_000;
 const VIEW_TILES = 80;         // сколько тайлов одного зрителя считать приоритетными
@@ -806,7 +806,18 @@ const cleanEnv = () => { const env = { ...process.env }; delete env.LD_LIBRARY_P
 
 // Xvfb живёт дольше клиента: его не нужно ждать при перезапуске, и видеокодер не теряет дисплей.
 function xvfbPid() { try { const pid = Number(fs.readFileSync(`/tmp/.X${CAMERA_DISPLAY.slice(1)}-lock`, 'utf8')); return pid && alive(pid) ? pid : 0; } catch { return 0; } }
+// Если запущен X-сервер на встроенной графике (служба factorio-camera-display, ~/factorio-camera/xorg), клиент рисует
+// на видеокарте; иначе — прежний Xvfb с программным рендером. Выбор делается при каждом запуске клиента.
+const GPU_DISPLAY = process.env.CAMERA_GPU_DISPLAY || ':95', GPU_XAUTH = path.join(CAMERA_DIR, 'xorg/Xauthority');
+let display = { DISPLAY: CAMERA_DISPLAY }; // окружение дисплея текущего клиента
+function pickDisplay() {
+  const gpu = process.env.CAMERA_GPU !== '0' && fs.existsSync(`/tmp/.X11-unix/X${GPU_DISPLAY.slice(1)}`) && fs.existsSync(GPU_XAUTH);
+  // vblank_mode=0: монитора нет, и ожидание «кадровой развёртки» тормозило бы клиент до пары кадров в секунду.
+  display = gpu ? { DISPLAY: GPU_DISPLAY, XAUTHORITY: GPU_XAUTH, vblank_mode: '0' } : { DISPLAY: CAMERA_DISPLAY };
+  return gpu;
+}
 function ensureXvfb() {
+  if (pickDisplay()) return false;
   if (xvfbPid()) return false;
   const out = fs.openSync(CAMERA_LOG, 'a');
   spawn('Xvfb', [CAMERA_DISPLAY, '-screen', '0', `${CAMERA_WINDOW}x24`, '-nolisten', 'tcp'], { env: cleanEnv(), detached: true, stdio: ['ignore', out, out] }).unref();
@@ -823,13 +834,13 @@ function startCamera() {
   let logPos = 0;
   try { logPos = fs.statSync(CAMERA_LOG).size; } catch { /* лога ещё нет */ }
   const out = fs.openSync(CAMERA_LOG, 'a');
-  const child = spawn('nice', args, { cwd: CAMERA_DIR, env: { ...cleanEnv(), DISPLAY: CAMERA_DISPLAY }, detached: true, stdio: ['ignore', out, out] });
+  const child = spawn('nice', args, { cwd: CAMERA_DIR, env: { ...cleanEnv(), ...display }, detached: true, stdio: ['ignore', out, out] });
   fs.closeSync(out);
   child.unref();
   child.on('exit', (code) => { if (camera?.pid === child.pid) { log(`клиент-камера завершился (код ${code})`); camera = null; nextStart = Date.now() + 3000; } });
   camera = { pid: child.pid, since: Date.now(), joined: false, logPos };
   fs.writeFileSync(PID_FILE, String(child.pid));
-  log(`клиент-камера запущен (группа процессов ${child.pid})`);
+  log(`клиент-камера запущен (группа процессов ${child.pid}, дисплей ${display.DISPLAY}${display.XAUTHORITY ? ' — видеокарта' : ' — программный рендер'})`);
 }
 
 function stopCamera(why, retryIn = 0) {
@@ -860,6 +871,13 @@ async function cameraLoop() {
     const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
     if (pid && alive(pid)) { camera = { pid, since: Date.now(), joined: false, adopted: true, logPos: fs.statSync(CAMERA_LOG).size }; log(`подхватил работающий клиент-камеру (${pid})`); }
   } catch { /* нет файла */ }
+  if (camera) {
+    // На каком дисплее работает подхваченный клиент — из его окружения (нужно кодировщику живого окна).
+    try {
+      const env = Object.fromEntries(fs.readFileSync(`/proc/${camera.pid}/environ`, 'utf8').split('\0').map((l) => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
+      if (env.DISPLAY) display = env.XAUTHORITY ? { DISPLAY: env.DISPLAY, XAUTHORITY: env.XAUTHORITY } : { DISPLAY: env.DISPLAY };
+    } catch { /* процесс уже ушёл */ }
+  }
   for (;;) {
     await sleep(1000);
     const now = Date.now();
@@ -911,9 +929,9 @@ let encoder = null, videoInit = null, videoIdle = null;
 function startVideo() {
   if (encoder || !live.camera) return;
   const gop = Math.round(VIDEO_FPS / 2);
-  const env = { ...process.env };
+  const env = { ...process.env, ...display };
   delete env.LD_LIBRARY_PATH;
-  encoder = spawn('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-framerate', String(VIDEO_FPS), '-video_size', CAMERA_WINDOW, '-i', CAMERA_DISPLAY,
+  encoder = spawn('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-framerate', String(VIDEO_FPS), '-video_size', CAMERA_WINDOW, '-i', display.DISPLAY,
     '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
     '-g', String(gop), '-keyint_min', String(gop), '-sc_threshold', '0', '-b:v', `${VIDEO_KBPS}k`, '-maxrate', `${VIDEO_KBPS * 1.5}k`, '-bufsize', `${VIDEO_KBPS}k`,
     '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-'], { env, stdio: ['ignore', 'pipe', 'pipe'] });

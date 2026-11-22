@@ -1,0 +1,12 @@
+[Unit]
+Description=X-сервер клиента-камеры веб-карты Factorio на встроенной графике (дисплей :95)
+
+[Service]
+ExecStartPre=/usr/bin/modprobe i915 modeset=1
+Environment=LD_LIBRARY_PATH=/home/darkkeks/factorio-camera/xorg/root/usr/lib
+ExecStart=/home/darkkeks/factorio-camera/xorg/root/usr/lib/Xorg :95 -config /home/darkkeks/factorio-camera/xorg/xorg.conf -modulepath /home/darkkeks/factorio-camera/xorg/root/usr/lib/xorg/modules,/usr/lib/xorg/modules -logfile /home/darkkeks/factorio-camera/xorg/Xorg.95.log -auth /home/darkkeks/factorio-camera/xorg/Xauthority -novtswitch -sharevts -noreset -nolisten tcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
