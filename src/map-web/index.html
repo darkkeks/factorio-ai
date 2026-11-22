@@ -33,7 +33,7 @@
 
   #toggle { position: absolute; z-index: 1001; right: 10px; top: 10px; width: 36px; height: 36px; font-size: 18px; color: inherit; cursor: pointer; }
   #side { position: absolute; z-index: 1000; right: 10px; top: 54px; bottom: 26px; width: 320px; max-width: calc(100vw - 20px); overflow-y: auto; padding: 10px 12px; box-sizing: border-box; }
-  #side.hidden, #bot.hidden { display: none; }
+  #side.hidden { display: none; }
   h3 { margin: 12px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #9a968c; }
   h3:first-child { margin-top: 0; }
   .muted { color: #9a968c; }
@@ -45,15 +45,12 @@
   .event { margin: 5px 0; overflow-wrap: anywhere; }
   .event b { color: #ffcc33; font-weight: 600; }
 
-  #bot { position: absolute; z-index: 1000; left: 10px; bottom: 26px; width: 380px; max-width: calc(100vw - 20px); max-height: 55%; overflow-y: auto; padding: 10px 12px; box-sizing: border-box; }
   #live { position: absolute; z-index: 1000; left: 10px; top: 84px; width: 480px; max-width: calc(100vw - 20px); padding: 6px; box-sizing: border-box; }
   /* Во всё окно браузера: карта остаётся под видео, сводка и панель бота — поверх. */
   #live.big { inset: 0; width: auto; max-width: none; z-index: 1002; border-radius: 0; border: 0; padding: 0; background: #000; display: flex; flex-direction: column; }
   #live.big video { flex: 1; min-height: 0; width: 100%; aspect-ratio: auto; object-fit: contain; border-radius: 0; }
   #live.big header { padding: 6px 54px 6px 8px; background: rgba(24, 24, 24, .92); }
-  body.livebig #side, body.livebig #bot, body.livebig #toggle { z-index: 1003; }
-  /* Маленькое живое окно и панель бота стоят слева друг над другом — панель не должна на него наезжать. */
-  body.liveopen:not(.livebig) #bot { max-height: max(180px, calc(100% - 130px - min(480px, 100vw - 20px) * 9 / 16 - 50px)); }
+  body.livebig #side, body.livebig #ent, body.livebig #layers, body.livebig #toggle { z-index: 1003; }
   #live select { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 6px; font: inherit; max-width: 45%; }
   #live:fullscreen { inset: 0; width: auto; max-width: none; padding: 0; border: 0; background: #000; display: flex; flex-direction: column; }
   #live:fullscreen video { flex: 1; min-height: 0; aspect-ratio: auto; object-fit: contain; }
@@ -96,8 +93,6 @@
   .ev.tool .sub { margin-left: 14px; }
   #sess-older { display: block; margin: 0 auto 8px; }
   @media (max-width: 700px) { #sess { inset: 0; } #sess-main { flex-direction: column; } #sess-tree { width: auto; max-height: 30%; border-right: 0; border-bottom: 1px solid #3a3a3a; } }
-  #bot header { display: flex; align-items: center; gap: 8px; }
-  #bot header b { flex: 1; color: #ffcc33; font-size: 16px; }
   button { background: #333; color: inherit; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
   button.on { background: #7a5c00; border-color: #c79400; }
   .items { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -129,6 +124,13 @@
   #ent header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; padding: 5px 8px; background: #f1dcb4; color: #111; font-weight: 700; font-size: 15px; }
   #ent header b { flex: 1; }
   #ent header button { background: none; border: 0; color: #111; padding: 0 4px; font-size: 15px; }
+  #ent header .botonly { display: none; font-size: 13px; font-weight: 600; border: 1px solid #8a7a5a; border-radius: 3px; margin-right: 4px; padding: 1px 6px; }
+  #ent.bot header .botonly { display: block; }
+  #ent header .botonly.on { background: #c79400; color: #fff; }
+  #ent.bot { width: 360px; }
+  #ent .log { font-size: 13px; }
+  /* Вблизи имя бота видно на самой картинке игры — своё не дублируем. */
+  .closeup .actor.bot span { display: none; }
   #ent section { padding: 6px 8px; border-top: 1px solid #1c1c1c; box-shadow: 0 1px 0 #454445 inset; }
   #ent section > div { margin: 2px 0; }
   #ent h4 { margin: 0 0 4px; font-size: 14px; color: #ffe6c0; }
@@ -144,7 +146,7 @@
   @media (min-width: 701px) { body:has(#side:not(.hidden)) #layers, body:has(#side:not(.hidden)) #ent { right: 340px; } }
   @media (max-width: 700px) { #ent { left: 10px; right: 10px; width: auto; top: auto; bottom: 112px; max-height: 40%; z-index: 1001; } }
   .leaflet-control-attribution { display: none; }
-  @media (max-width: 700px) { #side { width: auto; left: 10px; } #bot { max-height: 45%; } }
+  @media (max-width: 700px) { #side { width: auto; left: 10px; } }
 </style>
 </head>
 <body>
@@ -168,11 +170,7 @@
 </div>
 <div id="tip" class="hidden"></div>
 <div id="layers"></div>
-<div id="ent" class="hidden"><header><b id="ent-name"></b><button id="ent-close" title="Закрыть">✕</button></header><div id="ent-body"></div></div>
-<div id="bot" class="box hidden">
-  <header><b id="bot-name"></b><button id="bot-sess">сессии</button><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
-  <div id="bot-body"></div>
-</div>
+<div id="ent" class="hidden"><header><b id="ent-name"></b><button id="bot-sess" class="botonly">сессии</button><button id="bot-follow" class="botonly">следить</button><button id="ent-close" title="Закрыть">✕</button></header><div id="ent-body"></div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -292,6 +290,7 @@ function onLive(m) {
   actors = m.bots;
   showTarget(m);
   syncActors('bot', m.bots);
+  if (selected) botBox();
   syncActors('player', m.players);
   if (following && selected) {
     const b = m.bots.find((x) => x.name === selected);
@@ -388,18 +387,23 @@ function setFollow(on) {
   // Камера живого окна идёт за тем же ботом, пока его не отпустили кнопкой «авто».
   if (following) wsSend({ t: 'follow', kind: 'bot', name: selected });
 }
+// Бот открывается в том же окне, что и любая выбранная постройка, — с очередью крафта, инвентарём и логом.
 function openBot(name) {
+  ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = '';
   selected = name;
-  $('bot').classList.remove('hidden');
-  $('bot-name').textContent = name;
-  $('bot-body').innerHTML = '<div class="muted">загрузка…</div>';
+  $('ent').classList.add('bot');
+  $('ent').classList.remove('hidden');
+  $('ent-name').textContent = name;
+  $('ent-body').innerHTML = '<section class="muted">загрузка…</section>';
+  $('ent').scrollTop = 0;
   lastBotHtml = '';
   clearInterval(botTimer);
+  botBox();
   loadBot();
   botTimer = setInterval(loadBot, 2000);
 }
-function closeBot() { selected = null; setFollow(false); clearInterval(botTimer); $('bot').classList.add('hidden'); }
-$('bot-close').onclick = closeBot;
+function botBox() { const a = actors.find((x) => x.name === selected); if (a) drawEntBox([a.x - 0.6, a.y - 1.6, a.x + 0.6, a.y + 0.4]); }
+function closeBot() { selected = null; setFollow(false); clearInterval(botTimer); $('ent').classList.remove('bot'); }
 $('bot-follow').onclick = () => {
   setFollow(!following);
   const b = following && actors.find((x) => x.name === selected);
@@ -415,22 +419,21 @@ async function loadBot() {
   try {
     const r = await fetch('api/bot?name=' + encodeURIComponent(name));
     if (name !== selected) return;
-    if (!r.ok) { $('bot-body').innerHTML = '<div class="muted">бота нет на сервере</div>'; return; }
+    if (!r.ok) { $('ent-body').innerHTML = '<section class="muted">бота нет на сервере</section>'; return; }
     const b = await r.json();
     const inv = Object.entries(b.inventory).sort((x, y) => y[1] - x[1]);
     const live = actors.find((x) => x.name === name);
     const doing = (live && live.act) || (b.mining ? 'копает' : b.walking ? 'идёт' : b.queue.length ? 'крафтит' : 'стоит');
-    const body = $('bot-body'), keep = body.scrollTop;
+    const body = $('ent-body'), box = $('ent'), keep = box.scrollTop;
     const html = `
-      <div class="muted"><b style="color:#cfe6ff">${esc(doing)}</b> · (${b.x.toFixed(0)}, ${b.y.toFixed(0)}) · здоровье ${b.health} из ${b.max_health}</div>
-      <div class="bar"><b style="width:${Math.min(100, 100 * b.health / b.max_health)}%"></b></div>
-      <h3>Очередь крафта</h3><div class="items">${b.queue.length ? b.queue.map((q) => slot(q.recipe, q.count)).join('') : '<span class="muted">пусто</span>'}</div>
-      <h3>Инвентарь</h3><div class="items">${inv.length ? inv.map(([k, v]) => slot(k, v)).join('') : '<span class="muted">пусто</span>'}</div>
-      <h3>Чем занят</h3><div class="log">${b.log.length ? b.log.slice().reverse().map((l) => `<div class="${l.kind}"><time>${utcTime(l.time)}</time>${esc(l.text)}</div>`).join('') : '<span class="muted">записей нет</span>'}</div>`;
+      <section><div class="st"><i style="background:#6fd3ff"></i>${esc(doing)}</div>${kv('Положение', `${b.x.toFixed(0)}, ${b.y.toFixed(0)}`)}${kv('Здоровье', `${b.health}/${b.max_health}`)}${bar(b.health / b.max_health)}</section>
+      <section><h4>Очередь крафта</h4><div class="items">${b.queue.length ? b.queue.map((q) => slot(q.recipe, q.count)).join('') : '<span class="muted">пусто</span>'}</div></section>
+      <section><h4>Инвентарь</h4><div class="items">${inv.length ? inv.map(([k, v]) => slot(k, v)).join('') : '<span class="muted">пусто</span>'}</div></section>
+      <section><h4>Чем занят</h4><div class="log">${b.log.length ? b.log.slice().reverse().map((l) => `<div class="${l.kind}"><time>${utcTime(l.time)}</time>${esc(l.text)}</div>`).join('') : '<span class="muted">записей нет</span>'}</div></section>`;
     if (html === lastBotHtml) return; // не перерисовываем без изменений: иконки не мигают, прокрутка не сбивается
     lastBotHtml = html;
     body.innerHTML = html;
-    body.scrollTop = keep;
+    box.scrollTop = keep;
     if (tipFor && !document.contains(tipFor)) { const again = body.querySelector(`.slot[data-item="${CSS.escape(tipFor.dataset.item)}"]`); if (again && tip.classList.contains('pinned')) showTip(again, true); else hideTip(); }
   } catch { /* следующая попытка через 2 секунды */ }
 }
@@ -686,13 +689,14 @@ function drawEntBox(b) {
   const lines = [[[x1, y1 + d], [x1, y1], [x1 + d, y1]], [[x2 - d, y1], [x2, y1], [x2, y1 + d]], [[x2, y2 - d], [x2, y2], [x2 - d, y2]], [[x1 + d, y2], [x1, y2], [x1, y2 - d]]].map((l) => l.map(([x, y]) => ll(x, y)));
   if (ENT.box) ENT.box.setLatLngs(lines); else ENT.box = L.polyline(lines, { color: '#ffd23a', weight: 3, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
 }
-function closeEnt() { ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = ''; $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
+function closeEnt() { closeBot(); ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = ''; $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
 async function loadEnt(first) {
   const gen = ENT.gen;
   let e;
   try { e = await api(`api/entity?x=${ENT.x}&y=${ENT.y}`); } catch { return; }
   if (gen !== ENT.gen) return;
   if (!e || !e.name) return closeEnt(); // пусто, туман войны или постройку убрали
+  if (e.bot) return openBot(e.bot);     // персонаж бота — показываем самого бота
   drawEntBox(e.box);
   $('ent-name').textContent = nm(e.name) + (e.ghost ? ' (призрак)' : '');
   const html = entHtml(e);
@@ -700,6 +704,7 @@ async function loadEnt(first) {
   $('ent').classList.remove('hidden');
 }
 map.on('click', (ev) => {
+  closeBot();
   ENT.gen++; ENT.x = +ev.latlng.lng.toFixed(3); ENT.y = +ev.latlng.lat.toFixed(3);
   clearInterval(ENT.timer);
   loadEnt(true);
@@ -748,7 +753,9 @@ function drawLayers() {
     const c = list(d.chunks);
     for (let i = 0; i < c.length; i += 3) if (seen(c[i] * 32 + 16, c[i + 1] * 32 + 16, 16)) {
       ctx.fillStyle = `rgba(255, 0, 0, ${Math.min(0.55, 0.02 + c[i + 2] / 320).toFixed(3)})`;
-      ctx.fillRect(Math.floor(X(c[i] * 32)), Math.floor(Y(c[i + 1] * 32)), Math.ceil(32 * k), Math.ceil(32 * k));
+      // Края округляем одинаково у соседних чанков: иначе они перекрываются на пиксель и видна сетка.
+      const px = Math.round(X(c[i] * 32)), py = Math.round(Y(c[i + 1] * 32));
+      ctx.fillRect(px, py, Math.round(X(c[i] * 32 + 32)) - px, Math.round(Y(c[i + 1] * 32 + 32)) - py);
     }
   }
   if ((d = on('logistics'))) {
@@ -801,7 +808,7 @@ function drawLayers() {
     for (let i = 0; i < r.length; i += 3) if (seen(r[i], r[i + 1], 1)) { ctx.fillStyle = r[i + 2] ? '#ffb347' : '#e8f4ff'; ctx.fillRect(X(r[i]) - px, Y(r[i + 1]) - px, 2 * px, 2 * px); }
   }
   if ((d = on('tags'))) {
-    for (const [x, y, text, type, n] of list(d.tags)) if (seen(x, y, 40 / k + 1)) {
+    for (const [x, y, text, type, n] of list(d.tags)) if (seen(x, y, 40 / k + 1) && !actors.some((a) => a.name === text)) { // тег бота дублировал бы его метку
       const im = n && type !== 'virtual' ? icon(n) : null;
       if (im) ctx.drawImage(im, 0, 0, im.naturalHeight, im.naturalHeight, X(x) - 12, Y(y) - 12, 24, 24);
       else { ctx.fillStyle = '#ffd23a'; ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(x), Y(y), 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke(); }
@@ -812,7 +819,9 @@ function drawLayers() {
 }
 map.on('move zoom viewreset resize', drawLayers);
 map.on('zoomanim', () => { zoomAnim = true; drawLayers(); });
-map.on('zoomend', () => { zoomAnim = false; drawLayers(); });
+const closeup = () => map.getContainer().classList.toggle('closeup', map.getZoom() >= 5);
+map.on('zoomend', () => { zoomAnim = false; closeup(); drawLayers(); });
+closeup();
 async function loadLayers() {
   const want = [...layersOn].filter((l) => l !== 'players');
   if (!want.length || document.hidden) return;

@@ -42,6 +42,7 @@ if r.electric then r.energy = e.energy r.buffer = try(function() return e.electr
 r.amount = try(function() return e.type == 'resource' and e.amount or nil end)
 r.backer = try(function() return e.type == 'train-stop' and e.backer_name or nil end)
 r.player = try(function() return e.type == 'character' and e.player and e.player.name or nil end)
+if e.type == 'character' then for n, c in pairs(storage.vb or {}) do if c == e then r.bot = n end end end
 r.generated = try(function() return e.energy_generated_last_tick * 60 end)
 r.speed = try(function() return e.crafting_speed end)
 r.progress = try(function() return e.crafting_progress end)
