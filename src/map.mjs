@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { lua } from './rcon.mjs';
+import { layer, entityAt, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
 
@@ -951,7 +952,10 @@ function loadNames(lang) {
   return out;
 }
 // Русские названия — для показа, английские — для ссылок на вики (страницы там называются по-английски).
-const NAMES = JSON.stringify({ ru: loadNames('ru'), en: loadNames('en') });
+// Для окна сведений о постройке — описания построек и названия состояний («Работает», «Нет топлива»).
+const LOCALE = loadLocale(GAME_DATA, 'ru', ['entity-description', 'entity-status']);
+const NAMES = JSON.stringify({ ru: loadNames('ru'), en: loadNames('en'), desc: LOCALE['entity-description'], status: LOCALE['entity-status'] });
+const MAP_BUTTONS = path.join(CAMERA_DIR, 'factorio/data/core/graphics/icons/mip/side-map-menu-buttons.png'); // кнопки слоёв карты из игры
 
 // ---------- сессии Claude ботов ----------
 // Транскрипты лежат в SESSIONS: <id>.jsonl — главная сессия, <id>/subagents/agent-<agentId>.jsonl (+ .meta.json) — субагенты.
@@ -1277,6 +1281,20 @@ const server = http.createServer(async (req, res) => {
         const num = (k) => (q.has(k) && /^\d{1,15}$/.test(q.get(k)) ? Number(q.get(k)) : null);
         try { return json(sessionLog(id, agent, num('after'), num('before'))); } catch { return reply(404, 'application/json', '{"error":"нет такого лога"}'); }
       }
+    }
+    if (url.pathname === '/ui/map-buttons.png') return reply(200, 'image/png', fs.readFileSync(MAP_BUTTONS), 'public, max-age=604800');
+    if (url.pathname === '/api/entity') {
+      // Сведения о постройке в точке карты — как при наведении курсора в игре.
+      const x = Number(url.searchParams.get('x')), y = Number(url.searchParams.get('y'));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 2e6 || Math.abs(y) > 2e6) return reply(400, 'application/json', '{"error":"нужны x и y"}');
+      return reply(200, 'application/json', JSON.stringify(await entityAt(x, y, SURFACE)));
+    }
+    if (url.pathname === '/api/layers') {
+      // Слои карты: ?l=electric,pollution — только известные имена, каждый слой кешируется.
+      const want = [...new Set((url.searchParams.get('l') ?? '').split(','))].filter((l) => LAYERS.includes(l));
+      const out = {};
+      await Promise.all(want.map(async (l) => { try { out[l] = await layer(l, SURFACE); } catch { /* слой придёт в следующий раз */ } }));
+      return reply(200, 'application/json', JSON.stringify(out));
     }
     if (url.pathname === '/api/bot') {
       const name = url.searchParams.get('name') ?? '';

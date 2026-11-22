@@ -115,6 +115,34 @@
   .log div { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
   .log .tool { font-family: ui-monospace, monospace; font-size: 12px; color: #b9c7d6; }
   .log time { color: #9a968c; margin-right: 6px; }
+  /* Кнопки слоёв карты — те же, что в игре (спрайты из файлов игры). */
+  #layers { position: absolute; z-index: 1000; right: 10px; bottom: 26px; display: grid; grid-template-columns: repeat(6, 36px); gap: 2px; padding: 4px; background: #313031; border: 1px solid #1c1c1c; border-radius: 4px; box-shadow: 0 0 0 1px #4a4a4a inset; }
+  #layers button { width: 36px; height: 36px; padding: 0; border: 1px solid #1f1f1f; border-radius: 3px; background: #8e8e8e linear-gradient(#a6a6a6, #7b7b7b); box-shadow: inset 0 1px 0 #cfcfcf; }
+  #layers button:hover { filter: brightness(1.12); }
+  #layers button.on { background: #f1be64 linear-gradient(#f9d795, #e8a93b); box-shadow: inset 0 1px 0 #ffeec2; }
+  #layers button i { display: block; width: 32px; height: 32px; margin: 1px; background: url(ui/map-buttons.png) 0 0 / 48px 352px no-repeat; }
+  .nonames .actor span, .nonames .actor small { display: none; }
+  #overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
+  /* Окно сведений о выбранной постройке — как подсказка в игре. */
+  #ent { position: absolute; z-index: 1000; right: 10px; top: 54px; width: 300px; max-width: calc(100vw - 20px); max-height: calc(100% - 190px); overflow-y: auto; box-sizing: border-box; background: #313031; border: 1px solid #1c1c1c; border-radius: 4px; box-shadow: 0 2px 10px #000; color: #fff; }
+  #ent.hidden { display: none; }
+  #ent header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; padding: 5px 8px; background: #f1dcb4; color: #111; font-weight: 700; font-size: 15px; }
+  #ent header b { flex: 1; }
+  #ent header button { background: none; border: 0; color: #111; padding: 0 4px; font-size: 15px; }
+  #ent section { padding: 6px 8px; border-top: 1px solid #1c1c1c; box-shadow: 0 1px 0 #454445 inset; }
+  #ent section > div { margin: 2px 0; }
+  #ent h4 { margin: 0 0 4px; font-size: 14px; color: #ffe6c0; }
+  #ent .k { font-weight: 700; color: #ffe6c0; }
+  #ent .desc { color: #e8e6e1; }
+  #ent .st i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background: #5fe04a; box-shadow: 0 0 4px currentColor; }
+  #ent .st.y i { background: #f0d232; } #ent .st.r i { background: #e8412c; }
+  #ent .bar { height: 8px; background: #1c1c1c; border-radius: 0; }
+  #ent .bar b { background: #5fae4e; }
+  #ent .bar.fl b { background: #2f7fd6; } #ent .bar.fuel b { background: #e8a93b; }
+  #ent .items { align-items: center; }
+  #ent .arrow { color: #9a968c; padding: 0 2px; }
+  @media (min-width: 701px) { body:has(#side:not(.hidden)) #layers, body:has(#side:not(.hidden)) #ent { right: 340px; } }
+  @media (max-width: 700px) { #ent { left: 10px; right: 10px; width: auto; top: auto; bottom: 112px; max-height: 40%; z-index: 1001; } }
   .leaflet-control-attribution { display: none; }
   @media (max-width: 700px) { #side { width: auto; left: 10px; } #bot { max-height: 45%; } }
 </style>
@@ -139,6 +167,8 @@
   <div id="sess-main"><div id="sess-tree"></div><div id="sess-log"></div></div>
 </div>
 <div id="tip" class="hidden"></div>
+<div id="layers"></div>
+<div id="ent" class="hidden"><header><b id="ent-name"></b><button id="ent-close" title="Закрыть">✕</button></header><div id="ent-body"></div></div>
 <div id="bot" class="box hidden">
   <header><b id="bot-name"></b><button id="bot-sess">сессии</button><button id="bot-follow">следить</button><button id="bot-close">✕</button></header>
   <div id="bot-body"></div>
@@ -150,7 +180,8 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 let NAMES = {}, NAMES_EN = {};
-fetch('names.json').then((r) => r.json()).then((n) => { NAMES = n.ru || {}; NAMES_EN = n.en || {}; renderSummary(); }).catch(() => {});
+let DESC = {}, STATUS_RU = {};
+fetch('names.json').then((r) => r.json()).then((n) => { NAMES = n.ru || {}; NAMES_EN = n.en || {}; DESC = n.desc || {}; STATUS_RU = n.status || {}; renderSummary(); }).catch(() => {});
 const nm = (k) => NAMES[k] || k;
 const STATUS = { no_fuel: 'нет топлива', no_power: 'нет питания', low_power: 'мало питания', not_plugged_in_electric_network: 'не подключено к сети',
   no_minable_resources: 'руда кончилась', missing_science_packs: 'нет колб', no_ammo: 'нет патронов', no_input_fluid: 'нет жидкости', missing_required_fluid: 'нет жидкости' };
@@ -571,7 +602,7 @@ function wikiUrl(name) {
 function showTip(el, pinned) {
   const name = el.dataset.item;
   tipFor = el;
-  tip.innerHTML = `<b>${esc(nm(name))}</b> × ${esc(el.dataset.n)}` + (pinned ? `<a href="${esc(wikiUrl(name))}" target="_blank" rel="noopener">открыть в вики ↗</a>` : '');
+  tip.innerHTML = `<b>${esc(nm(name))}</b>${el.dataset.n ? ' × ' + esc(el.dataset.n) : ''}` + (pinned ? `<a href="${esc(wikiUrl(name))}" target="_blank" rel="noopener">открыть в вики ↗</a>` : '');
   tip.classList.toggle('pinned', pinned);
   tip.classList.remove('hidden');
   const r = el.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
@@ -587,6 +618,222 @@ document.addEventListener('click', (e) => {
   if (el) showTip(el, true); else if (!tip.classList.contains('hidden')) hideTip();
 });
 window.addEventListener('scroll', () => { if (!tip.classList.contains('hidden')) hideTip(); }, true);
+
+// ---------- сведения о постройке ----------
+// Клик по карте выбирает постройку под курсором (как наведение в игре) и открывает окно с её состоянием и содержимым.
+// В тумане войны, как и в игре, ничего не выбирается.
+map.createPane('select').style.zIndex = 460; // рамка выбора — поверх слоёв карты
+map.getPane('select').style.pointerEvents = 'none';
+const ENT = { x: 0, y: 0, timer: null, box: null, html: '', gen: 0 };
+const watts = (w) => (w >= 1e9 ? `${+(w / 1e9).toFixed(2)} ГВт` : w >= 1e6 ? `${+(w / 1e6).toFixed(2)} МВт` : w >= 1e3 ? `${+(w / 1e3).toFixed(1)} кВт` : `${Math.round(w)} Вт`);
+const num = (v) => (v >= 100 ? Math.round(v) : +v.toFixed(1));
+const GREEN = new Set(['working', 'normal', 'fully_charged', 'charging', 'discharging', 'ghost', 'networks_connected', 'opened_by_circuit_network', 'turned_off_during_daytime', 'thrust_not_required', 'on_the_way']);
+const YELLOW = new Set(['low_power', 'full_output', 'waiting_for_source_items', 'item_ingredient_shortage', 'fluid_ingredient_shortage', 'waiting_for_space_in_destination', 'low_input_fluid', 'waiting_for_train', 'waiting_to_launch_rocket',
+  'preparing_rocket_for_launch', 'waiting_for_target_to_be_built', 'recharging_after_power_outage', 'low_temperature', 'not_enough_space_in_output', 'full_burnt_result_output', 'waiting_for_more_parts', 'item_production_overload', 'waiting_for_plants_to_grow', 'paused', 'computing_navigation', 'waiting_at_stop']);
+const INV = [[/burnt/, 'Отработанное топливо'], [/fuel/, 'Топливо'], [/module/, 'Модули'], [/ammo/, 'Боеприпасы'], [/input|source/, 'Сырьё'], [/output|result/, 'Продукция'], [/trash|dump/, 'Мусор'], [/armor/, 'Броня'], [/gun/, 'Оружие']];
+const invLabel = (n) => (INV.find(([re]) => re.test(n || '')) || [0, 'Содержимое'])[1];
+const kv = (k, v) => `<div><span class="k">${k}:</span> ${v}</div>`;
+const bar = (part, cls = '') => `<div class="bar ${cls}"><b style="width:${Math.max(0, Math.min(100, part * 100)).toFixed(1)}%"></b></div>`;
+function entHtml(e) {
+  const main = [];
+  if (DESC[e.name]) main.push(`<div class="desc">${esc(DESC[e.name])}</div>`);
+  if (e.player) main.push(kv('Игрок', esc(e.player)));
+  if (e.backer) main.push(kv('Станция', esc(e.backer)));
+  if (e.status) main.push(`<div class="st ${GREEN.has(e.status) ? '' : YELLOW.has(e.status) ? 'y' : 'r'}"><i></i>${esc(STATUS_RU[e.status.replace(/_/g, '-')] || STATUS[e.status] || e.status.replace(/_/g, ' '))}</div>`);
+  if (e.amount != null) main.push(kv('Количество', count(e.amount)));
+  if (e.belt_speed) main.push(kv('Скорость конвейера', `${num(e.belt_speed)} предметов/с`));
+  if (e.belt) main.push(`<div class="items">${list(e.belt).length ? list(e.belt).map(([n, c]) => slot(n, c)).join('') : '<span class="muted">пусто</span>'}</div>`);
+  if (e.speed != null) main.push(kv('Скорость производства', num(e.speed)));
+  if (e.prod) main.push(kv('Продуктивность', `+${Math.round(e.prod * 100)}%`));
+  if (e.finished) main.push(kv('Произведено', e.finished));
+  if (e.pollution > 0.01) main.push(kv('Загрязнение', `${num(e.pollution)}/мин`));
+  if (e.generated != null) main.push(kv('Выработка энергии', watts(e.generated)));
+  if (e.type === 'accumulator' && e.buffer) main.push(kv('Заряд', `${Math.round(100 * e.energy / e.buffer)}%`) + bar(e.energy / e.buffer, 'fuel'));
+  if (e.last_user) main.push(kv('Последний игрок', esc(e.last_user)));
+  if (e.health != null) main.push(kv('Здоровье', `${Math.round(e.health)}/${Math.round(e.max_health)}`));
+  const out = [`<section>${main.join('')}</section>`];
+  const sec = (title, rows) => out.push(`<section><h4>${title}</h4>${rows.join('')}</section>`);
+  if (e.recipe) {
+    const side = (l) => l.map(([, n, c]) => slot(n, num(c))).join('');
+    const rows = [`<div class="items">${side(e.recipe.ing)}<span class="arrow">→</span>${side(e.recipe.out)}</div>`];
+    if (e.progress != null) rows.push(bar(e.progress));
+    if (e.speed) rows.push(`<div class="muted">${num(e.recipe.time / e.speed)} с на цикл</div>`);
+    sec(`Рецепт: ${esc(nm(e.recipe.name))}`, rows);
+  }
+  if (e.mining) sec(`Добывает: ${esc(nm(e.mining))}`, [`<div class="items">${slot(e.mining, '')}</div>`, e.mining_progress != null ? bar(e.mining_progress) : '']);
+  if (e.held) sec('В манипуляторе', [`<div class="items">${slot(e.held[0], e.held[1])}</div>`]);
+  for (const f of list(e.fluids)) {
+    if (!f.name) { sec('Жидкость', ['<div class="muted">пусто</div>']); continue; }
+    sec(esc(nm(f.name)), [`<div class="items">${slot(f.name, Math.round(f.amount))}<span>${num(f.amount)}${f.cap ? ` из ${num(f.cap)}` : ''}</span></div>`, f.cap ? bar(f.amount / f.cap, 'fl') : '', f.temp != null && f.amount > 0 ? kv('Температура', `${num(f.temp)} °C`) : '']);
+  }
+  if (e.burner) {
+    const b = e.burner, rows = [];
+    if (e.max_power) rows.push(kv('Макс. потребление', watts(e.max_power)));
+    if (b.burning) rows.push(`<div class="items">${slot(b.burning, '')}<span class="muted">горит сейчас</span></div>`, b.value ? bar(b.remaining / b.value, 'fuel') : '');
+    sec('Потребляет топливо', rows);
+  } else if (e.electric && e.max_power) sec('Потребляет электричество', [kv('Макс. потребление', watts(e.max_power))]);
+  for (const inv of list(e.inv)) {
+    const items = list(inv.items);
+    if (!items.length && e.type === 'character') continue;
+    sec(invLabel(inv.name) + (inv.size > 1 && /chest|main|cargo|trunk/.test(inv.name || '') ? ` <span class="muted">(ячеек: ${inv.size})</span>` : ''), [`<div class="items">${items.length ? items.map(([n, c]) => slot(n, c)).join('') : '<span class="muted">пусто</span>'}</div>`]);
+  }
+  return out.join('');
+}
+const list = (v) => (Array.isArray(v) ? v : []); // пустая таблица Lua приходит объектом {}
+function drawEntBox(b) {
+  // Жёлтые уголки вокруг выбранной постройки, как в игре.
+  const [x1, y1, x2, y2] = b, d = Math.min(x2 - x1, y2 - y1) * 0.28;
+  const lines = [[[x1, y1 + d], [x1, y1], [x1 + d, y1]], [[x2 - d, y1], [x2, y1], [x2, y1 + d]], [[x2, y2 - d], [x2, y2], [x2 - d, y2]], [[x1 + d, y2], [x1, y2], [x1, y2 - d]]].map((l) => l.map(([x, y]) => ll(x, y)));
+  if (ENT.box) ENT.box.setLatLngs(lines); else ENT.box = L.polyline(lines, { color: '#ffd23a', weight: 3, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
+}
+function closeEnt() { ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = ''; $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
+async function loadEnt(first) {
+  const gen = ENT.gen;
+  let e;
+  try { e = await api(`api/entity?x=${ENT.x}&y=${ENT.y}`); } catch { return; }
+  if (gen !== ENT.gen) return;
+  if (!e || !e.name) return closeEnt(); // пусто, туман войны или постройку убрали
+  drawEntBox(e.box);
+  $('ent-name').textContent = nm(e.name) + (e.ghost ? ' (призрак)' : '');
+  const html = entHtml(e);
+  if (html !== ENT.html) { const body = $('ent'), keep = body.scrollTop; ENT.html = html; $('ent-body').innerHTML = html; body.scrollTop = first ? 0 : keep; }
+  $('ent').classList.remove('hidden');
+}
+map.on('click', (ev) => {
+  ENT.gen++; ENT.x = +ev.latlng.lng.toFixed(3); ENT.y = +ev.latlng.lat.toFixed(3);
+  clearInterval(ENT.timer);
+  loadEnt(true);
+  ENT.timer = setInterval(() => { if (!document.hidden) loadEnt(false); }, 1000);
+});
+$('ent-close').onclick = closeEnt;
+
+// ---------- слои карты ----------
+// Те же переключатели, что в виде карты в игре. Данные слоёв сервис читает из игры, пока слой включён хотя бы у одного зрителя.
+const LAYER_DEFS = [['logistics', 0, 'Логистические сети'], ['electric', 1, 'Электрические сети'], ['turrets', 2, 'Зоны покрытия турелей'], ['pollution', 3, 'Загрязнение'], ['stations', 4, 'Названия станций'], ['players', 5, 'Имена игроков'],
+  ['tags', 6, 'Теги'], ['robots', 7, 'Рабочие дроны'], ['signals', 8, 'Ж/д сигналы'], ['recipes', 9, 'Значки рецептов'], ['pipes', 10, 'Показывать трубопроводы']];
+let layersOn = new Set(['stations', 'players', 'tags']), layerData = {}, layerTimer = null;
+try { const v = JSON.parse(localStorage.getItem('layers')); if (Array.isArray(v)) layersOn = new Set(v); } catch { /* настройки по умолчанию */ }
+map.createPane('overlay').style.zIndex = 450; // над тайлами, под метками ботов и игроков
+map.getPane('overlay').style.pointerEvents = 'none';
+const canvas = document.createElement('canvas');
+canvas.id = 'overlay';
+map.getPane('overlay').appendChild(canvas);
+const icons = new Map(); // имя -> Image (первая, крупная копия иконки)
+function icon(name) {
+  let im = icons.get(name);
+  if (!im) { im = new Image(); im.onload = drawLayers; im.src = `icon/${encodeURIComponent(name)}.png`; icons.set(name, im); }
+  return im.complete && im.naturalWidth ? im : null;
+}
+function label(ctx, text, x, y, color) {
+  ctx.font = '600 12px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = ctx.measureText(text).width + 10;
+  ctx.fillStyle = 'rgba(17, 17, 17, .8)'; ctx.fillRect(x - w / 2, y - 9, w, 18);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+let zoomAnim = false;
+function drawLayers() {
+  const size = map.getSize(), dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== size.x * dpr || canvas.height !== size.y * dpr) { canvas.width = size.x * dpr; canvas.height = size.y * dpr; canvas.style.width = size.x + 'px'; canvas.style.height = size.y + 'px'; }
+  L.DomUtil.setPosition(canvas, map.containerPointToLayerPoint([0, 0]));
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size.x, size.y);
+  if (zoomAnim) return;
+  const o = map.latLngToContainerPoint(ll(0, 0)), k = 32 * 2 ** (map.getZoom() - ZMAX); // пикселей на клетку
+  const X = (x) => o.x + x * k, Y = (y) => o.y + y * k;
+  const seen = (x, y, r) => X(x + r) >= 0 && X(x - r) <= size.x && Y(y + r) >= 0 && Y(y - r) <= size.y;
+  const on = (n) => layersOn.has(n) && layerData[n];
+  let d;
+  if ((d = on('pollution'))) {
+    const c = list(d.chunks);
+    for (let i = 0; i < c.length; i += 3) if (seen(c[i] * 32 + 16, c[i + 1] * 32 + 16, 16)) {
+      ctx.fillStyle = `rgba(255, 0, 0, ${Math.min(0.55, 0.02 + c[i + 2] / 320).toFixed(3)})`;
+      ctx.fillRect(Math.floor(X(c[i] * 32)), Math.floor(Y(c[i + 1] * 32)), Math.ceil(32 * k), Math.ceil(32 * k));
+    }
+  }
+  if ((d = on('logistics'))) {
+    const p = list(d.ports);
+    for (const [j, color] of [[3, 'rgba(70, 200, 70, .16)'], [2, 'rgba(255, 150, 30, .28)']]) {
+      ctx.beginPath();
+      for (let i = 0; i < p.length; i += 4) if (seen(p[i], p[i + 1], p[i + j])) ctx.rect(X(p[i] - p[i + j]), Y(p[i + 1] - p[i + j]), 2 * p[i + j] * k, 2 * p[i + j] * k);
+      ctx.fillStyle = color; ctx.fill();
+    }
+  }
+  if ((d = on('electric'))) {
+    const p = list(d.poles), w = list(d.wires);
+    ctx.beginPath();
+    for (let i = 0; i < p.length; i += 3) if (seen(p[i], p[i + 1], p[i + 2])) ctx.rect(X(p[i] - p[i + 2]), Y(p[i + 1] - p[i + 2]), 2 * p[i + 2] * k, 2 * p[i + 2] * k);
+    ctx.fillStyle = 'rgba(60, 150, 255, .26)'; ctx.fill();
+    ctx.beginPath();
+    for (let i = 0; i < w.length; i += 4) { ctx.moveTo(X(w[i]), Y(w[i + 1])); ctx.lineTo(X(w[i + 2]), Y(w[i + 3])); }
+    ctx.strokeStyle = 'rgba(150, 215, 255, .95)'; ctx.lineWidth = Math.max(1, Math.min(3, k * 0.1)); ctx.stroke();
+    if (k >= 3) { ctx.fillStyle = '#eaf6ff'; for (let i = 0; i < p.length; i += 3) if (seen(p[i], p[i + 1], 1)) { const r = Math.max(1.5, k * 0.16); ctx.fillRect(X(p[i]) - r, Y(p[i + 1]) - r, 2 * r, 2 * r); } }
+  }
+  if ((d = on('turrets'))) {
+    const t = list(d.turrets);
+    ctx.beginPath();
+    for (let i = 0; i < t.length; i += 3) if (seen(t[i], t[i + 1], t[i + 2])) { ctx.moveTo(X(t[i]) + t[i + 2] * k, Y(t[i + 1])); ctx.arc(X(t[i]), Y(t[i + 1]), t[i + 2] * k, 0, 2 * Math.PI); }
+    ctx.fillStyle = 'rgba(230, 60, 40, .2)'; ctx.fill('nonzero');
+  }
+  if ((d = on('pipes'))) {
+    const col = (n) => { const c = d.colors && d.colors[n]; return c ? `rgb(${c.map((v) => Math.round(60 + v * 195)).join(',')})` : '#9a9a9a'; };
+    for (const [x1, y1, x2, y2, n] of list(d.pipes)) if (seen((x1 + x2) / 2, (y1 + y2) / 2, 3)) { ctx.fillStyle = col(n); ctx.fillRect(X(x1), Y(y1), Math.max(1.5, (x2 - x1) * k), Math.max(1.5, (y2 - y1) * k)); }
+    ctx.lineWidth = Math.max(1, k * 0.25); ctx.setLineDash([Math.max(2, k * 0.4), Math.max(2, k * 0.3)]);
+    for (const [x1, y1, x2, y2, n] of list(d.links)) { ctx.strokeStyle = col(n); ctx.beginPath(); ctx.moveTo(X(x1), Y(y1)); ctx.lineTo(X(x2), Y(y2)); ctx.stroke(); }
+    ctx.setLineDash([]);
+  }
+  if ((d = on('recipes')) && k >= 5) {
+    for (const [x, y, s, n] of list(d.machines)) if (seen(x, y, 3)) {
+      const px = Math.max(14, Math.min(64, s * k * 0.75)), im = icon(n);
+      ctx.fillStyle = 'rgba(0, 0, 0, .55)'; ctx.beginPath(); ctx.arc(X(x), Y(y), px * 0.6, 0, 2 * Math.PI); ctx.fill();
+      if (im) ctx.drawImage(im, 0, 0, im.naturalHeight, im.naturalHeight, X(x) - px / 2, Y(y) - px / 2, px, px);
+    }
+  }
+  if ((d = on('signals'))) {
+    const s = list(d.signals), st = d.states || {};
+    for (let i = 0; i < s.length; i += 3) if (seen(s[i], s[i + 1], 1)) {
+      ctx.fillStyle = s[i + 2] === st.open ? '#3fe04a' : s[i + 2] === st.closed ? '#f03a2a' : s[i + 2] === st.reserved ? '#f0d232' : '#4aa3ff';
+      ctx.beginPath(); ctx.arc(X(s[i]), Y(s[i + 1]), Math.max(2.5, k * 0.35), 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+  if ((d = on('robots'))) {
+    const r = list(d.robots), px = Math.max(1.5, Math.min(5, k * 0.2));
+    for (let i = 0; i < r.length; i += 3) if (seen(r[i], r[i + 1], 1)) { ctx.fillStyle = r[i + 2] ? '#ffb347' : '#e8f4ff'; ctx.fillRect(X(r[i]) - px, Y(r[i + 1]) - px, 2 * px, 2 * px); }
+  }
+  if ((d = on('tags'))) {
+    for (const [x, y, text, type, n] of list(d.tags)) if (seen(x, y, 40 / k + 1)) {
+      const im = n && type !== 'virtual' ? icon(n) : null;
+      if (im) ctx.drawImage(im, 0, 0, im.naturalHeight, im.naturalHeight, X(x) - 12, Y(y) - 12, 24, 24);
+      else { ctx.fillStyle = '#ffd23a'; ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(x), Y(y), 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke(); }
+      if (text) label(ctx, text, X(x), Y(y) + 22, '#ffe6c0');
+    }
+  }
+  if ((d = on('stations'))) for (const [x, y, name] of list(d.stops)) if (seen(x, y, 40 / k + 1)) label(ctx, '🚉 ' + name, X(x), Y(y) - 14, '#fff');
+}
+map.on('move zoom viewreset resize', drawLayers);
+map.on('zoomanim', () => { zoomAnim = true; drawLayers(); });
+map.on('zoomend', () => { zoomAnim = false; drawLayers(); });
+async function loadLayers() {
+  const want = [...layersOn].filter((l) => l !== 'players');
+  if (!want.length || document.hidden) return;
+  try { Object.assign(layerData, await api('api/layers?l=' + want.join(','))); drawLayers(); } catch { /* следующая попытка по таймеру */ }
+}
+function syncLayers() {
+  $('layers').innerHTML = LAYER_DEFS.map(([id, row, title]) => `<button data-l="${id}" title="${title}" class="${layersOn.has(id) ? 'on' : ''}"><i style="background-position:0 ${-row * 32}px"></i></button>`).join('');
+  map.getContainer().classList.toggle('nonames', !layersOn.has('players'));
+  for (const k of Object.keys(layerData)) if (!layersOn.has(k)) delete layerData[k];
+  drawLayers();
+}
+$('layers').onclick = (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const id = b.dataset.l;
+  if (layersOn.has(id)) layersOn.delete(id); else layersOn.add(id);
+  try { localStorage.setItem('layers', JSON.stringify([...layersOn])); } catch { /* без сохранения */ }
+  syncLayers(); loadLayers();
+};
+syncLayers(); loadLayers();
+setInterval(loadLayers, 2500);
 
 // ---------- сводка ----------
 let summary = null, events = [];
