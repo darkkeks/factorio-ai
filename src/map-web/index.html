@@ -892,6 +892,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.now) offset = m.now - Date.now();
+    if (m.t === 'reset') return location.reload(); // на сервере другая карта: всё накопленное на странице — от прежней
     if (m.t === 'hello') {
       sweepMs = m.sweep_ms;
       if (m.cam) camSize = m.cam;

@@ -69,6 +69,8 @@ const list = (v) => (Array.isArray(v) ? v : []); // пустая таблица 
 const LUA = {
   live: `
     local out = {tick=game.tick, paused=game.tick_paused, bots={}, players={}, chat={}}
+    -- По зерну генерации узнаём, что на сервере другая карта.
+    out.map = tostring(game.surfaces[A.surface].map_gen_settings.seed)
     -- Чем занят бот — той же строкой, что мод показывает над его головой (v2/mod/agent/gui.lua, G.describe):
     -- первое действие очереди, цель ходьбы, сколько предметов уже обработано, сколько действий ждёт следом.
     local ACTIONS = {walk_to='идёт', mine='добывает', place='строит', build_ghosts='строит по плану', transfer='перекладывает',
@@ -293,7 +295,8 @@ const broadcast = (msg) => { const s = JSON.stringify({ ...msg, now: Date.now() 
 async function liveLoop() {
   for (;;) {
     try {
-      const r = await lua(LUA.live, { camera: CAMERA, since: chatSeq });
+      const r = await lua(LUA.live, { camera: CAMERA, since: chatSeq, surface: SURFACE });
+      checkMap(r.map, r.tick);
       const here = (a) => list(a).filter((p) => p.surface === SURFACE).map((p) => ({ name: p.name, x: +p.x.toFixed(2), y: +p.y.toFixed(2), ...(p.act ? { act: String(p.act).slice(0, 80) } : {}) }));
       if (!live.ok && quickFails < 3) nextStart = 0; // сервер игры снова отвечает — камеру можно пробовать сразу
       if (r.paused && !pausedAt) pausedAt = Date.now();
@@ -725,8 +728,33 @@ async function renderLoop() {
 // --- то, что переживает перезапуск сервиса: схемы чанков и из чего собран каждый тайл ---
 
 const FOG_BIN = path.join(TILES, 'fog.bin'), FOG_IDX = path.join(TILES, 'fog.json'), TILE_IDX = path.join(TILES, 'index.json');
+// ---------- смена карты ----------
+// На сервере карту иногда меняют или откатывают из резервной копии. Тогда всё накопленное (тайлы, схемы тумана
+// войны) — от другой карты, и его надо выбросить. Карту узнаём по зерну генерации; откат — по тому, что время
+// игры ушло назад больше чем на час (при обычном перезапуске сервера теряется не больше минут автосохранения).
+const MAP_ID = path.join(TILES, 'map.json');
+const ROLLBACK_TICKS = 216_000;
+let mapId = null, mapTick = 0;
+try { ({ id: mapId, tick: mapTick } = JSON.parse(fs.readFileSync(MAP_ID, 'utf8'))); } catch { /* ещё не записано */ }
+function checkMap(id, tick) {
+  if (!id) return;
+  const why = mapId === null ? 'карта кеша неизвестна' : id !== mapId ? `другая карта (зерно ${mapId} → ${id})` : tick < mapTick - ROLLBACK_TICKS ? `карту откатили (тик ${mapTick} → ${tick})` : '';
+  mapTick = tick;
+  if (!why) return;
+  mapId = id;
+  log(`${why} — кеш карты сброшен: тайлов ${tiles.size}, схем чанков ${chunks.size}`);
+  tiles.clear(); chunks.clear(); colors.ents.clear(); colors.tiles.clear();
+  chunksKnown = false; fogChanged = false; indexChanged = false;
+  events = []; chatSeq = 0; summary = null;
+  fs.rmSync(TILES, { recursive: true, force: true });
+  fs.mkdirSync(TILES, { recursive: true });
+  fs.writeFileSync(MAP_ID, JSON.stringify({ id: mapId, tick: mapTick }));
+  broadcast({ t: 'reset' }); // открытые страницы перезагрузятся и получат пустую карту
+}
+
 function saveState() {
   try {
+    if (mapId) fs.writeFileSync(MAP_ID, JSON.stringify({ id: mapId, tick: mapTick }));
     if (fogChanged) {
       const have = [...chunks.values()].filter((c) => c.snap);
       fs.writeFileSync(FOG_BIN + '.tmp', Buffer.concat(have.map((c) => c.snap)));
