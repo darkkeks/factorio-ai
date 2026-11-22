@@ -47,7 +47,8 @@ const ZMAX = 5;                // самый подробный уровень: 
                                // уровень 0 — масштаб 1/32, меньше игра снимать не умеет
 const JPEG_QUALITY = 75;
 const FRESH_MS = 5_000;        // цель для участков вокруг ботов и игроков
-const VIEW_MS = 2_000;         // цель для того, на что смотрят зрители (сколько успеет камера)
+const VIEW_MS = Number(process.env.MAP_VIEW_MS || 500); // чаще этого то, на что смотрят зрители, не переснимаем; реже — насколько хватает камеры:
+                               // она делит свою скорость на всех, поэтому чем меньше зрителей и чем уже их вид, тем чаще обновление
 const SWEEP_MS = 600_000;      // цель полного фонового обхода
 const BATCH = Number(process.env.MAP_BATCH || 16);               // снимков в одной команде RCON
 const PAUSE_MS = 20;           // пауза между пачками
@@ -285,7 +286,7 @@ let live = { tick: 0, paused: false, bots: [], players: [], ok: false, camera: f
 let summary = null;
 let events = [];           // лента: сообщения ботов и решения по заявкам из игрового чата ботов
 let chatSeq = 0;
-let rendered = 0;
+let rendered = 0, unchanged = 0;
 
 const send = (ws, msg) => { if (ws.readyState === 1 && ws.bufferedAmount < 4_000_000) ws.send(JSON.stringify(msg)); };
 const broadcast = (msg) => { const s = JSON.stringify({ ...msg, now: Date.now() }); for (const ws of clients) if (ws.readyState === 1 && ws.bufferedAmount < 4_000_000) ws.send(s); };
@@ -583,9 +584,12 @@ function fogImage(t, bpp) {
   return img;
 }
 
-function publish(t, st, fog, updates) {
+// ts — когда тайл последний раз сверен с игрой, ver — когда его картинка последний раз изменилась (версия файла в адресе).
+// Если новый снимок совпал с прежним байт в байт, зрителю незачем качать его заново: меняется только ts.
+function publish(t, st, fog, updates, changed = true) {
   t.ts = Date.now(); t.sig = st.sig; t.fog = fog; t.vis = st.vis; t.dirty = false;
-  updates.push([t.z, t.x, t.y, t.ts, fog ? 1 : 0]);
+  if (changed || !t.ver) t.ver = t.ts;
+  updates.push([t.z, t.x, t.y, t.ts, fog ? 1 : 0, t.ver]);
   indexChanged = true;
 }
 let indexChanged = false;
@@ -632,14 +636,18 @@ function pick() {
   const now = Date.now(), due = [];
   for (const [k, t] of tiles) {
     if (!(t.vis > 0)) continue;                             // целиком в тумане — не снимаем
-    if (t.dirty) { due.push([viewed.has(k) ? Infinity : 1e9, t]); continue; }
+    if (t.dirty) { due.push([viewed.has(k) ? Infinity : 1e9, t, viewed.has(k)]); continue; }
     if (live.paused && pausedAt && t.ts > pausedAt) continue; // на паузе картинка не меняется
     const want = viewed.has(k) ? VIEW_MS : hot.has(k) ? FRESH_MS : SWEEP_MS;
     const score = (now - t.ts) / want;
-    if (score >= 1) due.push([score, t]);
+    if (score >= 1) due.push([score, t, viewed.has(k)]);
   }
   due.sort((a, b) => b[0] - a[0]);
-  return due.slice(0, BATCH).map((d) => d[1]);
+  // Зрители могут занять камеру целиком, поэтому четверть каждой пачки оставлена остальному
+  // (участки вокруг ботов и фоновый обход); незанятые места достаются тем, кому есть что снимать.
+  const seen = due.filter((d) => d[2]), rest = due.filter((d) => !d[2]);
+  const keep = Math.min(rest.length, Math.max(BATCH / 4, BATCH - seen.length));
+  return [...rest.slice(0, keep), ...seen.slice(0, BATCH - keep)].map((d) => d[1]);
 }
 
 const jpegDone = (file) => {
@@ -673,9 +681,11 @@ async function finishShot(t, src, updates) {
   const st = tileState(t);
   try {
     if (st.vis === 0) { t.vis = 0; t.dirty = true; return; }           // пока снимали, всё ушло в туман — соберёт fogLoop
-    if (st.vis === st.total) { fs.mkdirSync(path.join(TILES, String(t.z)), { recursive: true }); fs.renameSync(src, tileFile(t.z, t.x, t.y)); }
-    else writeTile(t, await overlay(src, fogImage(t, 4)));
-    publish(t, st, false, updates);
+    const data = st.vis === st.total ? fs.readFileSync(src) : await overlay(src, fogImage(t, 4));
+    const hash = crypto.createHash('md5').update(data).digest('hex');
+    const same = hash === t.hash && st.sig === t.sig && !t.fog;
+    if (same) unchanged++; else { writeTile(t, data); t.hash = hash; }
+    publish(t, st, false, updates, !same);
     rendered++;
   } catch (e) { log(`тайл ${key(t.z, t.x, t.y)}:`, e.message); }
   finally { fs.rmSync(src, { force: true }); }
@@ -764,7 +774,7 @@ function saveState() {
     }
     if (indexChanged) {
       const idx = {};
-      for (const [k, t] of tiles) if (t.sig) idx[k] = [t.ts, t.sig, t.fog ? 1 : 0];
+      for (const [k, t] of tiles) if (t.sig) idx[k] = [t.ts, t.sig, t.fog ? 1 : 0, t.ver || t.ts];
       fs.writeFileSync(TILE_IDX + '.tmp', JSON.stringify(idx));
       fs.renameSync(TILE_IDX + '.tmp', TILE_IDX);
       indexChanged = false;
@@ -775,10 +785,10 @@ function loadState() {
   try {
     const idx = JSON.parse(fs.readFileSync(FOG_IDX, 'utf8')), bin = fs.readFileSync(FOG_BIN);
     idx.forEach(([x, y, v], i) => chunks.set(ckey(x, y), { x, y, vis: null, snap: Buffer.from(bin.subarray(i * 3072, i * 3072 + 3072)), snapV: v, snapTs: 0, tiles: null, tnames: null, tilesTs: 0 }));
-    for (const [k, [ts, sig, fog]] of Object.entries(JSON.parse(fs.readFileSync(TILE_IDX, 'utf8')))) {
+    for (const [k, [ts, sig, fog, ver]] of Object.entries(JSON.parse(fs.readFileSync(TILE_IDX, 'utf8')))) {
       const [z, x, y] = k.split('/').map(Number);
       // Тайлы из снимков после запуска переснимаем (dirty): так случайно испорченный тайл не живёт дольше одного запуска.
-      if (fs.existsSync(tileFile(z, x, y))) tiles.set(k, { z, x, y, ts, sig, fog: !!fog, vis: 0, dirty: !fog });
+      if (fs.existsSync(tileFile(z, x, y))) tiles.set(k, { z, x, y, ts, ver: ver || ts, sig, fog: !!fog, vis: 0, dirty: !fog });
     }
     log(`загружено: схем чанков ${chunks.size}, тайлов ${tiles.size}`);
   } catch { /* первый запуск: всё соберётся заново */ }
@@ -1379,7 +1389,7 @@ wss.on('connection', (ws) => {
   if (clients.size >= MAX_CLIENTS) return ws.close(1013, 'слишком много зрителей');
   clients.add(ws);
   const tl = [];
-  for (const t of tiles.values()) if (t.sig) tl.push([t.z, t.x, t.y, t.ts, t.fog ? 1 : 0]);
+  for (const t of tiles.values()) if (t.sig) tl.push([t.z, t.x, t.y, t.ts, t.fog ? 1 : 0, t.ver || t.ts]);
   send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, summary, events, live, now: Date.now() });
   ws.on('message', (data) => {
     try {
@@ -1391,6 +1401,7 @@ wss.on('connection', (ws) => {
         if ((kind === 'bot' ? live.bots : live.players).some((a) => a.name === m.name)) target = { kind, name: m.name, by: ws, since: Date.now() };
         return;
       }
+      if (m.t === 'view' && m.none) { ws.view = []; return; } // вкладка зрителя скрыта: ради неё камеру не гоняем
       if (m.t !== 'view' || ![m.x1, m.y1, m.x2, m.y2, m.z].every(Number.isFinite)) return;
       const z = Math.max(0, Math.min(ZMAX, Math.round(m.z))), s = span(z);
       const x1 = Math.floor(Math.min(m.x1, m.x2) / s), x2 = Math.floor(Math.max(m.x1, m.x2) / s);
@@ -1408,7 +1419,7 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, HOST, () => log(`карта слушает http://${HOST}:${PORT}`));
-setInterval(() => { log(`зрителей ${clients.size}, тайлов ${tiles.size}, снято за минуту ${rendered}, камера ${live.camera ? 'в игре' : 'не в игре'}`); rendered = 0; }, 60_000);
+setInterval(() => { log(`зрителей ${clients.size}, тайлов ${tiles.size}, снято за минуту ${rendered} (без изменений ${unchanged}), камера ${live.camera ? 'в игре' : 'не в игре'}`); rendered = 0; unchanged = 0; }, 60_000);
 // Штатная остановка сервиса останавливает и клиент-камеру; после падения сервиса клиент остаётся, и следующий запуск его подхватит.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {

@@ -198,7 +198,8 @@ const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0.
 // ---------- тайлы с версиями ----------
 const tiles = new Map(); // "z/x/y" -> когда снят по часам сервера (0 — ещё не снят)
 const shown = new Map(); // "z/x/y" -> <img> на экране
-const tileUrl = (k) => `tiles/${k}.jpg?v=${tiles.get(k)}`;
+const vers = new Map();  // "z/x/y" -> версия картинки: меняется, только когда новый снимок отличается от прежнего
+const tileUrl = (k) => `tiles/${k}.jpg?v=${vers.get(k)}`;
 const EMPTY = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
 const Base = L.GridLayer.extend({
   createTile(c) {
@@ -223,7 +224,7 @@ function refreshTile(k) {
 }
 
 const fogTiles = new Set(); // тайлы целиком в тумане войны: они не устаревают, пока чанк снова не увидят
-function setTile(z, x, y, ts, fog) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); if (fog) fogTiles.add(k); else fogTiles.delete(k); return k; }
+function setTile(z, x, y, ts, fog, ver) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); vers.set(k, ver || ts); if (fog) fogTiles.add(k); else fogTiles.delete(k); return k; }
 
 // ---------- свежесть ----------
 let offset = 0, sweepMs = 600000, paused = false;
@@ -877,6 +878,7 @@ if (innerWidth > 900) $('side').classList.remove('hidden');
 let ws = null;
 function wsSend(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 function sendView() {
+  if (document.hidden) return wsSend({ t: 'view', none: true }); // скрытая вкладка не занимает камеру и не качает тайлы
   const b = map.getBounds();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'view', x1: b.getWest(), x2: b.getEast(), y1: b.getSouth(), y2: b.getNorth(), z: viewZ() }));
 }
@@ -886,6 +888,7 @@ map.on('moveend', () => {
   sendView();
   updateFresh();
 });
+document.addEventListener('visibilitychange', sendView);
 function connect() {
   ws = new WebSocket(new URL('ws', location.href.split('#')[0]).href.replace(/^http/, 'ws'));
   ws.onopen = sendView;
@@ -898,13 +901,14 @@ function connect() {
       if (m.cam) camSize = m.cam;
       tiles.clear();
       fogTiles.clear();
-      for (const [z, x, y, ts, fog] of m.tiles) setTile(z, x, y, ts, fog);
+      vers.clear();
+      for (const [z, x, y, ts, fog, ver] of m.tiles) setTile(z, x, y, ts, fog, ver);
       for (const k of shown.keys()) refreshTile(k);
       summary = m.summary; events = m.events || [];
       renderSummary(); renderEvents(); onLive(m.live);
     } else if (m.t === 'live') onLive(m);
     else if (m.t === 'tiles') {
-      for (const [z, x, y, ts, fog] of m.up) refreshTile(setTile(z, x, y, ts, fog));
+      for (const [z, x, y, ts, fog, ver] of m.up) { const old = vers.get(`${z}/${x}/${y}`), k = setTile(z, x, y, ts, fog, ver); if (vers.get(k) !== old) refreshTile(k); }
     } else if (m.t === 'summary') { summary = m.summary; renderSummary(); }
     else if (m.t === 'events') { events = events.concat(m.items).slice(-100); renderEvents(); }
   };
