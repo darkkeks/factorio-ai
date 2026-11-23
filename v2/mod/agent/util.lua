@@ -5,6 +5,11 @@ local U = {}
 -- сервер на хосте заменяет её на [].
 U.EMPTY = '\1[]'
 
+-- Результат, уже закодированный в JSON (большие ответы графа фабрики кодируются своим кодировщиком — см. graph.lua):
+-- main.lua вставляет строку в ответ как есть.
+U.RAW = {}
+function U.raw(json) return {[U.RAW] = json} end
+
 --- Прервать операцию ошибкой единого вида {code, message, data}.
 function U.fail(code, message, data)
   error({code = code, message = message, data = data}, 0)

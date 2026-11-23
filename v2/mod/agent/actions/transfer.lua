@@ -5,6 +5,7 @@ local T = require('agent.target')
 local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
 local Inv = require('agent.inv')
+local Graph = require('agent.graph')
 
 local BELT = {['transport-belt'] = true, ['underground-belt'] = true, splitter = true, ['lane-splitter'] = true, loader = true, ['loader-1x1'] = true}
 
@@ -182,6 +183,8 @@ local function transfer_one(A, it)
       U.fail('no_item', 'в ' .. ent.name .. ' нет ' .. (it.item or 'предметов'), {item = it.item})
     end
   end
+  -- Модули меняют скорость и продуктивность машины (у маяка — машин вокруг): запись в графе пересобирается.
+  if it.inventory == 'modules' or (it.direction == 'put' and prototypes.item[it.item].type == 'module') then Graph.touch(ent) end
   return {moved = total, items = moved, from_ammo = from_ammo}
 end
 

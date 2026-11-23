@@ -23,10 +23,14 @@ require('agent.observe')
 require('agent.stats')
 local Fog = require('agent.fog')
 local Gui = require('agent.gui')
+local Graph = require('agent.graph')
 
 local M = {events = {}}
 
 local function reply(ok, body)
+  if ok and type(body) == 'table' and body[U.RAW] then
+    return '{"ok":true,"tick":' .. string.format('%d', game.tick) .. ',"result":' .. body[U.RAW] .. '}'
+  end
   local r = {ok = ok, tick = game.tick}
   if ok then r.result = body else r.error = body end
   return helpers.table_to_json(r)
@@ -111,6 +115,7 @@ end
 for id, fn in pairs(E.handlers) do listen(id, fn) end
 for id, fn in pairs(Fog.handlers) do listen(id, fn) end
 for id, fn in pairs(Gui.handlers) do listen(id, fn) end
+for id, fn in pairs(Graph.handlers) do listen(id, fn) end
 for id, list in pairs(chains) do
   M.events[id] = guarded(#list == 1 and list[1] or function(ev)
     for _, fn in ipairs(list) do fn(ev) end

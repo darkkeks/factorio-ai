@@ -8,6 +8,7 @@ local B = require('agent.actions.build')
 local Inv = require('agent.inv')
 local O = require('agent.ops')
 local Fog = require('agent.fog')
+local Graph = require('agent.graph')
 
 local WIRE = {
   red = defines.wire_connector_id.circuit_red,
@@ -364,8 +365,11 @@ local function configure_one(A, it)
       a.connect_to(b, false)
       done.wire = 'connected'
     end
+    Graph.touch(other) -- медный провод меняет список соседей у обоих столбов
   end
 
+  -- Рецепт, поворот, фильтры, приоритеты, копия настроек меняют запись постройки, а событий игры не поднимают.
+  Graph.touch(ent)
   return B.describe(ent, done)
 end
 

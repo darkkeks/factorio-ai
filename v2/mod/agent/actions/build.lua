@@ -6,6 +6,7 @@ local Q = require('agent.queue')
 local Tour = require('agent.actions.tour')
 local Plans = require('agent.plans')
 local E = require('agent.events')
+local Graph = require('agent.graph')
 
 local B = {}
 
@@ -90,6 +91,7 @@ local function pole_from_ghost(g, quality)
       if oc and not c.is_connected_to(oc) then c.connect_to(oc) end
     end
   end
+  Graph.touch(n) -- провода протянуты после события постройки
   return n
 end
 
@@ -113,6 +115,7 @@ local function place_one(A, it)
         end
         c.direction = dir
         res.rotated = true
+        Graph.touch(c)
       end
       return describe(c, res)
     end
@@ -123,7 +126,7 @@ local function place_one(A, it)
     U.fail('no_item', 'в инвентаре нет ' .. U.item_key(it.item, quality), {item = it.item, need = need})
   end
 
-  local n, replaced
+  local n, replaced, gone
   -- Призрак этой же постройки в этой точке: оживляем его — настройки призрака (рецепт, фильтры) сохраняются.
   for _, g in pairs(s.find_entities_filtered{type = 'entity-ghost', position = pos, radius = 0.6, force = force}) do
     if g.valid and g.ghost_name == proto.name and U.dist(g.position, pos) < 0.51 and g.quality.name == quality then
@@ -155,6 +158,7 @@ local function place_one(A, it)
       -- Быстрая замена на месте: старая постройка возвращается в инвентарь, содержимое и настройки сохраняются.
       local old = s.find_entities_filtered{position = pos, force = force, type = proto.type}[1]
       replaced = old and old.name or true
+      gone = Graph.info(old) -- старая постройка исчезнет без события сноса
       args.fast_replace, args.character, args.spill = true, e, false
     elseif not s.can_place_entity{name = proto.name, position = pos, direction = dir, force = force,
         build_check_type = defines.build_check_type.manual} then
@@ -163,6 +167,7 @@ local function place_one(A, it)
     args.raise_built = true
     n = s.create_entity(args)
     if not n then U.fail('blocked', 'сюда поставить нельзя') end
+    if gone and gone.u ~= n.unit_number then Graph.gone(gone) end
   end
 
   e.remove_item{name = it.item, count = need, quality = quality}
@@ -228,9 +233,11 @@ local function build_ghost(A, it)
     local item, need = item_for(e, target, qn)
     if not item then U.fail('no_item', 'в инвентаре нет ' .. U.item_key(need or target.name, qn), {item = need or target.name}) end
     local old = g.name
+    local gone = Graph.info(g)
     local n = g.surface.create_entity{name = target.name, position = g.position, direction = g.direction, force = g.force,
       quality = qn, fast_replace = true, character = e, spill = false, raise_built = true}
     if not n then U.fail('blocked', 'замена на месте не удалась') end
+    if gone and gone.u ~= n.unit_number then Graph.gone(gone) end
     e.remove_item{name = item, count = need, quality = qn}
     E.tally('entities_built', A.name, n)
     return describe(n, {replaced = old})
@@ -259,8 +266,13 @@ local function build_ghost(A, it)
     local args = {name = name, position = g.position, direction = g.direction, force = g.force, quality = quality,
       fast_replace = true, character = e, spill = false, raise_built = true}
     if g.ghost_type == 'underground-belt' then args.type = g.belt_to_ground_type end
+    local gone
+    for _, o in pairs(g.surface.find_entities_filtered{position = g.position, force = g.force}) do
+      if o.type ~= 'entity-ghost' and Graph.TYPES[o.type] then gone = Graph.info(o) break end
+    end
     local n = g.surface.create_entity(args)
     if n then
+      if gone and gone.u ~= n.unit_number then Graph.gone(gone) end -- замещённая постройка исчезает без события сноса
       if g.valid then g.destroy() end
       e.remove_item{name = item, count = need, quality = quality}
       E.tally('entities_built', A.name, n)
