@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
+import { handleV2, wssV2 } from './map-v2.mjs';
 import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
@@ -1320,6 +1321,7 @@ const server = http.createServer(async (req, res) => {
       return reply(200, 'application/json', '{"ok":true}');
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return reply(405, 'text/plain', '');
+    if (url.pathname.startsWith('/v2') && handleV2(url, reply)) return; // прототип v2 (src/map-v2.mjs)
     if (url.pathname === '/') return reply(200, 'text/html; charset=utf-8', fs.readFileSync(path.join(WEB, 'index.html')));
     const ic = url.pathname.match(/^\/icon\/([a-z0-9-]{1,80})\.png$/);
     if (ic) {
@@ -1386,7 +1388,7 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 2048 });
 const wssVideo = new WebSocketServer({ noServer: true, maxPayload: 64 });
 server.on('upgrade', (req, socket, headUp) => {
   const p = new URL(req.url, 'http://x').pathname;
-  const target = p === '/ws' ? wss : p === '/video' ? wssVideo : null;
+  const target = p === '/ws' ? wss : p === '/video' ? wssVideo : p === '/v2/ws' ? wssV2 : null;
   if (!target) return socket.destroy();
   target.handleUpgrade(req, socket, headUp, (ws) => target.emit('connection', ws, req));
 });

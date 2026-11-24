@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Карта Factorio v2</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #000; color: #e8e6e1; font: 14px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #info { position: absolute; left: 10px; top: 10px; padding: 5px 10px; background: rgba(24, 24, 24, .9); border: 1px solid #3a3a3a; border-radius: 4px; pointer-events: none; }
+  #info b { color: #ffcc33; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"><b>v2 · прототип</b> — игра рисуется в браузере из очереди отрисовки клиента. <span id="st">подключение…</span></div>
+<script>
+'use strict';
+// Прототип: кадр — список «спрайт № n в точке (x, y) с масштабом и цветом», присланный сервисом по WebSocket.
+// Картинки спрайтов — вырезки из атласов игры (/v2/sprite/<поколение>/<n>.png), грузятся по мере появления.
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
+let gen = '', frame = null, frameN = 0, dirty = true;
+let view = { x: 0, y: 0, k: 24, auto: true }; // центр в клетках, пикселей на клетку
+
+function load(s) {
+  s.img = new Image();
+  s.img.onload = () => { s.ok = true; dirty = true; };
+  s.img.onerror = () => { s.img = null; }; // атлас ещё не пришёл — попробуем позже
+  s.img.src = `sprite/${gen}/${s.n}.png`;
+}
+function connect() {
+  const ws = new WebSocket(new URL('ws', location.href).href.replace(/^http/, 'ws'));
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { frame = new Int32Array(e.data); frameN++; dirty = true; return; }
+    const m = JSON.parse(e.data);
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; }
+    else if (m.t === 'sprites') for (const s of m.list) spr[s.n] = s;
+    else if (m.t === 'atlas') for (const s of spr) if (s && !s.ok && !s.img) load(s);
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+connect();
+
+function draw() {
+  requestAnimationFrame(draw);
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; dirty = true; }
+  if (!dirty || !frame) return;
+  dirty = false;
+  const f = frame, n = f.length / 7;
+  // Порядок: слой, затем сверху вниз — так игра сортирует свою очередь.
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  order.sort((a, b) => (f[a * 7 + 6] & 255) - (f[b * 7 + 6] & 255) || f[a * 7 + 2] - f[b * 7 + 2] || f[a * 7 + 1] - f[b * 7 + 1]);
+  if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * 7 + 1]; sy += f[i * 7 + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = true;
+  let shown = 0, missing = 0;
+  for (const i of order) {
+    const o = i * 7, s = spr[f[o]];
+    if (!s) continue;
+    if (!s.ok) { if (!s.img) load(s); missing++; continue; }
+    const kx = f[o + 3] / 1000, ky = f[o + 4] / 1000, tint = f[o + 5] >>> 0;
+    const w = s.w * s.sc * kx / 32, h = s.h * s.sc * ky / 32;               // размер в клетках
+    const cx = f[o + 1] / 256 + s.sx * kx, cy = f[o + 2] / 256 + s.sy * ky;  // центр в клетках
+    const px = (cx - w / 2 - view.x) * view.k + W / 2, py = (cy - h / 2 - view.y) * view.k + H / 2;
+    if (px > W || py > H || px + w * view.k < 0 || py + h * view.k < 0) continue;
+    ctx.globalAlpha = (tint >>> 24) / 255;
+    ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
+    shown++;
+  }
+  ctx.globalAlpha = 1;
+  document.getElementById('st').textContent = `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length}`;
+}
+draw();
+
+// Перетаскивание и зум колесом/щипком.
+let drag = null;
+cv.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY }; view.auto = false; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', (e) => { if (!drag) return; view.x -= (e.clientX - drag.x) / view.k; view.y -= (e.clientY - drag.y) / view.k; drag = { x: e.clientX, y: e.clientY }; dirty = true; });
+cv.addEventListener('pointerup', () => { drag = null; });
+cv.addEventListener('wheel', (e) => { e.preventDefault(); view.k = Math.max(2, Math.min(128, view.k * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002)))); dirty = true; }, { passive: false });
+cv.addEventListener('dblclick', () => { view.auto = true; dirty = true; });
+</script>
+</body>
+</html>

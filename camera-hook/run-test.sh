@@ -1,0 +1,1 @@
+env -u LD_LIBRARY_PATH DISPLAY=:93 LD_PRELOAD=/home/darkkeks/factorio-camera/hook/gadget.so taskset -c 2-7 nice -n 10 /home/darkkeks/factorio-camera/factorio/bin/x64/factorio --config /home/darkkeks/factorio-camera/hook/data/config/config.ini --load-game /home/darkkeks/factorio-camera/hook/test-save.zip --disable-audio --window-size 1280x720
