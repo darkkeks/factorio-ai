@@ -22,6 +22,7 @@ const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
 let gen = '', frame = null, frameN = 0, dirty = true;
 let view = { x: 0, y: 0, k: 24, auto: true };
+let cam = null;       // что видит клиент-камера: {x, y, w, h} в клетках
 let gameOn = false; // подключён ли клиент игры с перехватом
 let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
 
@@ -40,6 +41,7 @@ function connect() {
     if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; }
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
+    else if (m.t === 'cam') { cam = m.w ? m : null; dirty = true; }
     else if (m.t === 'atlas') for (const s of spr) if (s && !s.ok && !s.img) load(s);
   };
   ws.onclose = () => setTimeout(connect, 2000);
@@ -80,7 +82,8 @@ function draw() {
   const order = new Uint32Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
   order.sort((a, b) => (f[a * 7 + 6] & 255) - (f[b * 7 + 6] & 255) || f[a * 7 + 2] - f[b * 7 + 2] || f[a * 7 + 1] - f[b * 7 + 1]);
-  if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * 7 + 1]; sy += f[i * 7 + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
+  if (view.auto && cam) { view.x = cam.x; view.y = cam.y; }
+  else if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * 7 + 1]; sy += f[i * 7 + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   if (showBg) background(W, H);
@@ -100,6 +103,13 @@ function draw() {
     shown++;
   }
   ctx.globalAlpha = 1;
+  // Вне вида камеры — только снимки карты (без анимаций): затемняем и обводим границу.
+  if (cam && gameOn) {
+    const x1 = (cam.x - cam.w / 2 - view.x) * view.k + W / 2, y1 = (cam.y - cam.h / 2 - view.y) * view.k + H / 2, w = cam.w * view.k, h = cam.h * view.k;
+    ctx.fillStyle = 'rgba(0, 0, 0, .45)';
+    ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(x1, y1, w, h); ctx.fill('evenodd');
+    ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 6]); ctx.strokeRect(x1, y1, w, h); ctx.setLineDash([]);
+  }
   document.getElementById('st').textContent = !gameOn ? 'клиент игры с перехватом сейчас не запущен — видна только подложка со снимков карты' : `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length}`;
 }
 draw();

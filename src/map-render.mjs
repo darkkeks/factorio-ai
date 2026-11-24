@@ -143,6 +143,13 @@ net.createServer((c) => {
 }).listen(SOCK, () => log('ждёт игру на', SOCK));
 
 // ---------- зрители ----------
+// Что видит клиент-камера: прямоугольник в клетках. Всё вне его на странице — только подложка со снимков.
+let cam = null, camSent = '';
+export function setCamera(c) {
+  cam = c;
+  const s = c ? JSON.stringify({ t: 'cam', ...c }) : '{"t":"cam"}';
+  if (s !== camSent) { camSent = s; broadcast(s); }
+}
 function broadcast(s) { for (const ws of viewers) if (ws.readyState === 1) ws.send(s); }
 setInterval(() => {
   if (!frame || frame === frameAt) return;
@@ -156,6 +163,7 @@ wssRender.on('connection', (ws) => {
   viewers.add(ws);
   ws.send(JSON.stringify({ t: 'reset', gen }));
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
+  if (camSent) ws.send(camSent);
   if (frame) ws.send(frame);
   ws.on('close', () => viewers.delete(ws));
   ws.on('error', () => viewers.delete(ws));
