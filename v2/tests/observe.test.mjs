@@ -161,6 +161,20 @@ test('карта area: постоянные обозначения — стре�
   await lua(`for _, e in pairs(storage.test_map) do if e.valid then e.destroy() end end storage.test_map = nil return true`);
 });
 
+test('patches: поля ресурсов — остаток, клетки, сколько в зоне добычи своих буров', async () => {
+  const X = F.x - 6, Y = F.y + 6;
+  await lua(`
+    local s = game.surfaces.nauvis
+    for x = A.x, A.x + 9 do for y = A.y, A.y + 4 do s.create_entity{name = 'iron-ore', position = {x + 0.5, y + 0.5}, amount = 100} end end
+    storage.test_drill = s.create_entity{name = 'electric-mining-drill', position = {A.x + 1.5, A.y + 1.5}, force = 'player', raise_built = true}
+    return true`, { x: X, y: Y });
+  const r = await call(A, 'patches', { x: X + 5, y: Y + 2, radius: 12, name: 'iron-ore' });
+  const p = r.patches.find((q) => q.area.x1 === X && q.area.y1 === Y);
+  ok(p && p.tiles === 50 && p.amount === 5000, 'поле 10×5 по 100: ' + JSON.stringify(r.patches.slice(0, 3)));
+  ok(p.tiles_mined > 0 && p.tiles_mined + p.tiles_free === 50 && p.drills === 1, 'зона добычи бура: ' + JSON.stringify(p));
+  await lua(`storage.test_drill.destroy() for _, e in pairs(game.surfaces.nauvis.find_entities_filtered{area = {{A.x, A.y}, {A.x + 10, A.y + 5}}, name = 'iron-ore'}) do e.destroy() end return true`, { x: X, y: Y });
+});
+
 test('событие: разрушение постройки приходит ожидающему запросу быстрее секунды', async () => {
   await lua(`storage.test_t = game.surfaces.nauvis.create_entity{name = 'wooden-chest', position = {A.x + 6.5, A.y + 6.5}, force = 'player', raise_built = true} return true`, F);
   const s0 = (await call(B, 'events')).seq;

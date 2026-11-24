@@ -10,6 +10,7 @@ local B = require('agent.actions.build')
 local Inv = require('agent.inv')
 local Rails = require('agent.rails')
 local MapView = require('agent.mapview')
+require('agent.patches')
 
 local Obs = {}
 
