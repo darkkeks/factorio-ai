@@ -9,6 +9,7 @@ local Plans = require('agent.plans')
 local B = require('agent.actions.build')
 local Inv = require('agent.inv')
 local Rails = require('agent.rails')
+local MapView = require('agent.mapview')
 
 local Obs = {}
 
@@ -341,7 +342,6 @@ local function proto_of(name)
 end
 
 -- ── area ──
-local SYMBOLS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*+=<>^!/|{}[]();:'
 
 local function rect(A, p)
   local x1, y1, x2, y2
@@ -360,23 +360,13 @@ end
 O.register('area', {agent = true, fn = function(A, p)
   local e = A.entity
   local surface, force = e.surface, e.force
+  if p.codes then return {codes = MapView.all_codes()} end
   local x1, y1, x2, y2 = rect(A, p)
   local w, h = x2 - x1, y2 - y1
   if w < 1 or h < 1 then U.fail('bad_request', 'пустая область') end
   if w * h > 1024 then U.fail('bad_request', 'область больше 1024 клеток (32×32) за один запрос к игре; сервер сам делит большие области на части') end
   local visible = Fog.viewer(surface, force)
-  local legend, by_name, next_symbol = {}, {}, 1
-  local function symbol(label)
-    local s = by_name[label]
-    if not s then
-      s = next_symbol <= #SYMBOLS and SYMBOLS:sub(next_symbol, next_symbol) or '?'
-      next_symbol = next_symbol + 1
-      by_name[label] = s
-      legend[s] = label
-    end
-    return s
-  end
-  -- Сетка: '.' — свободная земля, '~' — вода или непроходимая плитка, ' ' — не открыто.
+  -- Сетка: '.' — свободная земля, '~' — вода, ' ' — не открыто. Обозначения постоянные (help → area.legend).
   local grid = {}
   for j = 1, h do
     local row = {}
@@ -408,24 +398,19 @@ O.register('area', {agent = true, fn = function(A, p)
   local objects, total = {}, 0
   local limit, offset = math.min(p.limit or 300, 2000), p.offset or 0
   local want_objects = p.objects and true or false
-  local function paint(s, px, py, bw, bh, over)
-    local cx1, cy1 = math.floor(px - bw / 2 + 0.01), math.floor(py - bh / 2 + 0.01)
-    for yy = cy1, cy1 + bh - 1 do
-      local row = grid[yy - y1 + 1]
-      if row then
-        for xx = cx1, cx1 + bw - 1 do
-          local i = xx - x1 + 1
-          if i >= 1 and i <= w then
-            local cur = row[i]
-            if cur ~= ' ' and (over or cur == '.' or cur == '~') then row[i] = s end
-          end
-        end
-      end
-    end
+  local function paint(xx, yy, ch, over)
+    local row = grid[yy - y1 + 1]
+    if not row then return end
+    local i = xx - x1 + 1
+    if i < 1 or i > w then return end
+    local cur = row[i]
+    if cur ~= ' ' and (over or cur == '.' or cur == '~') then row[i] = ch end
   end
-  local SMALL = {character = true, unit = true, tree = true, ['item-entity'] = true, fish = true, ['simple-entity'] = true}
   local NATURE = {tree = true, fish = true, ['simple-entity'] = true}
+  local NOT_MAP = {character = true, unit = true, ['item-entity'] = true, fish = true, ['character-corpse'] = true,
+    ['construction-robot'] = true, ['logistic-robot'] = true, ['combat-robot'] = true, car = true, ['spider-vehicle'] = true}
   local res_total, resources = {}, {}
+  local fresh = {}
   local my_unit = e.unit_number
   for _, c in pairs(surface.find_entities_filtered{area = {{x1, y1}, {x2, y2}}}) do
     local name = c.name
@@ -454,23 +439,18 @@ O.register('area', {agent = true, fn = function(A, p)
           t.tiles = t.tiles + 1
           if not memory then t.amount = t.amount + c.amount end
         else
-          local label = name
-          local bw, bh = pr.w, pr.h
-          if ctype == 'entity-ghost' or ctype == 'tile-ghost' then
-            local gn = c.ghost_name
-            label = 'ghost:' .. gn
+          -- Враги, персонажи, роботы, транспорт — не часть клетки: на карту не рисуются (они в objects, enemies).
+          if not NOT_MAP[ctype] and not is_enemy(c, force) and ctype ~= 'tile-ghost' then
+            local bw, bh = pr.w, pr.h
             if ctype == 'entity-ghost' then
-              local gp = proto_of(gn)
+              local gp = proto_of(c.ghost_name)
               bw, bh = gp.w, gp.h
               if not gp.square and c.direction % 8 == 4 then bw, bh = bh, bw end
+            elseif not pr.square and c.direction % 8 == 4 then
+              bw, bh = bh, bw
             end
-          elseif (ctype == 'unit' or ctype == 'unit-spawner' or ctype == 'turret') and is_enemy(c, force) then
-            label = 'enemy:' .. name
-          elseif not pr.square and c.direction % 8 == 4 then
-            bw, bh = bh, bw
+            MapView.draw(c, ctype, {w = bw, h = bh, live = not memory, fresh = fresh}, paint)
           end
-          if SMALL[ctype] then paint(symbol(label), pos.x, pos.y, 1, 1, true)
-          else paint(symbol(label), pos.x, pos.y, bw, bh, ctype ~= 'tile-ghost') end
           if not NATURE[ctype] or p.nature then
             total = total + 1
             if want_objects and total > offset and #objects < limit then
@@ -481,22 +461,20 @@ O.register('area', {agent = true, fn = function(A, p)
       end
     end
   end
-  -- Ресурсы видны там, где над ними ничего не стоит.
-  for _, r in ipairs(resources) do paint(symbol(r[1]), r[2], r[3], 1, 1, false) end
+  -- Руда видна там, где над ней ничего не стоит.
+  for _, r in ipairs(resources) do paint(math.floor(r[2]), math.floor(r[3]), MapView.ORE[r[1]] or 'r', false) end
   local gone = {}
   if any_fog then ghosts_of_memory(surface, force, {{x1, y1}, {x2, y2}}, visible, gone) end
   for _, r in ipairs(gone) do
-    paint(symbol(r.name), r.x, r.y, 1, 1, true)
+    paint(math.floor(r.x), math.floor(r.y), '•', true)
     total = total + 1
     if want_objects and #objects < limit then objects[#objects + 1] = r end
   end
-  local me = e.position
-  if me.x >= x1 and me.x < x2 and me.y >= y1 and me.y < y2 then grid[math.floor(me.y) - y1 + 1][math.floor(me.x) - x1 + 1] = '@' end
   local rows = {}
   for j = 1, h do rows[j] = table.concat(grid[j]) end
-  local out = {x1 = x1, y1 = y1, x2 = x2, y2 = y2, width = w, height = h, rows = rows, legend = legend,
-    note = "rows[j][i] — клетка с углом (x1 + i, y1 + j), считая с нуля; '.' — свободно, '~' — вода или обрыв, ' ' — не открыто, '@' — ты",
-    objects_total = total, resources = next(res_total) and res_total or nil}
+  local out = {x1 = x1, y1 = y1, x2 = x2, y2 = y2, width = w, height = h, rows = rows,
+    note = "rows[j] — ряд y1 + j, символ i — клетка x1 + i (считая с нуля); обозначения — help → operations.area.legend; коды рецептов постоянные для карты",
+    objects_total = total, resources = next(res_total) and res_total or nil, codes_new = next(fresh) and fresh or nil}
   if any_fog then
     local frows = {}
     for j = 1, h do

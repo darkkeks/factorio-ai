@@ -222,6 +222,7 @@ const special = {
   // большую область сервер запрашивает частями и склеивает.
   async area(who, body) {
     const p = stripControl(body);
+    if (p.codes) return game.call({ agent: who.agent, op: 'area', params: { codes: true } });
     let x1, y1, x2, y2;
     if (p.area) {
       const a = p.area;
@@ -240,27 +241,25 @@ const special = {
     const one = (a, extra = {}) => game.call({ agent: who.agent, op: 'area', params: { ...p, x: undefined, y: undefined, radius: undefined, area: a, ...extra } });
     if (w * h <= 1024) return one({ x1, y1, x2, y2 });
     const limit = Math.min(p.limit ?? 300, 2000), offset = p.offset ?? 0;
-    const SYMBOLS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*+=<>^!/|{}[]();:';
-    const symbolOf = new Map(), legend = {};
-    const sym = (label) => { let s = symbolOf.get(label); if (!s) { s = SYMBOLS[symbolOf.size] ?? '?'; symbolOf.set(label, s); legend[s] = label; } return s; };
     const rows = Array.from({ length: h }, () => new Array(w).fill(' '));
     const fog = Array.from({ length: h }, () => new Array(w).fill('v'));
-    let anyFog = false, total = 0;
-    const objects = [], resources = {};
+    let anyFog = false, total = 0, note;
+    const objects = [], resources = {}, codesNew = {};
     for (let ty = y1; ty < y2; ty += 32) for (let tx = x1; tx < x2; tx += 32) {
       const a = { x1: tx, y1: ty, x2: Math.min(tx + 32, x2), y2: Math.min(ty + 32, y2) };
       const r = await one(a, { limit: 2000, offset: 0 });
-      const map = {};
-      for (const [s, label] of Object.entries(r.legend)) map[s] = sym(label);
-      r.rows.forEach((row, j) => { for (let i = 0; i < row.length; i++) { const ch = row[i]; rows[a.y1 - y1 + j][a.x1 - x1 + i] = map[ch] ?? ch; } });
+      note = r.note;
+      // Символы постоянные (обозначения — help → operations.area.legend): части склеиваются как есть. Array.from — по символам, не по UTF-16.
+      r.rows.forEach((row, j) => { Array.from(row).forEach((ch, i) => { rows[a.y1 - y1 + j][a.x1 - x1 + i] = ch; }); });
       if (r.fog_rows) { anyFog = true; r.fog_rows.forEach((row, j) => { for (let i = 0; i < row.length; i++) fog[a.y1 - y1 + j][a.x1 - x1 + i] = row[i]; }); }
       total += r.objects_total;
       for (const o of r.objects || []) objects.push(o);
       for (const [name, t] of Object.entries(r.resources || {})) { const g = (resources[name] ??= { tiles: 0, amount: 0 }); g.tiles += t.tiles; g.amount += t.amount; }
+      Object.assign(codesNew, r.codes_new || {});
     }
-    const out = { x1, y1, x2, y2, width: w, height: h, rows: rows.map((r) => r.join('')), legend,
-      note: "rows[j][i] — клетка с углом (x1 + i, y1 + j), считая с нуля; '.' — свободно, '~' — вода или обрыв, ' ' — не открыто, '@' — ты",
-      objects_total: total, resources: Object.keys(resources).length ? resources : undefined };
+    const out = { x1, y1, x2, y2, width: w, height: h, rows: rows.map((r) => r.join('')), note,
+      objects_total: total, resources: Object.keys(resources).length ? resources : undefined,
+      codes_new: Object.keys(codesNew).length ? codesNew : undefined };
     if (anyFog) out.fog_rows = fog.map((r) => r.join(''));
     if (p.objects) { out.objects = objects.slice(offset, offset + limit); out.more = objects.length > offset + limit || undefined; }
     return out;

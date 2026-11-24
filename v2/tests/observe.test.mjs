@@ -127,11 +127,38 @@ test('бот открывает карту вокруг себя, как игр�
   const en = await call(A, 'enemies', { radius: 30 });
   ok(en.units_total >= 1 && en.nests.length === 1 && !en.nests[0].memory, JSON.stringify(en));
   ok(en.view.visible_percent === 100 && en.view.charted_percent === 100 && !en.view.nearest_hidden, 'вблизи бота всё видно: ' + JSON.stringify(en.view));
-  const ar = await call(A, 'area', { radius: 10 });
-  ok(!ar.fog_rows && ar.rows.some((r) => r.includes('@')) && Object.values(ar.legend).includes('enemy:small-biter'), JSON.stringify(ar.legend));
+  const ar = await call(A, 'area', { radius: 10, objects: true });
+  ok(!ar.fog_rows && !ar.rows.some((r) => r.includes('@')) && ar.objects.some((o) => o.name === 'small-biter'),
+    'враги и персонаж на карту не рисуются, но есть в objects: ' + JSON.stringify(ar.rows));
   const far = await call(A, 'inspect', { target: { x: F.x + 2000.5, y: F.y + 2000.5 } });
   ok(far.found === false && far.visibility === 'unknown', JSON.stringify(far));
   await lua(`for _, e in pairs(storage.test_fog) do if e.valid then e.destroy() end end storage.test_fog = nil return true`);
+});
+
+test('карта area: постоянные обозначения — стрелки лент и манипуляторов, рамка машины с кодом рецепта, статус, патрубки', async () => {
+  const X = F.x - 12, Y = F.y - 12;
+  await lua(`
+    local s, f = game.surfaces.nauvis, game.forces.player
+    local o = {}
+    local function mk(t) t.force = f t.raise_built = true local e = s.create_entity(t) o[#o + 1] = e return e end
+    local m = mk{name = 'assembling-machine-2', position = {A.x + 1.5, A.y + 1.5}}
+    m.set_recipe('iron-gear-wheel')
+    for i = 0, 4 do mk{name = 'transport-belt', position = {A.x + i + 0.5, A.y - 1.5}, direction = defines.direction.east} end
+    mk{name = 'inserter', position = {A.x + 1.5, A.y - 0.5}, direction = defines.direction.south}
+    local r = mk{name = 'oil-refinery', position = {A.x + 9.5, A.y + 2.5}}
+    r.set_recipe('basic-oil-processing')
+    storage.test_map = o
+    return true`, { x: X, y: Y });
+  const ar = await call(A, 'area', { area: { x1: X - 1, y1: Y - 2, x2: X + 13, y2: Y + 6 } });
+  const at = (x, y) => Array.from(ar.rows[y - (Y - 2)])[x - (X - 1)];
+  eq(at(X + 2, Y - 2), '→', 'лента на восток: ' + ar.rows.join('|'));
+  ok(['⇣', '⇡'].includes(at(X + 1, Y - 1)), 'манипулятор стрелкой: ' + ar.rows.join('|'));
+  eq(at(X, Y), '┌', 'угол рамки сборщика');
+  eq(at(X + 1, Y + 1), 'g', 'в центре — код рецепта шестерён');
+  ok(['o', 'w'].includes(at(X + 9, Y + 4)) || ar.rows.some((r) => /[owHLG]/.test(r)), 'патрубки НПЗ буквами жидкостей: ' + ar.rows.join('|'));
+  const codes = await call(A, 'area', { codes: true });
+  eq(codes.codes.g, 'iron-gear-wheel', 'таблица кодов: ' + JSON.stringify(codes.codes));
+  await lua(`for _, e in pairs(storage.test_map) do if e.valid then e.destroy() end end storage.test_map = nil return true`);
 });
 
 test('событие: разрушение постройки приходит ожидающему запросу быстрее секунды', async () => {
