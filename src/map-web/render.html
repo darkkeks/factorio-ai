@@ -92,6 +92,8 @@ function draw() {
   // цвет RGBA, вырезка x | y<<16, w | h<<16. Порядок записей — уже игровой (слой, ключ сортировки), рисуем подряд.
   const R = 10, f = gameOn && frame ? frame : new Int32Array(0), n = f.length / R;
   if (view.auto && cam) { view.x = cam.x; view.y = cam.y; }
+  // Камера ни за кем не следит (на сервере нет ботов и игроков) — центр по записям кадра.
+  else if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * R + 1]; sy += f[i * R + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   if (showBg) background(W, H);

@@ -25,7 +25,7 @@ const PORT = Number(process.env.MAP_PORT || 8766);
 const SURFACE = 'nauvis';
 const CAMERA = process.env.MAP_CAMERA || 'camera'; // имя игрока-камеры: на карте не показывается
 const GAME_DATA = process.env.FACTORIO_DATA || path.join(os.homedir(), 'robot/factorio/space-age-1/factorio/data');
-const SERVER_SETTINGS = path.join(os.homedir(), 'robot/factorio/space-age-1/server-settings.json'); // отсюда пароль игры
+const SERVER_SETTINGS = process.env.MAP_SERVER_SETTINGS || path.join(os.homedir(), 'robot/factorio/space-age-1/server-settings.json'); // отсюда пароль игры
 const GAME_ADDR = process.env.GAME_ADDR || '127.0.0.1:34197';
 const CAMERA_DIR = process.env.CAMERA_DIR || path.join(os.homedir(), 'factorio-camera'); // внутри — factorio/ (полная копия игры)
 const CAMERA_MANAGE = process.env.CAMERA_MANAGE !== '0';   // 0 — клиент-камеру запускают руками
@@ -854,7 +854,7 @@ function startCamera() {
   fs.rmSync(SHOTS, { recursive: true, force: true });
   // Перехват отрисовки для прототипа /render/ (camera-hook/): Frida Gadget только в процесс игры. CAMERA_HOOK=0 — без него.
   const gadget = path.join(CAMERA_DIR, 'hook/gadget.so'), hook = process.env.CAMERA_HOOK !== '0' && fs.existsSync(gadget);
-  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, ...(hook ? ['env', `LD_PRELOAD=${gadget}`] : []), path.join(CAMERA_DIR, 'factorio/bin/x64/factorio'), '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
+  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, ...(hook ? ['env', `LD_PRELOAD=${gadget}`, ...(process.env.V2_SOCK ? [`V2_SOCK=${process.env.V2_SOCK}`] : [])] : []), path.join(CAMERA_DIR, 'factorio/bin/x64/factorio'), '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
   if (process.env.CAMERA_CONFIG) args.push('--config', process.env.CAMERA_CONFIG);
   const pw = gamePassword();
   if (pw) args.push('--password', pw);

@@ -24,3 +24,11 @@ drawIconLayers 162.., drawEntities 162..255, drawOthers. Устройство с
 сервис сам запустит новый): горячая перезагрузка (`"on_change": "reload"` в `gadget.config`) снимала перехваты, пока потоки игры
 были внутри перехваченных функций, и клиент падал (SIGSEGV в DrawQueue::draw). Поэтому в `gadget.config` — `"on_change": "ignore"`.
 `bpftrace` на клиент с Frida тоже не вешать: обе вещи правят начало одних и тех же функций, клиент падает.
+
+## Тестовый мир для сравнения (25.11.2026)
+
+Отдельный сервер без паузы — `~/factorio-test2` (мир «Warger's 100% map» с factoriobench.com, только base),
+окно tmux `factorio-test2` (`run-server.sh`, порт 34210, RCON 27210). Второй экземпляр карты — окно `factorio-map-test2`
+(`run-map-test2.sh`, порт 8767, своя клиент-камера `~/factorio-camera2`, свой сокет перехвата), снаружи —
+https://factorio.darkkeks.me/test/ и /test/render/. Ботов и игроков там нет, поэтому камера стоит, где её поставили
+(`p.teleport` через RCON тестового сервера). Остановить: закрыть оба окна tmux.

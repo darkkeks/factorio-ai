@@ -15,7 +15,8 @@ import crypto from 'node:crypto';
 import { ROOT } from './config.mjs';
 import { Rcon } from '../v2/server/rcon.mjs';
 
-const CONF = JSON.parse(fs.readFileSync(path.join(ROOT, 'rcon.json'), 'utf8'));
+// MAP_RCON_JSON — другой файл доступа (второй экземпляр карты на тестовом сервере).
+const CONF = JSON.parse(fs.readFileSync(process.env.MAP_RCON_JSON || path.join(ROOT, 'rcon.json'), 'utf8'));
 const esc = (v) => JSON.stringify(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 const ids = new Map(); // текст кода -> имя функции в игре (по хешу: правка кода — новая функция)
 const fnId = (code) => { let id = ids.get(code); if (!id) ids.set(code, id = 'f' + crypto.createHash('md5').update(code).digest('hex').slice(0, 12)); return id; };

@@ -8,7 +8,14 @@
 'use strict';
 // В QuickJS нет TextEncoder: строки здесь только ASCII (JSON с числами и адресами).
 const enc = (str) => { const a = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xff; return a; };
-const SOCK = '/home/darkkeks/factorio-camera/hook/v2.sock';
+// Сокет сервиса: переменная окружения V2_SOCK процесса игры (второй экземпляр карты), иначе — основной.
+const SOCK = (() => {
+  try {
+    const v = new NativeFunction(Module.getGlobalExportByName('getenv'), 'pointer', ['pointer'])(Memory.allocUtf8String('V2_SOCK'));
+    if (!v.isNull()) return v.readUtf8String();
+  } catch (e) { console.log('[v2] getenv:', e.message); }
+  return '/home/darkkeks/factorio-camera/hook/v2.sock';
+})();
 const MAX = 32768;       // записей в кадре
 const REC = 64;          // байт на запись
 const EVERY = 3;         // отправлять каждый N-й кадр (~20 в секунду при 60 кадрах)
