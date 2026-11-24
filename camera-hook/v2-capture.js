@@ -19,6 +19,7 @@ const find = (prefix) => { for (const [n, a] of syms) if (n.startsWith(prefix)) 
 
 const buf = Memory.alloc(MAX * REC);
 const count = Memory.alloc(8);
+const skip = Memory.alloc(8);
 // Регистры по дизассемблеру 2.1.24 (компилятор местами отходит от ABI по сигнатуре, поэтому смотрим на код, не на имена):
 //   kind 0 draw:                       rsi спрайт, rdx позиция, r8d слой
 //   kind 1 drawTinted:                 + цвет xmm0 (r,g) xmm1 (b,a)
@@ -33,6 +34,7 @@ const cm = new CModule(`
 #include <gum/guminterceptor.h>
 extern unsigned char buf[];
 extern volatile gint count;
+extern volatile gint skip;   // 1 — идёт съёмка снимков карты (take_screenshot): их отрисовку не записываем
 #define CAP ${MAX}
 static inline unsigned int rgba(float r, float g, float b, float a) {
   int R = r * 255, G = g * 255, B = b * 255, A = a * 255;
@@ -52,7 +54,7 @@ void onEnter(GumInvocationContext *ic) {
   else if (kind == 4) { pos = (gint32 *) c->rcx; sx = sy = *(double *)(x + 0); layer = (unsigned int) c->r9 & 0xff; }
   else if (kind == 5) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 96), *(float *)(x + 100), *(float *)(x + 112), *(float *)(x + 116)); }
   else if (kind == 6) { pos = (gint32 *) c->rcx; tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20)); }
-  if (!sprite || !pos) return;
+  if (!sprite || !pos || skip) return;
   int i = g_atomic_int_add(&count, 1);
   if (i >= CAP) return;
   unsigned char *r = buf + i * ${REC};
@@ -63,7 +65,7 @@ void onEnter(GumInvocationContext *ic) {
   *(float *)(r + 20) = sy;
   *(unsigned int *)(r + 24) = tint;
   *(unsigned int *)(r + 28) = layer | (kind << 8) | (flags << 16);
-}`, { buf, count });
+}`, { buf, count, skip });
 
 const HOOKS = [
   ['_ZN9DrawQueue4drawERK6SpriteRK11MapPosition12DrawingFlags', 0],
@@ -167,8 +169,13 @@ function readAtlas(a) {
   post(3, all.buffer);
 }
 
+// Клиент-камера ещё и снимает тайлы карты (RenderUtil::takeScreenshots): эти отрисовки — не вид камеры.
+const shots = find('_ZN10RenderUtil15takeScreenshotsE');
+if (shots) Interceptor.attach(shots, { onEnter() { skip.writeS32(1); }, onLeave() { skip.writeS32(0); } });
+
 // Граница кадра: начало DrawEngine::render — все очереди кадра уже собраны, контекст GL текущий.
 Interceptor.attach(find('_ZN10DrawEngine6renderE'), { onEnter() {
+  if (skip.readS32()) return; // кадр снимка карты
   frame++;
   const n = Math.min(count.readS32(), MAX);
   if (conn && frame % EVERY === 0 && n > 0) {

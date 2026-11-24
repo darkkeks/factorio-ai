@@ -849,7 +849,9 @@ function ensureXvfb() {
 
 function startCamera() {
   fs.rmSync(SHOTS, { recursive: true, force: true });
-  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, path.join(CAMERA_DIR, 'factorio/bin/x64/factorio'), '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
+  // Перехват отрисовки для прототипа /render/ (camera-hook/): Frida Gadget только в процесс игры. CAMERA_HOOK=0 — без него.
+  const gadget = path.join(CAMERA_DIR, 'hook/gadget.so'), hook = process.env.CAMERA_HOOK !== '0' && fs.existsSync(gadget);
+  const args = ['-n', '10', 'taskset', '-c', CAMERA_CPUS, ...(hook ? ['env', `LD_PRELOAD=${gadget}`] : []), path.join(CAMERA_DIR, 'factorio/bin/x64/factorio'), '--mp-connect', GAME_ADDR, '--disable-audio', '--window-size', CAMERA_WINDOW];
   if (process.env.CAMERA_CONFIG) args.push('--config', process.env.CAMERA_CONFIG);
   const pw = gamePassword();
   if (pw) args.push('--password', pw);
@@ -862,7 +864,7 @@ function startCamera() {
   child.on('exit', (code) => { if (camera?.pid === child.pid) { log(`клиент-камера завершился (код ${code})`); camera = null; nextStart = Date.now() + 3000; } });
   camera = { pid: child.pid, since: Date.now(), joined: false, logPos };
   fs.writeFileSync(PID_FILE, String(child.pid));
-  log(`клиент-камера запущен (группа процессов ${child.pid}, дисплей ${display.DISPLAY}${display.XAUTHORITY ? ' — видеокарта' : ' — программный рендер'})`);
+  log(`клиент-камера запущен (группа процессов ${child.pid}, дисплей ${display.DISPLAY}${display.XAUTHORITY ? ' — видеокарта' : ' — программный рендер'}${hook ? ', с перехватом отрисовки' : ''})`);
 }
 
 function stopCamera(why, retryIn = 0) {
