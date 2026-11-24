@@ -827,7 +827,7 @@ export function helpDocument(info, publicUrl) {
   const ops = {};
   for (const [name, s] of Object.entries(API)) {
     if (s.admin) continue;
-    ops[name] = { kind: s.kind, instant: s.instant || undefined, summary: s.summary, params: s.params, result: s.result, example: s.example };
+    ops[name] = { kind: s.kind, instant: s.instant || undefined, summary: s.summary, params: s.params, result: s.result, legend: s.legend, example: s.example };
   }
   return {
     about: 'Управление персонажем-ботом в Factorio. Каждый вызов — POST /v2/<операция> с JSON-телом и заголовком ' +
