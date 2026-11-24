@@ -762,10 +762,13 @@ function corners(b) {
   return [[[x1, y1 + d], [x1, y1], [x1 + d, y1]], [[x2 - d, y1], [x2, y1], [x2, y1 + d]], [[x2, y2 - d], [x2, y2], [x2 - d, y2]], [[x1 + d, y2], [x1, y2], [x1, y2 - d]]].map((l) => l.map(([x, y]) => ll(x, y)));
 }
 function drawEntBox(b) {
+  ENT.boxArr = b;
+  // Под курсором та же постройка — рамку наведения убираем, чтобы не было двух рамок.
+  if (hoverBox && sameBox(hoverHit && hoverHit.box, b)) { hoverBox.remove(); hoverBox = null; }
   const lines = corners(b);
   if (ENT.box) ENT.box.setLatLngs(lines); else ENT.box = L.polyline(lines, { color: '#ffd23a', weight: 3, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
 }
-function closeEnt() { closeBot(); ENT.gen++; ENT.sel = null; ENT.html = ''; sendSelect(); $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
+function closeEnt() { closeBot(); ENT.gen++; ENT.sel = null; ENT.html = ''; sendSelect(); $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } ENT.boxArr = null; }
 // Что выделено — сообщаем сервису, он присылает свежие данные сам (4 раза в секунду, только изменения).
 function sendSelect() { wsSend(selected ? { t: 'select', bot: selected } : ENT.sel ? { t: 'select', x: ENT.sel.x, y: ENT.sel.y } : { t: 'select' }); }
 function renderEnt(e) {
@@ -798,7 +801,8 @@ $('ent-close').onclick = closeEnt;
 // один раз (и перечитывает раз в 5 секунд, пока курсор рядом) и ищет постройку под курсором сама, без запроса.
 const BOXES = new Map(); // "cx,cy" -> { at, data | false (чанк не виден), pending }
 const BOX_TTL = 5000;
-let hoverBox = null, hoverKey = '', boxQueue = new Set(), boxTimer = null;
+const sameBox = (a, b) => !!(a && b) && a.every((v, i) => Math.abs(v - b[i]) < 0.05);
+let hoverHit = null, hoverBox = null, hoverKey = '', boxQueue = new Set(), boxTimer = null;
 function wantChunks(cx, cy) {
   const now = Date.now();
   for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
@@ -822,7 +826,7 @@ async function fetchBoxes() {
 }
 // Постройка под точкой: из нескольких — с большим приоритетом выделения, затем меньшая; руда — если построек нет.
 function hoverAt(x, y) {
-  const cx = Math.floor(x / 32), cy = Math.floor(y / 32), X = x * 8, Y = y * 8;
+  const cx = Math.floor(x / 32), cy = Math.floor(y / 32), X = x * 256, Y = y * 256;
   let best = null;
   for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
     const c = BOXES.get(`${cx + dx},${cy + dy}`), d = c && c.data;
@@ -831,7 +835,7 @@ function hoverAt(x, y) {
     for (let i = 0; i < b.length; i += 7) {
       if (X < b[i + 1] || X > b[i + 3] || Y < b[i + 2] || Y > b[i + 4]) continue;
       const area = (b[i + 3] - b[i + 1]) * (b[i + 4] - b[i + 2]);
-      if (!best || b[i + 5] > best.prio || (b[i + 5] === best.prio && area < best.area)) best = { name: n[b[i] - 1], prio: b[i + 5], area, ghost: !!b[i + 6], box: [b[i + 1] / 8, b[i + 2] / 8, b[i + 3] / 8, b[i + 4] / 8] };
+      if (!best || b[i + 5] > best.prio || (b[i + 5] === best.prio && area < best.area)) best = { name: n[b[i] - 1], prio: b[i + 5], area, ghost: !!b[i + 6], box: [b[i + 1] / 256, b[i + 2] / 256, b[i + 3] / 256, b[i + 4] / 256] };
     }
   }
   if (best) return best;
@@ -856,9 +860,11 @@ function onHover(x, y, px, py) {
   if (hoverBox) { hoverBox.remove(); hoverBox = null; }
   hoverTip.classList.toggle('hidden', !hit);
   map.getContainer().style.cursor = hit ? 'pointer' : '';
+  hoverHit = hit;
   if (!hit) return;
+  const same = sameBox(hit.box, ENT.boxArr);
   hoverTip.textContent = nm(hit.name) + (hit.ghost ? ' (призрак)' : '');
-  hoverBox = L.polyline(corners(hit.box), { color: '#ffd23a', weight: 2, opacity: 0.85, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
+  if (!same) hoverBox = L.polyline(corners(hit.box), { color: '#ffd23a', weight: 2, opacity: 0.85, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
 }
 if (matchMedia('(hover: hover)').matches) {
   map.on('mousemove', (ev) => { lastMouse = { x: ev.latlng.lng, y: ev.latlng.lat }; onHover(lastMouse.x, lastMouse.y, ev.originalEvent.clientX, ev.originalEvent.clientY); });

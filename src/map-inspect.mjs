@@ -94,7 +94,7 @@ end
 return r`,
 
   // Рамки выделения всех построек в видимых чанках — чтобы страница сама находила постройку под курсором, как игра.
-  // Постройка относится к чанку, в котором её центр. Числа — восьмые доли клетки. Руда — строкой по клетке на символ.
+  // Постройка относится к чанку, в котором её центр. Рамки — в 1/256 клетки (как у самой игры: та же рамка, что при клике). Руда — строкой по клетке на символ.
   // Подвижное (персонажи, роботы, техника, враги) не отдаём: оно устаревает за секунду, его выбирает клик.
   boxes: `
     local s, f, out = game.surfaces[A.surface], game.forces.player, {}
@@ -120,8 +120,8 @@ return r`,
               local k = idx[n]
               if not k then k = #r.n + 1 r.n[k] = n idx[n] = k end
               local sb, m = e.selection_box, #b
-              b[m+1] = k b[m+2] = floor(sb.left_top.x * 8 + 0.5) b[m+3] = floor(sb.left_top.y * 8 + 0.5)
-              b[m+4] = floor(sb.right_bottom.x * 8 + 0.5) b[m+5] = floor(sb.right_bottom.y * 8 + 0.5) b[m+6] = p.selection_priority or 50
+              b[m+1] = k b[m+2] = floor(sb.left_top.x * 256 + 0.5) b[m+3] = floor(sb.left_top.y * 256 + 0.5)
+              b[m+4] = floor(sb.right_bottom.x * 256 + 0.5) b[m+5] = floor(sb.right_bottom.y * 256 + 0.5) b[m+6] = p.selection_priority or 50
               b[m+7] = e.type == 'entity-ghost' and 1 or 0
             end
           end
