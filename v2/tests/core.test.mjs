@@ -55,6 +55,25 @@ test('ходьба: дошёл, отчёт с пройденным, прямой
   ok(r.ok && r.left <= 0.3 && r.walked > 12 && r.straight > 12.9 && r.path_length > 12, JSON.stringify(r));
 });
 
+test('ходьба от кромки воды: персонаж задевает воду — путь ищется от свободной точки рядом (fb-100)', async () => {
+  // Вода 5×3 в дальнем углу открытого места; персонаж стоит, на волосок заходя на неё (так бывает у берега).
+  const c = { x: Math.floor(open.x) + 50, y: Math.floor(open.y) + 26 };
+  const old = await lua(`local s, t, old = game.surfaces.nauvis, {}, {}
+    for x = 0, 4 do for y = 0, 2 do local p = {A.x + x, A.y + y} old[#old + 1] = {name = s.get_tile(p[1], p[2]).name, position = p} t[#t + 1] = {name = 'water', position = p} end end
+    s.set_tiles(t)
+    storage.agent.agents['bench-1'].entity.teleport({A.x + 2, A.y - 0.18})
+    return old`, c);
+  try {
+    const near = await call(A, 'walk_to', { x: c.x + 2.5, y: c.y - 1.5 });
+    ok(near.ok && near.left <= 0.3, 'соседняя клетка: ' + JSON.stringify(near));
+    await lua(`storage.agent.agents['bench-1'].entity.teleport({A.x + 2, A.y - 0.18})`, c);
+    const far = await call(A, 'walk_to', { x: c.x - 9.5, y: c.y - 6.5 });
+    ok(far.ok && far.left <= 0.3 && far.walked > 11, 'дальняя точка: ' + JSON.stringify(far));
+  } finally {
+    await lua(`game.surfaces.nauvis.set_tiles(A.old)`, { old });
+  }
+});
+
 test('ходьба в занятую точку: no_path сразу', async () => {
   const b = await lua(`local e = game.surfaces.nauvis.find_entities_filtered{type = 'assembling-machine', limit = 1}[1] return e.position`);
   const r = await call(A, 'walk_to', { x: b.x, y: b.y });

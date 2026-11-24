@@ -22,7 +22,7 @@ local function request(A, act, w)
   w.req = e.surface.request_path{
     bounding_box = proto.collision_box,
     collision_mask = proto.collision_mask,
-    start = e.position,
+    start = w.start or e.position,
     goal = w.goal,
     force = e.force,
     -- Узлы поиска — центры клеток: до произвольной точки ближе 0,7 клетки узла может не быть.
@@ -36,6 +36,26 @@ local function request(A, act, w)
   }
   w.req_tick = game.tick
   storage.agent.path_requests[w.req] = {agent = A.name, action = act.id}
+end
+
+-- Персонаж может стоять, на волосок задевая воду или постройку (кромка берега, щель у насоса): из такой точки
+-- поисковик пути игры не строит путь вовсе. Тогда путь ищется от ближайшей свободной точки рядом (до полутора
+-- клеток), а до неё персонаж делает шаг сам, как игрок. Возвращает точку или nil, если персонаж ничего не задевает.
+local function free_start(e)
+  local proto, pos, s = e.prototype, e.position, e.surface
+  local b = proto.collision_box
+  local area = {{pos.x + b.left_top.x, pos.y + b.left_top.y}, {pos.x + b.right_bottom.x, pos.y + b.right_bottom.y}}
+  local layers = {}
+  for layer in pairs(proto.collision_mask.layers) do layers[#layers + 1] = layer end
+  if #layers == 0 then return nil end
+  local hit = s.count_tiles_filtered{area = area, collision_mask = layers, limit = 1} > 0
+  if not hit then
+    for _, o in pairs(s.find_entities_filtered{area = area, collision_mask = layers, limit = 2}) do
+      if o ~= e then hit = true break end
+    end
+  end
+  if not hit then return nil end
+  return s.find_non_colliding_position(e.name, pos, 1.5, 0.1)
 end
 
 --- Отчёт о ходьбе: где стоит, сколько пройдено, по прямой, длина найденного пути, сколько осталось.
@@ -97,10 +117,14 @@ function W.path_finished(ev)
   w.req = nil
   if ev.path and #ev.path > 0 then
     local path, len, prev = {}, 0, w.from
-    for i, p in ipairs(ev.path) do
+    if w.start then -- сначала шаг до свободной точки, от которой найден путь
+      path[1] = {x = w.start.x, y = w.start.y}
+      len, prev = U.dist(prev, path[1]), path[1]
+    end
+    for _, p in ipairs(ev.path) do
       local q = {x = p.position.x, y = p.position.y}
       len = len + U.dist(prev, q)
-      path[i] = q
+      path[#path + 1] = q
       prev = q
     end
     w.path, w.i, w.path_len = path, 1, len
@@ -110,6 +134,15 @@ function W.path_finished(ev)
     w.retry_at = game.tick + 10
   elseif ev.try_again_later then
     w.error = {code = 'busy', message = 'поисковик пути игры занят, повтори позже'}
+  elseif not w.nudged then
+    -- Один раз: если персонаж задевает воду или постройку, ищем путь от свободной точки рядом.
+    w.nudged = true
+    w.start = free_start(A.entity)
+    if w.start then
+      request(A, act, w)
+      return
+    end
+    w.error = {code = 'no_path', message = 'пути нет: цель отрезана препятствиями или занята'}
   else
     w.error = {code = 'no_path', message = 'пути нет: цель отрезана препятствиями или занята'}
   end
