@@ -131,10 +131,12 @@ function post(type, payload) {
 // Описание спрайта (смещения разобраны по дампам Sprite в 2.1.24):
 //   +0x28 double сдвиг x (клетки), +0x30 double сдвиг y, +0x38 double масштаб,
 //   +0x68 объект атласа (в нём +0x08 номер текстуры GL, +0x18/+0x1c размер), +0x70/+0x74 x, y в атласе, +0x78/+0x7a ширина, высота.
+//   +0x54 флаги слоя (биты 1–3: тень / свечение / свет — по коду drawSliced*: testb $0xe,0x54(...)), +0x80 следующий слой:
+//   Sprite — цепочка слоёв, функции draw* рисуют её целиком.
 function describe(sp) {
-  const atlas = sp.add(0x68).readPointer();
+  const atlas = sp.add(0x68).readPointer(), next = sp.add(0x80).readPointer();
   return {
-    id: sp.toString(), atlas: atlas.toString(),
+    id: sp.toString(), atlas: atlas.toString(), next: next.isNull() ? null : next.toString(), fl: sp.add(0x54).readU8(), fl2: sp.add(0x55).readU8(), fl3: sp.add(0x56).readU8(),
     x: sp.add(0x70).readU32(), y: sp.add(0x74).readU32(), w: sp.add(0x78).readU16(), h: sp.add(0x7a).readU16(),
     shiftX: sp.add(0x28).readDouble(), shiftY: sp.add(0x30).readDouble(), scale: sp.add(0x38).readDouble(),
   };
@@ -182,7 +184,17 @@ Interceptor.attach(find('_ZN10DrawEngine6renderE'), { onEnter() {
     const fresh = [];
     for (let i = 0; i < n; i++) {
       const sp = buf.add(i * REC).readPointer(), k = sp.toString();
-      if (!known.has(k)) { known.add(k); try { fresh.push(describe(sp)); } catch (e) { /* не спрайт */ } }
+      // Вся цепочка слоёв (не больше 16 — на случай мусора)
+      let p = sp;
+      for (let d = 0; d < 16 && !p.isNull(); d++) {
+        const pk = p.toString();
+        if (known.has(pk)) break;
+        known.add(pk);
+        let desc;
+        try { desc = describe(p); } catch (e) { break; }
+        fresh.push(desc);
+        p = desc.next ? ptr(desc.next) : NULL;
+      }
     }
     if (fresh.length) post(2, enc(JSON.stringify(fresh)).buffer);
     post(1, buf.readByteArray(n * REC));

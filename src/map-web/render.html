@@ -89,19 +89,26 @@ function draw() {
   if (showBg) background(W, H);
   ctx.imageSmoothingEnabled = true;
   let shown = 0, missing = 0;
-  for (const i of order) {
-    const o = i * 7, s = spr[f[o]];
-    if (!s) continue;
-    if (!s.ok) { if (!s.img) load(s); missing++; continue; }
-    const kx = f[o + 3] / 1000, ky = f[o + 4] / 1000, tint = f[o + 5] >>> 0;
-    const w = s.w * s.sc * kx / 32, h = s.h * s.sc * ky / 32;               // размер в клетках
-    const cx = f[o + 1] / 256 + s.sx * kx, cy = f[o + 2] / 256 + s.sy * ky;  // центр в клетках
-    const px = (cx - w / 2 - view.x) * view.k + W / 2, py = (cy - h / 2 - view.y) * view.k + H / 2;
-    if (px > W || py > H || px + w * view.k < 0 || py + h * view.k < 0) continue;
-    ctx.globalAlpha = (tint >>> 24) / 255;
-    ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
-    shown++;
+  // Каждая запись — цепочка слоёв спрайта (next). Флаги слоя: 2 — тень (чёрная маска, полупрозрачно),
+  // 4 — свечение (добавляется к картинке), 8 — только свет (виден ночью) — днём не рисуем.
+  // Два прохода, как в игре: сначала все тени, потом всё остальное.
+  for (const pass of [0, 1]) for (const i of order) {
+    const o = i * 7;
+    const kx = f[o + 3] / 1000, ky = f[o + 4] / 1000, tint = f[o + 5] >>> 0, alpha = (tint >>> 24) / 255;
+    for (let s = spr[f[o]], d = 0; s && d < 16; s = s.next >= 0 ? spr[s.next] : null, d++) {
+      if (s.fl & 8 || ((s.fl & 2) ? 0 : 1) !== pass) continue;
+      if (!s.ok) { if (!s.img) load(s); missing++; continue; }
+      const w = s.w * s.sc * kx / 32, h = s.h * s.sc * ky / 32;               // размер в клетках
+      const cx = f[o + 1] / 256 + s.sx * kx, cy = f[o + 2] / 256 + s.sy * ky;  // центр в клетках
+      const px = (cx - w / 2 - view.x) * view.k + W / 2, py = (cy - h / 2 - view.y) * view.k + H / 2;
+      if (px > W || py > H || px + w * view.k < 0 || py + h * view.k < 0) continue;
+      ctx.globalAlpha = (s.fl & 2) ? alpha * 0.6 : alpha;
+      ctx.globalCompositeOperation = (s.fl & 4) ? 'lighter' : 'source-over';
+      ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
+      shown++;
+    }
   }
+  ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   // Вне вида камеры — только снимки карты (без анимаций): затемняем и обводим границу.
   if (cam && gameOn) {

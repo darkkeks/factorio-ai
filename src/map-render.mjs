@@ -114,7 +114,8 @@ function onMessage(type, data) {
     frame = Buffer.from(out.buffer, 0, k * 4);
   }
 }
-const pub = (s) => ({ n: s.n, w: s.w, h: s.h, sx: s.shiftX, sy: s.shiftY, sc: s.scale });
+// next — номер следующего слоя (заполняется, когда его описание пришло), fl — флаги слоя.
+const pub = (s) => ({ n: s.n, w: s.w, h: s.h, sx: s.shiftX, sy: s.shiftY, sc: s.scale, fl: s.fl, next: s.next ? sprites.get(s.next)?.n ?? -1 : -1 });
 
 fs.rmSync(SOCK, { force: true });
 net.createServer((c) => {
