@@ -21,7 +21,8 @@
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
 let gen = '', frame = null, frameN = 0, dirty = true;
-let view = { x: 0, y: 0, k: 24, auto: true }; // центр в клетках, пикселей на клетку
+let view = { x: 0, y: 0, k: 24, auto: true };
+let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
 
 function load(s) {
   s.img = new Image();
@@ -43,6 +44,28 @@ function connect() {
 }
 connect();
 
+// Подложка: снимки основной карты (/tiles/z/x/y.jpg). Землю игра рисует из кеша текстур чанков, мимо очереди
+// отрисовки, поэтому пока берём её со снимков; постройки на снимке совпадают с нарисованными поверх.
+const bg = new Map(); // "z/x/y" -> { img, ok, at }
+function background(W, H) {
+  const z = Math.max(0, Math.min(6, Math.round(5 + Math.log2(view.k / 32)))), span = 16 * 2 ** (5 - z);
+  const x1 = Math.floor((view.x - W / 2 / view.k) / span), x2 = Math.floor((view.x + W / 2 / view.k) / span);
+  const y1 = Math.floor((view.y - H / 2 / view.k) / span), y2 = Math.floor((view.y + H / 2 / view.k) / span);
+  const bucket = Math.floor(Date.now() / 30000); // перечитываем снимки раз в полминуты
+  for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) {
+    const k = `${z}/${x}/${y}`;
+    let t = bg.get(k);
+    if (!t || t.at !== bucket) {
+      const img = new Image(), nt = { img, ok: false, at: bucket, prev: t && t.ok ? t : null };
+      img.onload = () => { nt.ok = true; nt.prev = null; dirty = true; };
+      img.src = `../tiles/${k}.jpg?b=${bucket}`;
+      bg.set(k, t = nt);
+    }
+    const show = t.ok ? t : t.prev;
+    if (show) ctx.drawImage(show.img, (x * span - view.x) * view.k + W / 2, (y * span - view.y) * view.k + H / 2, span * view.k + 0.5, span * view.k + 0.5);
+  }
+}
+
 function draw() {
   requestAnimationFrame(draw);
   const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
@@ -57,6 +80,7 @@ function draw() {
   if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * 7 + 1]; sy += f[i * 7 + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (showBg) background(W, H);
   ctx.imageSmoothingEnabled = true;
   let shown = 0, missing = 0;
   for (const i of order) {
@@ -83,6 +107,7 @@ cv.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY 
 cv.addEventListener('pointermove', (e) => { if (!drag) return; view.x -= (e.clientX - drag.x) / view.k; view.y -= (e.clientY - drag.y) / view.k; drag = { x: e.clientX, y: e.clientY }; dirty = true; });
 cv.addEventListener('pointerup', () => { drag = null; });
 cv.addEventListener('wheel', (e) => { e.preventDefault(); view.k = Math.max(2, Math.min(128, view.k * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002)))); dirty = true; }, { passive: false });
+addEventListener('keydown', (e) => { if (e.key === 'b' || e.key === 'и') { showBg = !showBg; dirty = true; } });
 cv.addEventListener('dblclick', () => { view.auto = true; dirty = true; });
 </script>
 </body>

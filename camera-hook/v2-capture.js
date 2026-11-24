@@ -46,6 +46,7 @@ void onEnter(GumInvocationContext *ic) {
   unsigned char *x = (unsigned char *) c->xmm;
   guint64 sprite = c->rsi; gint32 *pos = (gint32 *) c->rdx;
   float sx = 1, sy = 1; unsigned int tint = 0xffffffff; unsigned int layer = (unsigned int) c->r8 & 0xff;
+  unsigned int flags = kind <= 3 ? (unsigned int) c->rcx & 0xffff : 0; // DrawingFlags (свечение, тень, …)
   if (kind == 1) tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20));
   else if (kind == 2 || kind == 3) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 32), *(float *)(x + 36), *(float *)(x + 48), *(float *)(x + 52)); }
   else if (kind == 4) { pos = (gint32 *) c->rcx; sx = sy = *(double *)(x + 0); layer = (unsigned int) c->r9 & 0xff; }
@@ -61,7 +62,7 @@ void onEnter(GumInvocationContext *ic) {
   *(float *)(r + 16) = sx;
   *(float *)(r + 20) = sy;
   *(unsigned int *)(r + 24) = tint;
-  *(unsigned int *)(r + 28) = layer | (kind << 8);
+  *(unsigned int *)(r + 28) = layer | (kind << 8) | (flags << 16);
 }`, { buf, count });
 
 const HOOKS = [
