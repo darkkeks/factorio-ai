@@ -104,7 +104,14 @@ function draw() {
       if (px > W || py > H || px + w * view.k < 0 || py + h * view.k < 0) continue;
       ctx.globalAlpha = (s.fl & 2) ? alpha * 0.6 : alpha;
       ctx.globalCompositeOperation = (s.fl & 4) ? 'lighter' : 'source-over';
-      ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
+      const rot = (f[o + 6] >>> 16) / 65536 * 2 * Math.PI;
+      if (rot) {
+        // Поворот вокруг точки отрисовки (сдвиг слоя поворачивается вместе со спрайтом).
+        const ox = (f[o + 1] / 256 - view.x) * view.k + W / 2, oy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
+        ctx.save(); ctx.translate(ox, oy); ctx.rotate(rot);
+        ctx.drawImage(s.img, (s.sx * kx - w / 2) * view.k, (s.sy * ky - h / 2) * view.k, w * view.k, h * view.k);
+        ctx.restore();
+      } else ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
       shown++;
     }
   }

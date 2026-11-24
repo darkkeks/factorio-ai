@@ -48,11 +48,14 @@ void onEnter(GumInvocationContext *ic) {
   unsigned char *x = (unsigned char *) c->xmm;
   guint64 sprite = c->rsi; gint32 *pos = (gint32 *) c->rdx;
   float sx = 1, sy = 1; unsigned int tint = 0xffffffff; unsigned int layer = (unsigned int) c->r8 & 0xff;
-  unsigned int flags = kind <= 3 ? (unsigned int) c->rcx & 0xffff : 0; // DrawingFlags (свечение, тень, …)
+  unsigned int orient = 0; // поворот: доля оборота в 16 битах (RealOrientation — 32-битная доля оборота)
   if (kind == 1) tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20));
   else if (kind == 2 || kind == 3) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 32), *(float *)(x + 36), *(float *)(x + 48), *(float *)(x + 52)); }
   else if (kind == 4) { pos = (gint32 *) c->rcx; sx = sy = *(double *)(x + 0); layer = (unsigned int) c->r9 & 0xff; }
   else if (kind == 5) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 96), *(float *)(x + 100), *(float *)(x + 112), *(float *)(x + 116)); }
+  else if (kind == 10) { orient = ((unsigned int) c->rcx) >> 16; sx = *(double *)(x + 0); sy = *(double *)(x + 16); } /* drawScaledRotatedWithoutTint: руки манипуляторов и т. п. */
+  else if (kind == 8) { layer = (unsigned int) c->r8 & 0xff; } /* drawSlicedVertically: r8b — слой нижней части (подземные конвейеры и т. п.) */
+  else if (kind == 9) { unsigned char *ls = *(unsigned char **)(c->rsp + 8); layer = ls ? ls[0] : 0; } /* drawSlicedHorizontally: массив слоёв — первый аргумент в стеке */
   else if (kind == 6) { pos = (gint32 *) c->rcx; tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20)); }
   if (!sprite || !pos || skip) return;
   int i = g_atomic_int_add(&count, 1);
@@ -64,7 +67,7 @@ void onEnter(GumInvocationContext *ic) {
   *(float *)(r + 16) = sx;
   *(float *)(r + 20) = sy;
   *(unsigned int *)(r + 24) = tint;
-  *(unsigned int *)(r + 28) = layer | (kind << 8) | (flags << 16);
+  *(unsigned int *)(r + 28) = layer | (kind << 8) | (orient << 16);
 }`, { buf, count, skip });
 
 const HOOKS = [
@@ -75,10 +78,12 @@ const HOOKS = [
   ['_ZN9DrawQueue12drawInfoIconE', 4],
   ['_ZN9DrawQueue29drawScaledRotatedTintedRegionE', 5],
   ['_ZN9DrawQueue16drawMaskWithDataE', 6],
-  ['_ZN9DrawQueue28drawScaledRotatedWithoutTintE', 7],
+  ['_ZN9DrawQueue28drawScaledRotatedWithoutTintE', 10],
   ['_ZN9DrawQueue30drawMaskWithOptionalShadowSkipE', 7],
   ['_ZN9DrawQueue10drawScaledE', 7],
   ['_ZN9DrawQueue17drawScaledRotatedE', 7],
+  ['_ZN9DrawQueue20drawSlicedVerticallyE', 8],
+  ['_ZN9DrawQueue22drawSlicedHorizontallyE', 9],
 ];
 for (const [p, kind] of HOOKS) {
   const a = find(p);
