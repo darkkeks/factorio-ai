@@ -190,16 +190,16 @@ const nm = (k) => NAMES[k] || k;
 const STATUS = { no_fuel: 'нет топлива', no_power: 'нет питания', low_power: 'мало питания', not_plugged_in_electric_network: 'не подключено к сети',
   no_minable_resources: 'руда кончилась', missing_science_packs: 'нет колб', no_ammo: 'нет патронов', no_input_fluid: 'нет жидкости', missing_required_fluid: 'нет жидкости' };
 
-const ZMAX = 5, TILE = 512; // на уровне ZMAX — 32 пикселя на клетку, тайл 16×16 клеток
-const CRS = L.extend({}, L.CRS.Simple, { transformation: new L.Transformation(32 / 2 ** ZMAX, 0, 32 / 2 ** ZMAX, 0) });
+const ZREF = 5, ZMAX = 6, TILE = 512; // на уровне ZREF — 32 пикселя на клетку (масштаб игры 1), тайл 16×16 клеток; ZMAX — 64 пикселя на клетку
+const CRS = L.extend({}, L.CRS.Simple, { transformation: new L.Transformation(32 / 2 ** ZREF, 0, 32 / 2 ** ZREF, 0) });
 const ll = (x, y) => L.latLng(y, x);
-const span = (z) => 16 * 2 ** (ZMAX - z);
+const span = (z) => 16 * 2 ** (ZREF - z);
 
 // Адрес хранит позицию и масштаб: #x,y,z
 const start = (location.hash.slice(1).split(',').map(Number));
 const hasStart = start.length === 3 && start.every(Number.isFinite);
-const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0, zoomDelta: 0.5, scrollWheelZoom: false, zoomControl: true, attributionControl: false, zoomAnimation: true })
-  .setView(hasStart ? ll(start[0], start[1]) : ll(0, 0), hasStart ? start[2] : ZMAX - 2);
+const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 0.5, zoomSnap: 0, zoomDelta: 0.5, scrollWheelZoom: false, zoomControl: true, attributionControl: false, zoomAnimation: true })
+  .setView(hasStart ? ll(start[0], start[1]) : ll(0, 0), hasStart ? start[2] : ZREF - 2);
 
 // Колесо и тачпад — свой обработчик: у Leaflet зум колесом идёт ступеньками с задержкой, а щипок тачпада на Mac
 // (мелкие события колеса с ctrlKey) почти не двигал масштаб. Здесь масштаб меняется пропорционально прокрутке,
@@ -290,7 +290,7 @@ const Base = L.GridLayer.extend({
     return el;
   },
 });
-const grid = { tileSize: TILE >> RET, minNativeZoom: 0, maxNativeZoom: ZMAX - RET, maxZoom: ZMAX + 1, updateWhenZooming: true, keepBuffer: 2 };
+const grid = { tileSize: TILE >> RET, minNativeZoom: 0, maxNativeZoom: ZMAX - RET, maxZoom: ZMAX + 0.5, updateWhenZooming: true, keepBuffer: 2 };
 const base = new Base(grid).addTo(map);
 base.on('tileunload', (e) => { const k = tileKey(e.coords); if (shown.get(k) === e.tile) shown.delete(k); });
 // Новую версию сначала загружаем в память и только потом подменяем — без мерцания. Заодно обновляем рамки,
@@ -898,7 +898,7 @@ function drawLayers() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, size.x, size.y);
   if (zoomAnim) return;
-  const o = map.latLngToContainerPoint(ll(0, 0)), k = 32 * 2 ** (map.getZoom() - ZMAX); // пикселей на клетку
+  const o = map.latLngToContainerPoint(ll(0, 0)), k = 32 * 2 ** (map.getZoom() - ZREF); // пикселей на клетку
   const X = (x) => o.x + x * k, Y = (y) => o.y + y * k;
   const seen = (x, y, r) => X(x + r) >= 0 && X(x - r) <= size.x && Y(y + r) >= 0 && Y(y - r) <= size.y;
   const on = (n) => layersOn.has(n) && layerData[n];
@@ -1017,7 +1017,7 @@ function renderSummary() {
     ? summary.alerts.map((a) => `<div class="alert" data-x="${a.x}" data-y="${a.y}"><b>${esc(STATUS[a.status] || a.status)}</b>: ${esc(nm(a.name))}${a.count > 1 ? ' × ' + a.count : ''}</div>`).join('')
     : '<span class="muted">всё работает</span>';
 }
-$('alerts').onclick = (e) => { const a = e.target.closest('.alert'); if (a) { setFollow(false); map.setView(ll(+a.dataset.x, +a.dataset.y), Math.max(map.getZoom(), ZMAX - 1)); } };
+$('alerts').onclick = (e) => { const a = e.target.closest('.alert'); if (a) { setFollow(false); map.setView(ll(+a.dataset.x, +a.dataset.y), Math.max(map.getZoom(), ZREF - 1)); } };
 function renderEvents() {
   $('events').className = events.length ? '' : 'muted';
   $('events').innerHTML = events.length

@@ -44,7 +44,9 @@ const WEB = path.join(ROOT, 'src/map-web');
 const SESSIONS = process.env.CLAUDE_SESSIONS || path.join(os.homedir(), 'robot/.claude/projects/-home-robot'); // транскрипты сессий Claude ботов
 
 const TILE = 512;              // размер тайла в пикселях
-const ZMAX = 5;                // самый подробный уровень: масштаб игры 1, 32 пикселя на клетку
+const ZREF = 5;                // уровень с масштабом игры 1: 32 пикселя на клетку, тайл 16×16 клеток
+const ZMAX = 6;                // самый подробный уровень: масштаб 2, 64 пикселя на клетку — спрайты высокого разрешения;
+                               // его тайлы снимаются только там, где сейчас видно (в тумане вместо них — уровень ZREF)
                                // уровень 0 — масштаб 1/32, меньше игра снимать не умеет
 const JPEG_QUALITY = 75;
 const FRESH_MS = 5_000;        // цель для участков вокруг ботов и игроков
@@ -410,12 +412,12 @@ async function botInfo(name) {
 }
 
 // ---------- подложка: снимки клиента-камеры ----------
-// Тайл уровня z — снимок 512×512 с масштабом 2^(z-ZMAX): на ZMAX это 32 пикселя на клетку и 16 клеток на тайл.
+// Тайл уровня z — снимок 512×512 с масштабом 2^(z-ZREF): на ZREF это 32 пикселя на клетку и 16 клеток на тайл.
 // Игра сама пишет готовые JPEG в script-output клиента-камеры, сервис только раскладывает их по местам.
 
 const key = (z, x, y) => `${z}/${x}/${y}`;
 const tileFile = (z, x, y) => path.join(TILES, String(z), `${x}_${y}.jpg`);
-const span = (z) => 16 * 2 ** (ZMAX - z); // клеток в стороне тайла
+const span = (z) => 16 * 2 ** (ZREF - z); // клеток в стороне тайла
 
 // Туман войны — как в клиенте игры и на сервере, а не в браузере:
 //   чанк виден сейчас (радар, игрок, бот) — живая графика из снимка;
@@ -447,18 +449,17 @@ function tileState(t) {
 // Чанк изменился (видимость или схема) — тайлы всех уровней над ним нужно собрать заново.
 function touchChunk(c) {
   const seen = new Set();
-  for (let dx = 0; dx < 2; dx++) for (let dy = 0; dy < 2; dy++) {
-    let x = c.x * 2 + dx, y = c.y * 2 + dy;
-    for (let z = ZMAX; z >= 0; z--) {
-      const k = key(z, x, y);
-      if (!seen.has(k)) {
-        seen.add(k);
-        let t = tiles.get(k);
-        if (!t) { t = { z, x, y, ts: 0, sig: null, fog: false }; tiles.set(k, t); }
-        t.dirty = true;
-        t.vis = tileState(t).vis;
-      }
-      x >>= 1; y >>= 1;
+  for (let z = ZMAX; z >= 0; z--) {
+    const s = span(z), n = Math.max(1, 32 / s); // тайлов уровня в стороне чанка
+    const x0 = Math.floor(c.x * 32 / s), y0 = Math.floor(c.y * 32 / s);
+    for (let dx = 0; dx < n; dx++) for (let dy = 0; dy < n; dy++) {
+      const x = x0 + dx, y = y0 + dy, k = key(z, x, y);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      let t = tiles.get(k);
+      if (!t) { t = { z, x, y, ts: 0, sig: null, fog: false }; tiles.set(k, t); }
+      t.dirty = true;
+      t.vis = tileState(t).vis;
     }
   }
 }
@@ -613,6 +614,13 @@ async function fogLoop() {
         if (st.vis > 0) { t.vis = st.vis; continue; }
         if (!st.ready) continue;                          // схемы ещё подгружаются
         if (st.sig === t.sig) { t.dirty = false; continue; } // уже собран именно так
+        if (t.z > ZREF) {
+          // Самый подробный уровень в тумане не рисуем: страница покажет вместо него уровень ZREF.
+          // Снимок, сделанный, пока здесь было видно, убираем — в тумане деталей быть не должно.
+          t.dirty = false;
+          if (t.sig) { fs.rmSync(tileFile(t.z, t.x, t.y), { force: true }); t.sig = null; t.ts = 0; t.ver = 0; indexChanged = true; updates.push([t.z, t.x, t.y, 0, 1, 0]); }
+          continue;
+        }
         writeTile(t, encodePng(fogImage(t, 3)));
         publish(t, st, true, updates);
         if (++done >= 12) break;                          // не занимаем процесс надолго
@@ -626,11 +634,11 @@ async function fogLoop() {
 // Приоритеты камеры: 0) тайл нужно пересобрать, 1) поле зрения зрителей, 2) окрестности ботов и игроков, 3) фоновый обход.
 function pick() {
   const hot = new Set();
-  const s = span(ZMAX);
+  const s = span(ZREF);
   for (const a of [...live.bots, ...live.players]) {
     // Четыре ближайших тайла самого подробного уровня: 32×32 клетки вокруг.
     const x = Math.round(a.x / s), y = Math.round(a.y / s);
-    for (let dx = -1; dx <= 0; dx++) for (let dy = -1; dy <= 0; dy++) hot.add(key(ZMAX, x + dx, y + dy));
+    for (let dx = -1; dx <= 0; dx++) for (let dy = -1; dy <= 0; dy++) hot.add(key(ZREF, x + dx, y + dy));
   }
   const viewed = new Set();
   for (const ws of clients) for (const k of ws.view ?? []) viewed.add(k);
@@ -701,7 +709,7 @@ let shotId = 0, failures = 0;
 async function renderBatch(batch) {
   const shots = batch.map((t) => {
     const s = span(t.z);
-    return { t, name: `${SHOT_RUN}-${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZMAX)] };
+    return { t, name: `${SHOT_RUN}-${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZREF)] };
   });
   await lua.inline(LUA.shots, { camera: CAMERA, surface: SURFACE, dir: SHOT_DIR, size: TILE, quality: JPEG_QUALITY, shots: shots.map((s) => [...s.args, s.name]) });
   const deadline = Date.now() + SHOT_TIMEOUT_MS, updates = [], work = [];
@@ -1399,7 +1407,7 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   const tl = [];
   for (const t of tiles.values()) if (t.sig) tl.push([t.z, t.x, t.y, t.ts, t.fog ? 1 : 0, t.ver || t.ts]);
-  send(ws, { t: 'hello', zmax: ZMAX, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, summary, events, live, now: Date.now() });
+  send(ws, { t: 'hello', zmax: ZMAX, zref: ZREF, tile: TILE, surface: SURFACE, fresh_ms: FRESH_MS, sweep_ms: SWEEP_MS, cam: { w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM }, tiles: tl, summary, events, live, now: Date.now() });
   ws.on('message', (data) => {
     try {
       const m = JSON.parse(data);
