@@ -205,12 +205,20 @@ const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0,
 // (мелкие события колеса с ctrlKey) почти не двигал масштаб. Здесь масштаб меняется пропорционально прокрутке,
 // вокруг курсора, раз в кадр. Safari присылает щипок не колесом, а событиями gesture* — их обрабатываем отдельно.
 {
-  let acc = 0, at = null, raf = 0;
+  let acc = 0, at = null, raf = 0, moving = false, endTimer = 0;
+  // Двигаем вид так же, как Leaflet при щипке на телефоне (_move): setZoom без анимации сбрасывает слой тайлов
+  // целиком (viewreset) — экран чернел до загрузки. Так прежние тайлы остаются, пока не загрузятся новые.
   const apply = () => {
     raf = 0;
     if (!acc) return;
-    map.setZoomAround(at, Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), map.getZoom() + acc)), { animate: false });
+    const zoom = Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), map.getZoom() + acc));
     acc = 0;
+    const half = map.getSize().divideBy(2), off = at.subtract(half).multiplyBy(1 - 1 / map.getZoomScale(zoom));
+    const center = map.containerPointToLatLng(half.add(off));
+    if (!moving) { map._stop(); map._moveStart(true, false); moving = true; }
+    map._move(center, zoom);
+    clearTimeout(endTimer);
+    endTimer = setTimeout(() => { moving = false; map._moveEnd(true); }, 200);
   };
   const zoomBy = (d, x, y) => {
     acc += d;
