@@ -90,6 +90,7 @@ function onMessage(type, data) {
     // в основном потоке это остановило бы весь сервис карты): атлас из памяти клиента — YCoCg + альфа, маска — 1 байт.
     if (raw.length === head.w * head.h * 4) { atlases.set(head.atlas, { w: head.w, h: head.h, rgba: raw }); log(`атлас ${head.atlas}: ${head.cls} ${head.w}×${head.h}`); }
     else {
+      if (fs.existsSync(DUMP)) fs.writeFileSync(path.join(DUMP, `raw-${head.w}x${head.h}-${head.fmt}-${head.fmt2}-${head.atlas}.bin`), raw);
       const copy = new Uint8Array(raw.length); copy.set(raw);
       decode(copy, head.w, head.h).then((rgba) => {
         if (atlases.get(head.atlas) !== 'wait') return; // игра переподключилась

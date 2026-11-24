@@ -28,7 +28,8 @@ let showBg = true; // клавиша B — показать/скрыть под�
 
 // Картинка вырезки из атласа: сам спрайт или его часть (нарезанные спрайты, кадры). Грузим по мере появления.
 const shadowCv = document.createElement('canvas'), shadowCtx = shadowCv.getContext('2d'); // буфер теней
-const crops = new Map(); // "n-x-y-w-h" -> { img, ok, failed }
+const crops = new Map();
+const lastImg = new Map(); // место (слой, x, y) -> последняя нарисованная там картинка // "n-x-y-w-h" -> { img, ok, failed }
 function crop(s, x, y, w, h) {
   const full = !x && !y && w === s.w && h === s.h, k = full ? `${s.n}` : `${s.n}-${x}-${y}-${w}-${h}`;
   let c = crops.get(k);
@@ -47,11 +48,12 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') { frame = new Int32Array(e.data); frameN++; dirty = true; return; }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; crops.clear(); }
-    else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; crops.clear(); lastImg.clear(); }
+    // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
+    else if (m.t === 'sprites') { for (const s of m.list) { spr[s.n] = s; crop(s, 0, 0, s.w, s.h); } if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
     else if (m.t === 'cam') { cam = m.w ? m : null; dirty = true; }
-    else if (m.t === 'atlas') dirty = true; // недостающие вырезки перезапросятся при следующей отрисовке
+    else if (m.t === 'atlas') { for (const s of spr) if (s) crop(s, 0, 0, s.w, s.h); dirty = true; } // пришёл атлас — догружаем то, что не нашлось
   };
   ws.onclose = () => setTimeout(connect, 2000);
 }
@@ -109,8 +111,10 @@ function draw() {
     // Слой 255 — освещение (карта света, днём не видна), спрайты-«только свет» — тоже.
     if (!s || s.fl & 8 || layer === 255) continue;
     const cxr = f[o + 7] & 0xffff, cyr = f[o + 7] >>> 16, cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16;
-    const img = crop(s, cxr, cyr, cw, ch);
-    if (!img) { missing++; continue; }
+    let img = crop(s, cxr, cyr, cw, ch);
+    // Кадр анимации, картинка которого ещё грузится: рисуем то, что было на этом месте в прошлый раз (без мигания).
+    const slot = `${layer}:${f[o + 1]}:${f[o + 2]}`;
+    if (img) lastImg.set(slot, img); else if ((img = lastImg.get(slot))) missing++; else { missing++; continue; }
     const w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;      // размер в клетках
     const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
     const r = Math.max(w, h) * view.k;

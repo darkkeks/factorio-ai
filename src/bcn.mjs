@@ -58,3 +58,19 @@ export function decodeBC4Mask(src, w, h) {
   }
   return out;
 }
+
+/** BC3 (DXT5): 16 байт на блок 4×4 — альфа-блок (как BC4), затем цветовой блок BC1. Возвращает RGBA. */
+export function decodeBC3(src, w, h) {
+  const bw = Math.ceil(w / 4), bh = Math.ceil(h / 4), out = Buffer.alloc(w * h * 4), a = new Array(16), c = new Array(48);
+  for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+    const b = (by * bw + bx) * 16;
+    bc4(src, b, a); bc1(src, b + 8, c);
+    for (let i = 0; i < 16; i++) {
+      const px = bx * 4 + (i & 3), py = by * 4 + (i >> 2);
+      if (px >= w || py >= h) continue;
+      const o = (py * w + px) * 4;
+      out[o] = c[i * 3]; out[o + 1] = c[i * 3 + 1]; out[o + 2] = c[i * 3 + 2]; out[o + 3] = a[i];
+    }
+  }
+  return out;
+}
