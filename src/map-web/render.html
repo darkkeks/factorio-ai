@@ -22,6 +22,7 @@ const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
 let gen = '', frame = null, frameN = 0, dirty = true;
 let view = { x: 0, y: 0, k: 24, auto: true };
+let gameOn = false; // подключён ли клиент игры с перехватом
 let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
 
 function load(s) {
@@ -37,7 +38,8 @@ function connect() {
     if (typeof e.data !== 'string') { frame = new Int32Array(e.data); frameN++; dirty = true; return; }
     const m = JSON.parse(e.data);
     if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; }
-    else if (m.t === 'sprites') for (const s of m.list) spr[s.n] = s;
+    else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
+    else if (m.t === 'game') { gameOn = m.on; dirty = true; }
     else if (m.t === 'atlas') for (const s of spr) if (s && !s.ok && !s.img) load(s);
   };
   ws.onclose = () => setTimeout(connect, 2000);
@@ -70,9 +72,10 @@ function draw() {
   requestAnimationFrame(draw);
   const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
   if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; dirty = true; }
-  if (!dirty || !frame) return;
+  if (!dirty) return;
   dirty = false;
-  const f = frame, n = f.length / 7;
+  // Без клиента игры показываем хотя бы подложку — и говорим, почему нет построек.
+  const f = gameOn && frame ? frame : new Int32Array(0), n = f.length / 7;
   // Порядок: слой, затем сверху вниз — так игра сортирует свою очередь.
   const order = new Uint32Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
@@ -97,7 +100,7 @@ function draw() {
     shown++;
   }
   ctx.globalAlpha = 1;
-  document.getElementById('st').textContent = `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length}`;
+  document.getElementById('st').textContent = !gameOn ? 'клиент игры с перехватом сейчас не запущен — видна только подложка со снимков карты' : `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length}`;
 }
 draw();
 

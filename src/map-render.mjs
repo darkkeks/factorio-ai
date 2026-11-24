@@ -121,6 +121,7 @@ net.createServer((c) => {
   if (game) game.destroy();
   game = c;
   log('игра подключилась');
+  setTimeout(() => broadcast(JSON.stringify({ t: 'game', on: true })), 0);
   // Атласы, полученные раньше, могли устареть (другой запуск игры) — начинаем с чистого листа.
   sprites.clear(); byN.length = 0; atlases.clear(); pngs.clear();
   gen = Date.now().toString(36);
@@ -137,7 +138,7 @@ net.createServer((c) => {
       buf = buf.subarray(need); parts = buf.length ? [buf] : []; have = buf.length; need = 4;
     }
   });
-  c.on('close', () => { if (game === c) { game = null; log('игра отключилась'); } });
+  c.on('close', () => { if (game === c) { game = null; log('игра отключилась'); broadcast(JSON.stringify({ t: 'game', on: false })); } });
   c.on('error', () => {});
 }).listen(SOCK, () => log('ждёт игру на', SOCK));
 
