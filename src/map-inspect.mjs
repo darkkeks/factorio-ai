@@ -3,7 +3,10 @@
 // Всё только читает игру через RCON.
 import fs from 'node:fs';
 import path from 'node:path';
-import { lua } from './rcon.mjs';
+import { makeLua } from './map-rcon.mjs';
+
+// Запросы зрителей (клик по постройке, слои) — на своих соединениях, не в очереди за съёмкой.
+const lua = makeLua('map-inspect', 3);
 
 const LUA = {
   // Постройка в точке карты. Как в игре: только там, где чанк сейчас виден (не в тумане войны);

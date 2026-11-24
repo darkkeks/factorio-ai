@@ -13,10 +13,11 @@ import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
-import { lua } from './rcon.mjs';
+import { makeLua } from './map-rcon.mjs';
 import { layer, entityAt, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
+const lua = makeLua('map', 2); // опрос игры и команды камере
 
 const HOST = process.env.MAP_HOST || '172.25.0.1'; // шлюз docker-сети: виден nginx, не виден из интернета
 const PORT = Number(process.env.MAP_PORT || 8766);
