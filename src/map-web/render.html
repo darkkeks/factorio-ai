@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Карта Factorio v2</title>
+<title>Отрисовка Factorio</title>
 <style>
   html, body { height: 100%; margin: 0; background: #000; color: #e8e6e1; font: 14px/1.35 system-ui, sans-serif; overflow: hidden; }
   canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
@@ -13,11 +13,11 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="info"><b>v2 · прототип</b> — игра рисуется в браузере из очереди отрисовки клиента. <span id="st">подключение…</span></div>
+<div id="info"><b>отрисовка в браузере · прототип</b> — игра рисуется в браузере из очереди отрисовки клиента. <span id="st">подключение…</span></div>
 <script>
 'use strict';
 // Прототип: кадр — список «спрайт № n в точке (x, y) с масштабом и цветом», присланный сервисом по WebSocket.
-// Картинки спрайтов — вырезки из атласов игры (/v2/sprite/<поколение>/<n>.png), грузятся по мере появления.
+// Картинки спрайтов — вырезки из атласов игры (/render/sprite/<поколение>/<n>.png), грузятся по мере появления.
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
 let gen = '', frame = null, frameN = 0, dirty = true;

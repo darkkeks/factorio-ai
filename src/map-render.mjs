@@ -1,10 +1,10 @@
-// Прототип веб-карты v2 (factorio.darkkeks.me/v2/): игра рисуется в браузере из перехваченной очереди отрисовки.
+// Прототип отрисовки в браузере (factorio.darkkeks.me/render/; /v2/ на этом домене — API ботов): игра рисуется в браузере из перехваченной очереди отрисовки.
 //
 // Клиент игры с Frida Gadget (~/factorio-camera/hook/v2-capture.js) шлёт сюда по unix-сокету:
 //   тип 1 — кадр: записи по 32 байта (u64 спрайт, i32 x, i32 y в 1/256 клетки, f32 масштаб x, y, u32 цвет RGBA, u32 слой | вид<<8);
 //   тип 2 — описания новых спрайтов (JSON): где лежат в атласе, сдвиг, масштаб;
 //   тип 3 — пиксели атласа (JSON-заголовок, перевод строки, RGBA).
-// Сервис раздаёт браузерам кадры по WebSocket (/v2/ws) и вырезает картинки спрайтов из атласов (/v2/sprite/<n>.png).
+// Сервис раздаёт браузерам кадры по WebSocket (/render/ws) и вырезает картинки спрайтов из атласов (/render/sprite/<n>.png).
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,10 +16,10 @@ import { createRequire } from 'node:module';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
 const SOCK = process.env.V2_SOCK || path.join(os.homedir(), 'factorio-camera/hook/v2.sock');
-const PAGE = path.join(ROOT, 'src/map-web/v2.html');
+const PAGE = path.join(ROOT, 'src/map-web/render.html');
 const DUMP = path.join(os.homedir(), 'factorio-camera/hook/raw'); // есть папка — сжатые атласы пишутся туда (отладка)
 const SEND_MS = 100;           // кадров зрителям — не чаще 10 в секунду
-const log = (...a) => console.log(new Date().toISOString().slice(11, 23), '[v2]', ...a);
+const log = (...a) => console.log(new Date().toISOString().slice(11, 23), '[render]', ...a);
 
 const sprites = new Map();     // адрес спрайта в игре -> { n, ...описание }
 const byN = [];                // номер -> описание
@@ -150,8 +150,8 @@ setInterval(() => {
 }, SEND_MS);
 setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames}, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; }, 60_000);
 
-export const wssV2 = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
-wssV2.on('connection', (ws) => {
+export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
+wssRender.on('connection', (ws) => {
   viewers.add(ws);
   ws.send(JSON.stringify({ t: 'reset', gen }));
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
@@ -160,11 +160,11 @@ wssV2.on('connection', (ws) => {
   ws.on('error', () => viewers.delete(ws));
 });
 
-/** HTTP для /v2/…; true — запрос обработан. */
-export function handleV2(url, reply) {
-  if (url.pathname === '/v2' || url.pathname === '/v2/') { reply(200, 'text/html; charset=utf-8', fs.readFileSync(PAGE)); return true; }
-  // Отладка: атлас целиком, уменьшенный (/v2/debug/atlas/<номер>.png) и список спрайтов (/v2/debug/sprites.json).
-  const d = url.pathname.match(/^\/v2\/debug\/atlas\/(\d{1,3})\.png$/);
+/** HTTP для /render/…; true — запрос обработан. */
+export function handleRender(url, reply) {
+  if (url.pathname === '/render' || url.pathname === '/render/') { reply(200, 'text/html; charset=utf-8', fs.readFileSync(PAGE)); return true; }
+  // Отладка: атлас целиком, уменьшенный (/render/debug/atlas/<номер>.png) и список спрайтов (/render/debug/sprites.json).
+  const d = url.pathname.match(/^\/render\/debug\/atlas\/(\d{1,3})\.png$/);
   if (d) {
     const a = [...atlases.values()].filter((x) => x !== 'wait')[Number(d[1])];
     if (!a) { reply(404, 'text/plain', ''); return true; }
@@ -172,8 +172,8 @@ export function handleV2(url, reply) {
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) a.rgba.copy(out, (y * w + x) * 4, ((y * f) * a.w + x * f) * 4, ((y * f) * a.w + x * f) * 4 + 4);
     reply(200, 'image/png', png(out, w, h)); return true;
   }
-  if (url.pathname === '/v2/debug/sprites.json') { reply(200, 'application/json', JSON.stringify({ atlases: [...atlases].map(([k, v]) => [k, v === 'wait' ? 'wait' : [v.w, v.h]]), sprites: byN })); return true; }
-  const m = url.pathname.match(/^\/v2\/sprite\/([a-z0-9]{1,12})\/(\d{1,7})\.png$/);
+  if (url.pathname === '/render/debug/sprites.json') { reply(200, 'application/json', JSON.stringify({ atlases: [...atlases].map(([k, v]) => [k, v === 'wait' ? 'wait' : [v.w, v.h]]), sprites: byN })); return true; }
+  const m = url.pathname.match(/^\/render\/sprite\/([a-z0-9]{1,12})\/(\d{1,7})\.png$/);
   if (m) {
     const p = m[1] === gen ? spritePng(Number(m[2])) : null;
     if (p) reply(200, 'image/png', p, 'public, max-age=600'); else reply(404, 'text/plain', '', 'no-cache');

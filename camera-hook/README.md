@@ -1,9 +1,9 @@
-# Перехват отрисовки клиента игры (прототип v2)
+# Перехват отрисовки клиента игры (прототип отрисовки в браузере, factorio.darkkeks.me/render/)
 
 `v2-capture.js` — скрипт Frida, который грузится в клиент Factorio через Frida Gadget
 (`LD_PRELOAD=~/factorio-camera/hook/gadget.so`, рядом `gadget.config` с путём к этому файлу).
 Перехватывает `DrawQueue::draw*` (C-обработчик пишет спрайт, позицию, масштаб, цвет, слой в буфер),
-на `DrawEngine::render` отдаёт кадр сервису `src/map-v2.mjs` по unix-сокету `~/factorio-camera/hook/v2.sock`,
+на `DrawEngine::render` отдаёт кадр сервису `src/map-render.mjs` по unix-сокету `~/factorio-camera/hook/v2.sock`,
 по запросу сервиса читает атласы (`copyDataRaw` у `CustomVideoBitmap` / `VideoBitmapOpenGL`).
 
 Устройство структур игры (2.1.24) — в комментариях скрипта: регистры аргументов по дизассемблеру,
