@@ -9,8 +9,8 @@
 // В QuickJS нет TextEncoder: строки здесь только ASCII (JSON с числами и адресами).
 const enc = (str) => { const a = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xff; return a; };
 const SOCK = '/home/darkkeks/factorio-camera/hook/v2.sock';
-const MAX = 65536;       // записей в кадре
-const REC = 32;          // байт на запись
+const MAX = 32768;       // записей в кадре
+const REC = 64;          // байт на запись
 const EVERY = 3;         // отправлять каждый N-й кадр (~20 в секунду при 60 кадрах)
 
 const mod = Process.mainModule;
@@ -20,75 +20,55 @@ const find = (prefix) => { for (const [n, a] of syms) if (n.startsWith(prefix)) 
 const buf = Memory.alloc(MAX * REC);
 const count = Memory.alloc(8);
 const skip = Memory.alloc(8);
-// Регистры по дизассемблеру 2.1.24 (компилятор местами отходит от ABI по сигнатуре, поэтому смотрим на код, не на имена):
-//   kind 0 draw:                       rsi спрайт, rdx позиция, r8d слой
-//   kind 1 drawTinted:                 + цвет xmm0 (r,g) xmm1 (b,a)
-//   kind 2 drawScaledTinted:           масштаб xmm0, xmm1 (double); цвет xmm2, xmm3; r8d слой
-//   kind 3 drawScaledTintedWithoutTint: как 2
-//   kind 4 drawInfoIcon:               rsi спрайт (может быть 0), rcx позиция, xmm0 масштаб (double), r9d слой
-//   kind 5 drawScaledRotatedTintedRegion: rdx позиция, масштаб xmm0, xmm1, цвет xmm6, xmm7, r8d флаги
-//   kind 6 drawMaskWithData:           rsi спрайт, rcx позиция, цвет xmm0, xmm1
-//   kind 7 прочие (rsi спрайт, rdx позиция)
+// Записи кадра читаем в DrawEngine::load(DrawQueue*): игра передаёт сюда каждую очередь кадра, пока та ещё полная.
+// Устройство DrawQueue (2.1.24, по коду draw*): +0x28 u8 смещение слоёв очереди; +0x30 + (смещение + слой)·16 — массив
+// пар {u64 ключ сортировки, SpriteDrawOrder*} для слоя: {указатель, u32 число, u32 ёмкость}; +0x1030 — свечение
+// (при затенении света), +0x1040 — тени (рисуются одним буфером между слоями 119 и 120).
+// SpriteDrawOrder (по renderSpriteDrawOrderRange): +0x00 указатель на поле атласа спрайта (спрайт = он − 0x68),
+// +0x10/+0x14 f32 точка на экране в пикселях, +0x18 u32 поворот (доля оборота), +0x1c u32 флаги,
+// +0x24/+0x28 f32 итоговый масштаб, +0x2c u32 цвет RGBA, +0x30/+0x34 f32 сдвиг вырезки в атласе, +0x38/+0x3c f32 её размер.
+// Запись (REC байт): u64 спрайт, u64 ключ, f32 x, y, u32 поворот, u32 флаги, f32 масштаб x, y, u32 цвет, f32 вырезка x, y, w, h, u32 слой.
 const cm = new CModule(`
 #include <glib.h>
 #include <gum/guminterceptor.h>
 extern unsigned char buf[];
 extern volatile gint count;
-extern volatile gint skip;   // 1 — идёт съёмка снимков карты (take_screenshot): их отрисовку не записываем
+extern volatile gint skip;
 #define CAP ${MAX}
-static inline unsigned int rgba(float r, float g, float b, float a) {
-  int R = r * 255, G = g * 255, B = b * 255, A = a * 255;
-  if (R < 0) R = 0; if (R > 255) R = 255; if (G < 0) G = 0; if (G > 255) G = 255;
-  if (B < 0) B = 0; if (B > 255) B = 255; if (A < 0) A = 0; if (A > 255) A = 255;
-  return R | (G << 8) | (B << 16) | ((unsigned) A << 24);
-}
-void onEnter(GumInvocationContext *ic) {
-  GumCpuContext *c = ic->cpu_context;
-  int kind = GPOINTER_TO_INT(gum_invocation_context_get_listener_function_data(ic));
-  unsigned char *x = (unsigned char *) c->xmm;
-  guint64 sprite = c->rsi; gint32 *pos = (gint32 *) c->rdx;
-  float sx = 1, sy = 1; unsigned int tint = 0xffffffff; unsigned int layer = (unsigned int) c->r8 & 0xff;
-  unsigned int orient = 0; // поворот: доля оборота в 16 битах (RealOrientation — 32-битная доля оборота)
-  if (kind == 1) tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20));
-  else if (kind == 2 || kind == 3) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 32), *(float *)(x + 36), *(float *)(x + 48), *(float *)(x + 52)); }
-  else if (kind == 4) { pos = (gint32 *) c->rcx; sx = sy = *(double *)(x + 0); layer = (unsigned int) c->r9 & 0xff; }
-  else if (kind == 5) { sx = *(double *)(x + 0); sy = *(double *)(x + 16); tint = rgba(*(float *)(x + 96), *(float *)(x + 100), *(float *)(x + 112), *(float *)(x + 116)); }
-  else if (kind == 10) { orient = ((unsigned int) c->rcx) >> 16; sx = *(double *)(x + 0); sy = *(double *)(x + 16); } /* drawScaledRotatedWithoutTint: руки манипуляторов и т. п. */
-  else if (kind == 8) { layer = (unsigned int) c->r8 & 0xff; } /* drawSlicedVertically: r8b — слой нижней части (подземные конвейеры и т. п.) */
-  else if (kind == 9) { unsigned char *ls = *(unsigned char **)(c->rsp + 8); layer = ls ? ls[0] : 0; } /* drawSlicedHorizontally: массив слоёв — первый аргумент в стеке */
-  else if (kind == 6) { pos = (gint32 *) c->rcx; tint = rgba(*(float *)(x + 0), *(float *)(x + 4), *(float *)(x + 16), *(float *)(x + 20)); }
-  if (!sprite || !pos || skip) return;
+static void put(guint64 key, unsigned char *o, unsigned int layer) {
+  if (!o) return;
   int i = g_atomic_int_add(&count, 1);
   if (i >= CAP) return;
   unsigned char *r = buf + i * ${REC};
-  *(guint64 *)(r + 0) = sprite;
-  *(gint32 *)(r + 8) = pos[0];
-  *(gint32 *)(r + 12) = pos[1];
-  *(float *)(r + 16) = sx;
-  *(float *)(r + 20) = sy;
-  *(unsigned int *)(r + 24) = tint;
-  *(unsigned int *)(r + 28) = layer | (kind << 8) | (orient << 16);
-}`, { buf, count, skip });
-
-const HOOKS = [
-  ['_ZN9DrawQueue4drawERK6SpriteRK11MapPosition12DrawingFlags', 0],
-  ['_ZN9DrawQueue10drawTintedERK6Sprite', 1],
-  ['_ZN9DrawQueue16drawScaledTintedERK6Sprite', 2],
-  ['_ZN9DrawQueue27drawScaledTintedWithoutTintE', 3],
-  ['_ZN9DrawQueue12drawInfoIconE', 4],
-  ['_ZN9DrawQueue29drawScaledRotatedTintedRegionE', 5],
-  ['_ZN9DrawQueue16drawMaskWithDataE', 6],
-  ['_ZN9DrawQueue28drawScaledRotatedWithoutTintE', 10],
-  ['_ZN9DrawQueue30drawMaskWithOptionalShadowSkipE', 7],
-  ['_ZN9DrawQueue10drawScaledE', 7],
-  ['_ZN9DrawQueue17drawScaledRotatedE', 7],
-  ['_ZN9DrawQueue20drawSlicedVerticallyE', 8],
-  ['_ZN9DrawQueue22drawSlicedHorizontallyE', 9],
-];
-for (const [p, kind] of HOOKS) {
-  const a = find(p);
-  if (a) Interceptor.attach(a, cm.onEnter, ptr(kind)); else console.log('[v2] нет функции', p);
+  *(guint64 *)(r + 0) = *(guint64 *)(o + 0) - 0x68;
+  *(guint64 *)(r + 8) = key;
+  *(float *)(r + 16) = *(float *)(o + 0x10);
+  *(float *)(r + 20) = *(float *)(o + 0x14);
+  *(guint32 *)(r + 24) = *(guint32 *)(o + 0x18);
+  *(guint32 *)(r + 28) = *(guint32 *)(o + 0x1c);
+  *(float *)(r + 32) = *(float *)(o + 0x24);
+  *(float *)(r + 36) = *(float *)(o + 0x28);
+  *(guint32 *)(r + 40) = *(guint32 *)(o + 0x2c);
+  *(float *)(r + 44) = *(float *)(o + 0x30);
+  *(float *)(r + 48) = *(float *)(o + 0x34);
+  *(float *)(r + 52) = *(float *)(o + 0x38);
+  *(float *)(r + 56) = *(float *)(o + 0x3c);
+  *(guint32 *)(r + 60) = layer;
 }
+static void list(unsigned char *e, unsigned int layer) {
+  unsigned char *arr = *(unsigned char **)e;
+  unsigned int n = *(unsigned int *)(e + 8), cap = *(unsigned int *)(e + 12);
+  if (!arr || n > cap || n > 1000000) return;
+  for (unsigned int k = 0; k < n; k++) put(*(guint64 *)(arr + k * 16), *(unsigned char **)(arr + k * 16 + 8), layer);
+}
+void onLoad(GumInvocationContext *ic) {
+  if (skip) return;
+  unsigned char *q = (unsigned char *) gum_invocation_context_get_nth_argument(ic, 1);
+  for (int l = 0; l < 256; l++) list(q + 0x30 + l * 16, l);
+  list(q + 0x1040, 1000);   /* тени */
+  list(q + 0x1030, 1001);   /* свечение */
+}`, { buf, count, skip });
+Interceptor.attach(find('_ZN10DrawEngine4loadEPK9DrawQueue'), cm.onLoad);
 
 // ---------- связь с сервисом ----------
 let conn = null, connecting = false, frame = 0;

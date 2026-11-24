@@ -26,11 +26,20 @@ let cam = null;       // что видит клиент-камера: {x, y, w, 
 let gameOn = false; // подключён ли клиент игры с перехватом
 let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
 
-function load(s) {
-  s.img = new Image();
-  s.img.onload = () => { s.ok = true; dirty = true; };
-  s.img.onerror = () => { s.img = null; }; // атлас ещё не пришёл — попробуем позже
-  s.img.src = `sprite/${gen}/${s.n}.png`;
+// Картинка вырезки из атласа: сам спрайт или его часть (нарезанные спрайты, кадры). Грузим по мере появления.
+const shadowCv = document.createElement('canvas'), shadowCtx = shadowCv.getContext('2d'); // буфер теней
+const crops = new Map(); // "n-x-y-w-h" -> { img, ok, failed }
+function crop(s, x, y, w, h) {
+  const full = !x && !y && w === s.w && h === s.h, k = full ? `${s.n}` : `${s.n}-${x}-${y}-${w}-${h}`;
+  let c = crops.get(k);
+  if (!c) {
+    c = { img: new Image(), ok: false };
+    c.img.onload = () => { c.ok = true; dirty = true; };
+    c.img.onerror = () => { crops.delete(k); }; // атлас ещё не пришёл — попросим снова
+    c.img.src = `sprite/${gen}/${k}.png`;
+    crops.set(k, c);
+  }
+  return c.ok ? c.img : null;
 }
 function connect() {
   const ws = new WebSocket(new URL('ws', location.href).href.replace(/^http/, 'ws'));
@@ -38,11 +47,11 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') { frame = new Int32Array(e.data); frameN++; dirty = true; return; }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; }
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; crops.clear(); }
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
     else if (m.t === 'cam') { cam = m.w ? m : null; dirty = true; }
-    else if (m.t === 'atlas') for (const s of spr) if (s && !s.ok && !s.img) load(s);
+    else if (m.t === 'atlas') dirty = true; // недостающие вырезки перезапросятся при следующей отрисовке
   };
   ws.onclose = () => setTimeout(connect, 2000);
 }
@@ -77,44 +86,43 @@ function draw() {
   if (!dirty) return;
   dirty = false;
   // Без клиента игры показываем хотя бы подложку — и говорим, почему нет построек.
-  const f = gameOn && frame ? frame : new Int32Array(0), n = f.length / 7;
-  // Порядок: слой, затем сверху вниз — так игра сортирует свою очередь.
-  const order = new Uint32Array(n);
-  for (let i = 0; i < n; i++) order[i] = i;
-  order.sort((a, b) => (f[a * 7 + 6] & 255) - (f[b * 7 + 6] & 255) || f[a * 7 + 2] - f[b * 7 + 2] || f[a * 7 + 1] - f[b * 7 + 1]);
+  // Запись (9 целых): спрайт, x, y (1/256 клетки, центр), поворот<<16 | слой, масштаб x, y (×1000, атлас → 32 на клетку),
+  // цвет RGBA, вырезка x | y<<16, w | h<<16. Порядок записей — уже игровой (слой, ключ сортировки), рисуем подряд.
+  const R = 9, f = gameOn && frame ? frame : new Int32Array(0), n = f.length / R;
   if (view.auto && cam) { view.x = cam.x; view.y = cam.y; }
-  else if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * 7 + 1]; sy += f[i * 7 + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   if (showBg) background(W, H);
   ctx.imageSmoothingEnabled = true;
-  let shown = 0, missing = 0;
-  // Каждая запись — цепочка слоёв спрайта (next). Флаги слоя: 2 — тень (чёрная маска, полупрозрачно),
-  // 4 — свечение (добавляется к картинке), 8 — только свет (виден ночью) — днём не рисуем.
-  // Два прохода, как в игре: сначала все тени, потом всё остальное.
-  for (const pass of [0, 1]) for (const i of order) {
-    const o = i * 7;
-    const kx = f[o + 3] / 1000, ky = f[o + 4] / 1000, tint = f[o + 5] >>> 0, alpha = (tint >>> 24) / 255;
-    for (let s = spr[f[o]], d = 0; s && d < 16; s = s.next >= 0 ? spr[s.next] : null, d++) {
-      if (s.fl & 8 || ((s.fl & 2) ? 0 : 1) !== pass) continue;
-      if (!s.ok) { if (!s.img) load(s); missing++; continue; }
-      const w = s.w * s.sc * kx / 32, h = s.h * s.sc * ky / 32;               // размер в клетках
-      const cx = f[o + 1] / 256 + s.sx * kx, cy = f[o + 2] / 256 + s.sy * ky;  // центр в клетках
-      const px = (cx - w / 2 - view.x) * view.k + W / 2, py = (cy - h / 2 - view.y) * view.k + H / 2;
-      if (px > W || py > H || px + w * view.k < 0 || py + h * view.k < 0) continue;
-      ctx.globalAlpha = (s.fl & 2) ? alpha * 0.6 : alpha;
-      ctx.globalCompositeOperation = (s.fl & 4) ? 'lighter' : 'source-over';
-      const rot = (f[o + 6] >>> 16) / 65536 * 2 * Math.PI;
-      if (rot) {
-        // Поворот вокруг точки отрисовки (сдвиг слоя поворачивается вместе со спрайтом).
-        const ox = (f[o + 1] / 256 - view.x) * view.k + W / 2, oy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
-        ctx.save(); ctx.translate(ox, oy); ctx.rotate(rot);
-        ctx.drawImage(s.img, (s.sx * kx - w / 2) * view.k, (s.sy * ky - h / 2) * view.k, w * view.k, h * view.k);
-        ctx.restore();
-      } else ctx.drawImage(s.img, px, py, w * view.k, h * view.k);
-      shown++;
-    }
+  let shown = 0, missing = 0, g = ctx, shadowsDone = false;
+  // Тени игра собирает в отдельный буфер (перекрытия не темнеют сильнее) и накладывает его между слоями 119 и 120.
+  if (shadowCv.width !== cv.width || shadowCv.height !== cv.height) { shadowCv.width = cv.width; shadowCv.height = cv.height; }
+  const flushShadows = () => {
+    if (g === ctx) return;
+    g = ctx; ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 0.5; ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(shadowCv, 0, 0); ctx.restore();
+  };
+  for (let i = 0; i < n; i++) {
+    const o = i * R, s = spr[f[o]];
+    const layer = f[o + 3] & 0xffff, rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
+    if (layer === 1000 && g === ctx && !shadowsDone) { shadowsDone = true; g = shadowCtx; g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H); }
+    else if (layer !== 1000) flushShadows();
+    // Слой 255 — освещение (карта света, днём не видна), спрайты-«только свет» — тоже.
+    if (!s || s.fl & 8 || layer === 255) continue;
+    const cxr = f[o + 7] & 0xffff, cyr = f[o + 7] >>> 16, cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16;
+    const img = crop(s, cxr, cyr, cw, ch);
+    if (!img) { missing++; continue; }
+    const w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;      // размер в клетках
+    const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
+    const r = Math.max(w, h) * view.k;
+    if (cx - r > W || cy - r > H || cx + r < 0 || cy + r < 0) continue;
+    const tint = f[o + 6] >>> 0;
+    g.globalAlpha = layer === 1000 ? 1 : (tint >>> 24) / 255;
+    g.globalCompositeOperation = layer === 1001 || (s.fl & 4) ? 'lighter' : 'source-over';
+    if (rot) { g.save(); g.translate(cx, cy); g.rotate(rot); g.drawImage(img, -w / 2 * view.k, -h / 2 * view.k, w * view.k, h * view.k); g.restore(); }
+    else g.drawImage(img, cx - w / 2 * view.k, cy - h / 2 * view.k, w * view.k, h * view.k);
+    shown++;
   }
+  flushShadows();
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   // Вне вида камеры — только снимки карты (без анимаций): затемняем и обводим границу.

@@ -46,14 +46,16 @@ function png(rgba, w, h) {
   head.writeUInt32BE(w, 0); head.writeUInt32BE(h, 4); head[8] = 8; head[9] = 6;
   return Buffer.concat([Buffer.from('\x89PNG\r\n\x1a\n', 'latin1'), chunk('IHDR', head), chunk('IDAT', zlib.deflateSync(raw, { level: 6 })), chunk('IEND', Buffer.alloc(0))]);
 }
-function spritePng(n) {
-  let p = pngs.get(n);
+function spritePng(n, cx = 0, cy = 0, cw = 0, ch = 0) {
+  const k = `${n}:${cx}:${cy}:${cw}:${ch}`;
+  let p = pngs.get(k);
   if (p) return p;
   const s = byN[n], a = s && atlases.get(s.atlas);
-  if (!a || a === 'wait' || !s.w || !s.h || s.x + s.w > a.w || s.y + s.h > a.h) return null;
-  const out = Buffer.alloc(s.w * s.h * 4);
-  for (let y = 0; y < s.h; y++) a.rgba.copy(out, y * s.w * 4, ((s.y + y) * a.w + s.x) * 4, ((s.y + y) * a.w + s.x + s.w) * 4);
-  pngs.set(n, p = png(out, s.w, s.h));
+  const x0 = (s?.x ?? 0) + cx, y0 = (s?.y ?? 0) + cy, w = cw || s?.w, h = ch || s?.h;
+  if (!a || a === 'wait' || !w || !h || x0 < 0 || y0 < 0 || x0 + w > a.w || y0 + h > a.h) return null;
+  const out = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) a.rgba.copy(out, y * w * 4, ((y0 + y) * a.w + x0) * 4, ((y0 + y) * a.w + x0 + w) * 4);
+  pngs.set(k, p = png(out, w, h));
   return p;
 }
 
@@ -101,20 +103,58 @@ function onMessage(type, data) {
     broadcast(JSON.stringify({ t: 'atlas' })); // страница перезапросит спрайты, которые не загрузились
   } else if (type === 1) {
     frames++;
-    // Перекладываем в формат для браузера: номер спрайта вместо адреса, по 7 чисел на запись.
-    const n = data.length / 32, out = new Int32Array(n * 7);
-    let k = 0;
-    for (let i = 0; i < n; i++) {
-      const o = i * 32, s = sprites.get('0x' + data.readBigUInt64LE(o).toString(16));
-      if (!s) continue;
-      out[k++] = s.n; out[k++] = data.readInt32LE(o + 8); out[k++] = data.readInt32LE(o + 12);
-      out[k++] = Math.round(data.readFloatLE(o + 16) * 1000); out[k++] = Math.round(data.readFloatLE(o + 20) * 1000);
-      out[k++] = data.readUInt32LE(o + 24) | 0; out[k++] = data.readUInt32LE(o + 28);
-    }
-    frame = Buffer.from(out.buffer, 0, k * 4);
+    frame = convert(data);
   }
 }
-// next — номер следующего слоя (заполняется, когда его описание пришло), fl — флаги слоя.
+
+// Кадр от игры: готовые записи SpriteDrawOrder (по 64 байта, см. camera-hook/v2-capture.js) — точка на экране
+// в пикселях, итоговый масштаб, поворот, цвет, вырезка из атласа и ключ сортировки (в нём мировая позиция).
+// Переводим экран в мир: масштаб — итоговый масштаб записи / масштаб спрайта, сдвиг камеры — медиана
+// (экран − масштаб·мировая позиция из ключа). Сортируем как игра: по слою, внутри — по ключу;
+// тени (слой 1000) — одним буфером между слоями 119 и 120.
+const REC = 64;
+let lastCal = 0;
+const median = (a) => { a.sort((x, y) => x - y); return a.length ? a[a.length >> 1] : 0; };
+function convert(data) {
+  const n = data.length / REC, recs = [], zs = [];
+  for (let i = 0; i < n; i++) {
+    const o = i * REC, s = sprites.get('0x' + data.readBigUInt64LE(o).toString(16));
+    if (!s) continue;
+    const fl = data.readUInt32LE(o + 28);
+    if (fl & 0x400) continue;                      // такие записи игра пропускает при отрисовке
+    const key = data.readBigUInt64LE(o + 8), v = (key - 0x8000000000000080n) & 0xffffffffffffffffn;
+    let kx = Number((v >> 6n) & 0xffffffffn) - 2 ** 28; if (kx >= 2 ** 31) kx -= 2 ** 32;
+    let ky = Number(v >> 35n); if (ky >= 2 ** 28) ky -= 2 ** 29;
+    const r = { s, key, kx: kx / 256, ky: ky / 256, px: data.readFloatLE(o + 16), py: data.readFloatLE(o + 20), rot: data.readUInt32LE(o + 24),
+      sx: data.readFloatLE(o + 32), sy: data.readFloatLE(o + 36), tint: data.readUInt32LE(o + 40) | 0,
+      cx: Math.round(data.readFloatLE(o + 44)), cy: Math.round(data.readFloatLE(o + 48)), cw: Math.round(data.readFloatLE(o + 52)), ch: Math.round(data.readFloatLE(o + 56)),
+      layer: data.readUInt32LE(o + 60) };
+    if (s.scale > 0 && r.sx > 0) zs.push(r.sx / s.scale);
+    recs.push(r);
+  }
+  // Масштаб — у самой камеры (ширина её вида известна сервису карты); медиана по записям врёт: у значков свой масштаб.
+  const zoom = cam?.w ? 1280 / 32 / cam.w : 0.75, Z = 32 * zoom;
+  const cxs = [], cys = [];
+  // Калибруем по спрайтам без сдвига (предметы, значки): у них точка на экране — ровно позиция из ключа.
+  for (const r of recs) if (Math.abs(r.kx) < 1e6 && Math.abs(r.ky) < 1e6 && !r.rot && Math.abs(r.s.shiftX) < 0.01 && Math.abs(r.s.shiftY) < 0.01) { cxs.push(r.px - Z * r.kx); cys.push(r.py - Z * r.ky); }
+  const CX = median(cxs), CY = median(cys);
+  if (Date.now() - lastCal > 300000) { lastCal = Date.now(); log(`калибровка: масштаб ${zoom.toFixed(3)}, центр экрана в мире ${((640 - CX) / Z).toFixed(2)}, ${((360 - CY) / Z).toFixed(2)}, записей ${recs.length}, пример ключ ${recs[0]?.kx},${recs[0]?.ky} экран ${recs[0]?.px},${recs[0]?.py}`); }
+  const ord = (l) => (l === 1000 ? 239 : l === 1001 ? 511 : l * 2);
+  recs.sort((a, b) => ord(a.layer) - ord(b.layer) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  // Браузеру — по 9 целых: номер спрайта, x, y (1/256 клетки), поворот (16 бит) | слой (16 бит),
+  // масштаб x, y (×1000, в «пикселях атласа на 32 клетки»), цвет, вырезка x|y<<16, w|h<<16.
+  const out = new Int32Array(recs.length * 9);
+  let k = 0;
+  for (const r of recs) {
+    out[k++] = r.s.n;
+    out[k++] = Math.round((r.px - CX) / Z * 256); out[k++] = Math.round((r.py - CY) / Z * 256);
+    out[k++] = ((r.rot >>> 16) << 16) | (r.layer & 0xffff);
+    out[k++] = Math.round(r.sx / zoom * 1000); out[k++] = Math.round(r.sy / zoom * 1000);
+    out[k++] = r.tint;
+    out[k++] = (r.cx & 0xffff) | (r.cy << 16); out[k++] = (r.cw & 0xffff) | (r.ch << 16);
+  }
+  return Buffer.from(out.buffer, 0, k * 4);
+}
 const pub = (s) => ({ n: s.n, w: s.w, h: s.h, sx: s.shiftX, sy: s.shiftY, sc: s.scale, fl: s.fl, next: s.next ? sprites.get(s.next)?.n ?? -1 : -1 });
 
 fs.rmSync(SOCK, { force: true });
@@ -183,9 +223,9 @@ export function handleRender(url, reply) {
     reply(200, 'image/png', png(out, w, h)); return true;
   }
   if (url.pathname === '/render/debug/sprites.json') { reply(200, 'application/json', JSON.stringify({ atlases: [...atlases].map(([k, v]) => [k, v === 'wait' ? 'wait' : [v.w, v.h]]), sprites: byN })); return true; }
-  const m = url.pathname.match(/^\/render\/sprite\/([a-z0-9]{1,12})\/(\d{1,7})\.png$/);
+  const m = url.pathname.match(/^\/render\/sprite\/([a-z0-9]{1,12})\/(\d{1,7})(?:-(\d{1,5})-(\d{1,5})-(\d{1,5})-(\d{1,5}))?\.png$/);
   if (m) {
-    const p = m[1] === gen ? spritePng(Number(m[2])) : null;
+    const p = m[1] === gen ? spritePng(Number(m[2]), Number(m[3] ?? 0), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)) : null;
     if (p) reply(200, 'image/png', p, 'public, max-age=600'); else reply(404, 'text/plain', '', 'no-cache');
     return true;
   }
