@@ -90,7 +90,7 @@ function draw() {
   // Без клиента игры показываем хотя бы подложку — и говорим, почему нет построек.
   // Запись (9 целых): спрайт, x, y (1/256 клетки, центр), поворот<<16 | слой, масштаб x, y (×1000, атлас → 32 на клетку),
   // цвет RGBA, вырезка x | y<<16, w | h<<16. Порядок записей — уже игровой (слой, ключ сортировки), рисуем подряд.
-  const R = 9, f = gameOn && frame ? frame : new Int32Array(0), n = f.length / R;
+  const R = 10, f = gameOn && frame ? frame : new Int32Array(0), n = f.length / R;
   if (view.auto && cam) { view.x = cam.x; view.y = cam.y; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
@@ -119,11 +119,19 @@ function draw() {
     const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
     const r = Math.max(w, h) * view.k;
     if (cx - r > W || cy - r > H || cx + r < 0 || cy + r < 0) continue;
-    const tint = f[o + 6] >>> 0;
-    g.globalAlpha = layer === 1000 ? 1 : (tint >>> 24) / 255;
-    g.globalCompositeOperation = layer === 1001 || (s.fl & 4) ? 'lighter' : 'source-over';
-    if (rot) { g.save(); g.translate(cx, cy); g.rotate(rot); g.drawImage(img, -w / 2 * view.k, -h / 2 * view.k, w * view.k, h * view.k); g.restore(); }
-    else g.drawImage(img, cx - w / 2 * view.k, cy - h / 2 * view.k, w * view.k, h * view.k);
+    // Смешивание как в игре (предумноженная прозрачность): результат = картинка·цвет_записи + фон·(1 − α·α_записи).
+    // Если яркость цвета записи равна его прозрачности (обычный случай) — это обычное наложение с прозрачностью.
+    // Иначе (дым, свечение с α = 0) — два шага: приглушить фон на α·α_записи и добавить картинку с весом яркости.
+    const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
+    const put = (alpha, op) => {
+      g.globalAlpha = alpha; g.globalCompositeOperation = op;
+      if (rot) { g.save(); g.translate(cx, cy); g.rotate(rot); g.drawImage(img, -w / 2 * view.k, -h / 2 * view.k, w * view.k, h * view.k); g.restore(); }
+      else g.drawImage(img, cx - w / 2 * view.k, cy - h / 2 * view.k, w * view.k, h * view.k);
+    };
+    if (layer === 1000) put(1, 'source-over');                                   // тень — в буфер теней
+    else if (layer === 1001 || (s.fl & 4)) put(Math.max(tl, ta), 'lighter');     // свечение — сложением
+    else if (Math.abs(tl - ta) < 0.02) put(ta, 'source-over');
+    else { if (ta > 0) put(ta, 'destination-out'); if (tl > 0) put(tl, 'lighter'); }
     shown++;
   }
   flushShadows();

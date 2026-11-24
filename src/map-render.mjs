@@ -55,6 +55,11 @@ function spritePng(n, cx = 0, cy = 0, cw = 0, ch = 0) {
   if (!a || a === 'wait' || !w || !h || x0 < 0 || y0 < 0 || x0 + w > a.w || y0 + h > a.h) return null;
   const out = Buffer.alloc(w * h * 4);
   for (let y = 0; y < h; y++) a.rgba.copy(out, y * w * 4, ((y0 + y) * a.w + x0) * 4, ((y0 + y) * a.w + x0 + w) * 4);
+  // В атласах игры цвет предумножен на прозрачность; браузер ждёт обычный — делим обратно.
+  for (let i = 0; i < out.length; i += 4) {
+    const al = out[i + 3];
+    if (al && al < 255) { out[i] = Math.min(255, out[i] * 255 / al); out[i + 1] = Math.min(255, out[i + 1] * 255 / al); out[i + 2] = Math.min(255, out[i + 2] * 255 / al); }
+  }
   pngs.set(k, p = png(out, w, h));
   return p;
 }
@@ -114,7 +119,7 @@ function onMessage(type, data) {
 // (экран − масштаб·мировая позиция из ключа). Сортируем как игра: по слою, внутри — по ключу;
 // тени (слой 1000) — одним буфером между слоями 119 и 120.
 const REC = 64;
-let lastCal = 0;
+let lastCal = 0, calBad = 0;
 const median = (a) => { a.sort((x, y) => x - y); return a.length ? a[a.length >> 1] : 0; };
 function convert(data) {
   const n = data.length / REC, recs = [], zs = [];
@@ -126,7 +131,7 @@ function convert(data) {
     const key = data.readBigUInt64LE(o + 8), v = (key - 0x8000000000000080n) & 0xffffffffffffffffn;
     let kx = Number((v >> 6n) & 0xffffffffn) - 2 ** 28; if (kx >= 2 ** 31) kx -= 2 ** 32;
     let ky = Number(v >> 35n); if (ky >= 2 ** 28) ky -= 2 ** 29;
-    const r = { s, key, kx: kx / 256, ky: ky / 256, px: data.readFloatLE(o + 16), py: data.readFloatLE(o + 20), rot: data.readUInt32LE(o + 24),
+    const r = { s, key, fl, kx: kx / 256, ky: ky / 256, px: data.readFloatLE(o + 16), py: data.readFloatLE(o + 20), rot: data.readUInt32LE(o + 24),
       sx: data.readFloatLE(o + 32), sy: data.readFloatLE(o + 36), tint: data.readUInt32LE(o + 40) | 0,
       cx: Math.round(data.readFloatLE(o + 44)), cy: Math.round(data.readFloatLE(o + 48)), cw: Math.round(data.readFloatLE(o + 52)), ch: Math.round(data.readFloatLE(o + 56)),
       layer: data.readUInt32LE(o + 60) };
@@ -138,13 +143,16 @@ function convert(data) {
   const cxs = [], cys = [];
   // Калибруем по спрайтам без сдвига (предметы, значки): у них точка на экране — ровно позиция из ключа.
   for (const r of recs) if (Math.abs(r.kx) < 1e6 && Math.abs(r.ky) < 1e6 && !r.rot && Math.abs(r.s.shiftX) < 0.01 && Math.abs(r.s.shiftY) < 0.01) { cxs.push(r.px - Z * r.kx); cys.push(r.py - Z * r.ky); }
-  const CX = median(cxs), CY = median(cys);
-  if (Date.now() - lastCal > 300000) { lastCal = Date.now(); log(`калибровка: масштаб ${zoom.toFixed(3)}, центр экрана в мире ${((640 - CX) / Z).toFixed(2)}, ${((360 - CY) / Z).toFixed(2)}, записей ${recs.length}, пример ключ ${recs[0]?.kx},${recs[0]?.ky} экран ${recs[0]?.px},${recs[0]?.py}`); }
+  // Сдвиг экрана — самое частое значение (экранные точки у спрайтов без сдвига совпадают до пикселя), а не медиана.
+  const mode = (a) => { const c = new Map(); let best = 0, bv = 0; for (const v of a) { const k = Math.round(v * 4); const n = (c.get(k) || 0) + 1; c.set(k, n); if (n > best) { best = n; bv = k / 4; } } return [bv, best]; };
+  const [CX, nx] = mode(cxs), [CY, ny] = mode(cys);
+  if (Math.min(nx, ny) < 5) calBad++;
+  if (Date.now() - lastCal > 600000) { lastCal = Date.now(); log(`калибровка: плохих кадров ${calBad}, совпадений ${nx}/${ny} из ${cxs.length}, масштаб ${zoom.toFixed(3)}, центр экрана в мире ${((640 - CX) / Z).toFixed(2)}, ${((360 - CY) / Z).toFixed(2)}, записей ${recs.length}, пример ключ ${recs[0]?.kx},${recs[0]?.ky} экран ${recs[0]?.px},${recs[0]?.py}`); }
   const ord = (l) => (l === 1000 ? 239 : l === 1001 ? 511 : l * 2);
   recs.sort((a, b) => ord(a.layer) - ord(b.layer) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  // Браузеру — по 9 целых: номер спрайта, x, y (1/256 клетки), поворот (16 бит) | слой (16 бит),
+  // Браузеру — по 10 целых (последнее — флаги записи): номер спрайта, x, y (1/256 клетки), поворот (16 бит) | слой (16 бит),
   // масштаб x, y (×1000, в «пикселях атласа на 32 клетки»), цвет, вырезка x|y<<16, w|h<<16.
-  const out = new Int32Array(recs.length * 9);
+  const out = new Int32Array(recs.length * 10);
   let k = 0;
   for (const r of recs) {
     out[k++] = r.s.n;
@@ -153,6 +161,7 @@ function convert(data) {
     out[k++] = Math.round(r.sx / zoom * 1000); out[k++] = Math.round(r.sy / zoom * 1000);
     out[k++] = r.tint;
     out[k++] = (r.cx & 0xffff) | (r.cy << 16); out[k++] = (r.cw & 0xffff) | (r.ch << 16);
+    out[k++] = r.fl; // флаги записи (режим смешивания и т. п.)
   }
   return Buffer.from(out.buffer, 0, k * 4);
 }
