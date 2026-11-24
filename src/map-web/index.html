@@ -9,6 +9,8 @@
   html, body, #map { height: 100%; margin: 0; }
   body { font: 14px/1.35 system-ui, sans-serif; color: #e8e6e1; background: #111; overflow: hidden; }
   #map { background: #000; }
+  /* Схема тумана войны — по пикселю на клетку, как карта в игре: при увеличении не размываем, а оставляем чёткие клетки. */
+  #map img.fog { image-rendering: pixelated; }
   .leaflet-container { font: inherit; }
 
   .actor { transition: transform 1s linear; white-space: nowrap; pointer-events: auto; }
@@ -198,32 +200,37 @@ const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0.
 // ---------- тайлы с версиями ----------
 const tiles = new Map(); // "z/x/y" -> когда снят по часам сервера (0 — ещё не снят)
 const shown = new Map(); // "z/x/y" -> <img> на экране
+const fogTiles = new Set(); // тайлы целиком в тумане войны: они не устаревают, пока чанк снова не увидят
 const vers = new Map();  // "z/x/y" -> версия картинки: меняется, только когда новый снимок отличается от прежнего
 const tileUrl = (k) => `tiles/${k}.jpg?v=${vers.get(k)}`;
 const EMPTY = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+// На экранах высокой плотности (телефоны) берём тайлы на уровень подробнее и показываем вдвое меньше:
+// иначе тайл растягивается в 2–3 раза и всё размывается. RET — на сколько уровней подробнее.
+const RET = (window.devicePixelRatio || 1) >= 1.5 ? 1 : 0;
+const tileKey = (c) => `${c.z + RET}/${c.x}/${c.y}`;
 const Base = L.GridLayer.extend({
   createTile(c) {
     const img = document.createElement('img');
-    const k = `${c.z}/${c.x}/${c.y}`;
+    const k = tileKey(c);
     img.alt = '';
+    img.classList.toggle('fog', fogTiles.has(k));
     img.src = tiles.get(k) ? tileUrl(k) : EMPTY;
     shown.set(k, img);
     return img;
   },
 });
-const grid = { tileSize: TILE, minNativeZoom: 0, maxNativeZoom: ZMAX, maxZoom: ZMAX + 1, updateWhenZooming: false, keepBuffer: 1 };
+const grid = { tileSize: TILE >> RET, minNativeZoom: 0, maxNativeZoom: ZMAX - RET, maxZoom: ZMAX + 1, updateWhenZooming: false, keepBuffer: 1 };
 const base = new Base(grid).addTo(map);
-base.on('tileunload', (e) => { const c = e.coords; const k = `${c.z}/${c.x}/${c.y}`; if (shown.get(k) === e.tile) shown.delete(k); });
+base.on('tileunload', (e) => { const k = tileKey(e.coords); if (shown.get(k) === e.tile) shown.delete(k); });
 // Новую версию сначала загружаем в память и только потом подменяем — без мерцания.
 function refreshTile(k) {
   const img = shown.get(k);
   if (!img || !tiles.get(k)) return;
   const url = tileUrl(k), pre = new Image();
-  pre.onload = () => { if (shown.get(k) === img && tileUrl(k) === url) img.src = url; };
+  pre.onload = () => { if (shown.get(k) === img && tileUrl(k) === url) { img.src = url; img.classList.toggle('fog', fogTiles.has(k)); } };
   pre.src = url;
 }
 
-const fogTiles = new Set(); // тайлы целиком в тумане войны: они не устаревают, пока чанк снова не увидят
 function setTile(z, x, y, ts, fog, ver) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); vers.set(k, ver || ts); if (fog) fogTiles.add(k); else fogTiles.delete(k); return k; }
 
 // ---------- свежесть ----------
@@ -231,7 +238,7 @@ let offset = 0, sweepMs = 600000, paused = false;
 const now = () => Date.now() + offset;
 const staleLayer = L.layerGroup().addTo(map);
 function age(ms) { const s = Math.max(0, Math.round(ms / 1000)); return s < 90 ? `${s} с` : s < 5400 ? `${Math.round(s / 60)} мин` : `${Math.round(s / 3600)} ч`; }
-const viewZ = () => Math.max(0, Math.min(ZMAX, Math.round(map.getZoom())));
+const viewZ = () => Math.max(0, Math.min(ZMAX - RET, Math.round(map.getZoom()))) + RET; // уровень тайлов, которые сейчас на экране
 function updateFresh() {
   const b = map.getBounds(), z = viewZ(), s = span(z);
   const x1 = Math.floor(Math.min(b.getWest(), b.getEast()) / s), x2 = Math.floor(Math.max(b.getWest(), b.getEast()) / s);

@@ -666,7 +666,9 @@ const jpegDone = (file) => {
 function overlay(shotFile, rgba) {
   return new Promise((resolve, reject) => {
     const ff = spawn('ffmpeg', ['-loglevel', 'error', '-i', shotFile, '-f', 'rawvideo', '-pix_fmt', 'rgba', '-video_size', `${TILE}x${TILE}`, '-i', 'pipe:0',
-      '-filter_complex', 'overlay', '-frames:v', '1', '-q:v', '4', '-f', 'mjpeg', 'pipe:1'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+      '-filter_complex', 'overlay', '-frames:v', '1',
+      // Без прореживания цвета (4:4:4): иначе мелкие цветные пятна схемы (гнёзда — 3×3 пикселя на дальнем уровне) расплываются.
+      '-pix_fmt', 'yuvj444p', '-q:v', '2', '-f', 'mjpeg', 'pipe:1'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
     const out = [];
     ff.stdout.on('data', (d) => out.push(d));
     ff.on('error', reject);
