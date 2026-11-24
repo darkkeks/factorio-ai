@@ -4,9 +4,11 @@
 // и длинный текст расходится по ~270 байт за тик. Запрос сведений о постройке (5 КБ кода) поэтому выполнялся
 // только через 20 тиков — 330 мс, хотя сам код работает за доли миллисекунды. Теперь код один раз кладётся
 // в глобальную таблицу web_map (у сервера и у всех клиентов, которые в этот момент в игре), дальше вызов — пара
-// сотен байт, один тик. Функции только читают игру, поэтому клиент, вошедший позже и не знающий их, ничего
-// не теряет: у него вызов молча падает внутри pcall, а ответ печатает только сервер. После перезапуска сервера
-// таблицы нет — вызов отвечает «нет функции», и код отправляется заново.
+// сотен байт, один тик. Так можно только с кодом, который ЧИТАЕТ игру: клиент, вошедший позже, функций не знает,
+// у него вызов молча падает внутри pcall, а ответ печатает только сервер. Код, который что-то меняет или должен
+// сработать у клиента (снимки, положение камеры, режим зрителя), отправляется целиком — lua.inline: иначе вошедший
+// позже клиент его не выполнит (снимков не будет, а изменение состояния только у сервера — рассинхронизация).
+// После перезапуска сервера таблицы нет — вызов отвечает «нет функции», и код отправляется заново.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -30,8 +32,21 @@ export function makeLua(name, size = 1) {
     // Самую первую Lua-команду на карте сервер отклоняет с предупреждением про достижения — тогда ответ пустой.
     return out.trim() ? JSON.parse(out) : { missing: true };
   };
-  return async function lua(code, args = {}) {
-    const c = pool.reduce((a, b) => (b.busy < a.busy ? b : a));
+  const pick = () => pool.reduce((a, b) => (b.busy < a.busy ? b : a));
+  async function inline(code, args = {}) {
+    const c = pick();
+    c.busy++;
+    try {
+      const cmd = `/silent-command local A = helpers.json_to_table('${esc(args)}') local ok, res = pcall(function() ${code} end) rcon.print(helpers.table_to_json({ ok = ok, res = res }))`;
+      let out = await c.command(cmd);
+      if (!out.trim()) out = await c.command(cmd);
+      const r = JSON.parse(out);
+      if (!r.ok) throw new Error(`Lua: ${String(r.res).slice(0, 500)}`);
+      return r.res;
+    } finally { c.busy--; }
+  }
+  async function lua(code, args = {}) {
+    const c = pick();
     c.busy++;
     try {
       const id = fnId(code);
@@ -44,5 +59,7 @@ export function makeLua(name, size = 1) {
       if (!r.ok) throw new Error(`Lua: ${String(r.res).slice(0, 500)}`);
       return r.res;
     } finally { c.busy--; }
-  };
+  }
+  lua.inline = inline;
+  return lua;
 }

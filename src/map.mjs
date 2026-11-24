@@ -303,7 +303,7 @@ async function liveLoop() {
       if (!live.ok && quickFails < 3) nextStart = 0; // сервер игры снова отвечает — камеру можно пробовать сразу
       if (r.paused && !pausedAt) pausedAt = Date.now();
       if (!r.paused) pausedAt = 0;
-      if (r.camera?.connected && !r.camera.spectator) { await lua(LUA.spectate, { camera: CAMERA }); log('камера переведена в режим зрителя'); }
+      if (r.camera?.connected && !r.camera.spectator) { await lua.inline(LUA.spectate, { camera: CAMERA }); log('камера переведена в режим зрителя'); }
       const was = live.camera;
       live = { tick: r.tick, paused: r.paused, bots: here(r.bots), players: here(r.players), ok: true, camera: !!r.camera?.connected, target: live.target, sleep: sleeping };
       if (live.camera && !was) targetSent = ''; // камера только что вошла: настроить заново
@@ -351,7 +351,7 @@ async function aimCamera() {
   const id = `${target.kind}:${target.name}`;
   // Повторяем раз в 10 секунд: персонаж мог погибнуть и появиться заново, а заодно чистим чат с экрана клиента.
   if (id === targetSent && now - targetAt < 10_000) return;
-  const r = await lua(LUA.follow, { camera: CAMERA, kind: target.kind, name: target.name, zoom: CAMERA_ZOOM, setup: targetSent === '' });
+  const r = await lua.inline(LUA.follow, { camera: CAMERA, kind: target.kind, name: target.name, zoom: CAMERA_ZOOM, setup: targetSent === '' });
   if (r.ok) { if (id !== targetSent) log(`камера следит за ${target.name}${target.by ? ' (выбор зрителя)' : ''}`); targetSent = id; targetAt = now; }
 }
 
@@ -703,7 +703,7 @@ async function renderBatch(batch) {
     const s = span(t.z);
     return { t, name: `${SHOT_RUN}-${++shotId}.jpg`, args: [(t.x + 0.5) * s, (t.y + 0.5) * s, 2 ** (t.z - ZMAX)] };
   });
-  await lua(LUA.shots, { camera: CAMERA, surface: SURFACE, dir: SHOT_DIR, size: TILE, quality: JPEG_QUALITY, shots: shots.map((s) => [...s.args, s.name]) });
+  await lua.inline(LUA.shots, { camera: CAMERA, surface: SURFACE, dir: SHOT_DIR, size: TILE, quality: JPEG_QUALITY, shots: shots.map((s) => [...s.args, s.name]) });
   const deadline = Date.now() + SHOT_TIMEOUT_MS, updates = [], work = [];
   let left = shots;
   while (left.length && Date.now() < deadline) {
