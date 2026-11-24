@@ -11,6 +11,8 @@
   #map { background: #000; }
   /* Схема тумана войны — по пикселю на клетку, как карта в игре: при увеличении не размываем, а оставляем чёткие клетки. */
   #map img.fog { image-rendering: pixelated; }
+  #map .tile { overflow: hidden; }
+  #map .tile img { position: absolute; }
   .leaflet-container { font: inherit; }
 
   .actor { transition: transform 1s linear; white-space: nowrap; pointer-events: auto; }
@@ -147,6 +149,8 @@
   #ent .arrow { color: #9a968c; padding: 0 2px; }
   @media (min-width: 701px) { body:has(#side:not(.hidden)) #layers, body:has(#side:not(.hidden)) #ent { right: 340px; } }
   @media (max-width: 700px) { #ent { left: 10px; right: 10px; width: auto; top: auto; bottom: 112px; max-height: 40%; z-index: 1001; } }
+  #hover { position: fixed; z-index: 2000; padding: 3px 8px; background: rgba(16, 16, 16, .9); border: 1px solid #555; border-radius: 3px; font-size: 13px; pointer-events: none; white-space: nowrap; }
+  #hover.hidden { display: none; }
   .leaflet-control-attribution { display: none; }
   @media (max-width: 700px) { #side { width: auto; left: 10px; } }
 </style>
@@ -194,7 +198,7 @@ const span = (z) => 16 * 2 ** (ZMAX - z);
 // Адрес хранит позицию и масштаб: #x,y,z
 const start = (location.hash.slice(1).split(',').map(Number));
 const hasStart = start.length === 3 && start.every(Number.isFinite);
-const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0.5, zoomControl: true, attributionControl: false, zoomAnimation: true })
+const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0, zoomDelta: 0.5, wheelPxPerZoomLevel: 120, wheelDebounceTime: 20, zoomControl: true, attributionControl: false, zoomAnimation: true })
   .setView(hasStart ? ll(start[0], start[1]) : ll(0, 0), hasStart ? start[2] : ZMAX - 2);
 
 // ---------- тайлы с версиями ----------
@@ -208,27 +212,57 @@ const EMPTY = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAI
 // иначе тайл растягивается в 2–3 раза и всё размывается. RET — на сколько уровней подробнее.
 const RET = (window.devicePixelRatio || 1) >= 1.5 ? 1 : 0;
 const tileKey = (c) => `${c.z + RET}/${c.x}/${c.y}`;
+// Тайл на экране — рамка с картинкой внутри. Пока своего тайла нет (ещё не снят), в рамке показывается увеличенный
+// кусок ближайшего более грубого уровня — без чёрных дыр. Готовым тайл объявляется только после загрузки картинки:
+// до этого Leaflet держит на экране тайлы прежнего масштаба, и при зуме ничего не пропадает.
+function source(k) {
+  if (tiles.get(k)) return { k, d: 0, ox: 0, oy: 0 };
+  const [z, x, y] = k.split('/').map(Number);
+  for (let d = 1; d <= z; d++) {
+    const f = 2 ** d, px = Math.floor(x / f), py = Math.floor(y / f), pk = `${z - d}/${px}/${py}`;
+    if (tiles.get(pk)) return { k: pk, d, ox: x - px * f, oy: y - py * f };
+  }
+  return null;
+}
+function paint(el, k, done) {
+  const src = source(k), img = el.firstChild;
+  const finish = () => { if (done) { const d = done; done = null; d(null, el); } };
+  if (!src) { img.style.display = 'none'; el._src = ''; el._srcKey = ''; requestAnimationFrame(finish); return; }
+  const url = tileUrl(src.k);
+  if (el._src === url) return finish();
+  const pre = new Image();
+  pre.onload = () => {
+    if (shown.get(k) !== el) return finish();
+    const f = 2 ** src.d;
+    img.src = url; el._src = url; el._srcKey = src.k;
+    img.style.cssText = `display:block;width:${f * 100}%;height:${f * 100}%;left:${-src.ox * 100}%;top:${-src.oy * 100}%`;
+    img.classList.toggle('fog', fogTiles.has(src.k));
+    finish();
+  };
+  pre.onerror = finish;
+  pre.src = url;
+}
 const Base = L.GridLayer.extend({
-  createTile(c) {
-    const img = document.createElement('img');
-    const k = tileKey(c);
+  createTile(c, done) {
+    const el = document.createElement('div'), img = document.createElement('img');
+    el.className = 'tile';
     img.alt = '';
-    img.classList.toggle('fog', fogTiles.has(k));
-    img.src = tiles.get(k) ? tileUrl(k) : EMPTY;
-    shown.set(k, img);
-    return img;
+    el.appendChild(img);
+    const k = tileKey(c);
+    shown.set(k, el);
+    paint(el, k, done);
+    return el;
   },
 });
-const grid = { tileSize: TILE >> RET, minNativeZoom: 0, maxNativeZoom: ZMAX - RET, maxZoom: ZMAX + 1, updateWhenZooming: false, keepBuffer: 1 };
+const grid = { tileSize: TILE >> RET, minNativeZoom: 0, maxNativeZoom: ZMAX - RET, maxZoom: ZMAX + 1, updateWhenZooming: true, keepBuffer: 2 };
 const base = new Base(grid).addTo(map);
 base.on('tileunload', (e) => { const k = tileKey(e.coords); if (shown.get(k) === e.tile) shown.delete(k); });
-// Новую версию сначала загружаем в память и только потом подменяем — без мерцания.
+// Новую версию сначала загружаем в память и только потом подменяем — без мерцания. Заодно обновляем рамки,
+// где этот тайл стоял заменой более подробного.
 function refreshTile(k) {
-  const img = shown.get(k);
-  if (!img || !tiles.get(k)) return;
-  const url = tileUrl(k), pre = new Image();
-  pre.onload = () => { if (shown.get(k) === img && tileUrl(k) === url) { img.src = url; img.classList.toggle('fog', fogTiles.has(k)); } };
-  pre.src = url;
+  const el = shown.get(k);
+  if (el) paint(el, k);
+  for (const [sk, sel] of shown) if (sk !== k && sel._srcKey === k) paint(sel, sk);
 }
 
 function setTile(z, x, y, ts, fog, ver) { const k = `${z}/${x}/${y}`; tiles.set(k, ts); vers.set(k, ver || ts); if (fog) fogTiles.add(k); else fogTiles.delete(k); return k; }
@@ -388,7 +422,6 @@ $('live-full').onclick = () => { if (document.fullscreenElement) document.exitFu
 if (new URLSearchParams(location.search).has('live')) $('live-btn').onclick(); // ссылка сразу с живым окном: ?live
 
 // ---------- панель бота ----------
-let botTimer = null;
 function setFollow(on) {
   following = on && !!selected;
   $('bot-follow').classList.toggle('on', following);
@@ -396,8 +429,9 @@ function setFollow(on) {
   if (following) wsSend({ t: 'follow', kind: 'bot', name: selected });
 }
 // Бот открывается в том же окне, что и любая выбранная постройка, — с очередью крафта, инвентарём и логом.
+// Данные присылает сервис по WebSocket (раз в секунду, только когда что-то изменилось).
 function openBot(name) {
-  ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = '';
+  ENT.gen++; ENT.sel = null; ENT.html = '';
   selected = name;
   $('ent').classList.add('bot');
   $('ent').classList.remove('hidden');
@@ -405,13 +439,11 @@ function openBot(name) {
   $('ent-body').innerHTML = '<section class="muted">загрузка…</section>';
   $('ent').scrollTop = 0;
   lastBotHtml = '';
-  clearInterval(botTimer);
   botBox();
-  loadBot();
-  botTimer = setInterval(loadBot, 2000);
+  sendSelect();
 }
 function botBox() { const a = actors.find((x) => x.name === selected); if (a) drawEntBox([a.x - 0.6, a.y - 1.6, a.x + 0.6, a.y + 0.4]); }
-function closeBot() { selected = null; setFollow(false); clearInterval(botTimer); $('ent').classList.remove('bot'); }
+function closeBot() { selected = null; setFollow(false); $('ent').classList.remove('bot'); }
 $('bot-follow').onclick = () => {
   setFollow(!following);
   const b = following && actors.find((x) => x.name === selected);
@@ -422,13 +454,10 @@ const utcTime = (t) => { const d = new Date(); const [h, mi, s] = t.split(':').m
 const count = (v) => (v >= 10000 ? `${Math.round(v / 1000)}k` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v);
 const slot = (name, n) => `<div class="slot" data-item="${esc(name)}" data-n="${n}"><img src="icon/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()"><small>${esc(nm(name))}</small><b>${count(n)}</b></div>`;
 let lastBotHtml = '';
-async function loadBot() {
-  const name = selected;
+function renderBot(name, b) {
+  if (name !== selected) return;
   try {
-    const r = await fetch('api/bot?name=' + encodeURIComponent(name));
-    if (name !== selected) return;
-    if (!r.ok) { $('ent-body').innerHTML = '<section class="muted">бота нет на сервере</section>'; return; }
-    const b = await r.json();
+    if (!b) { $('ent-body').innerHTML = '<section class="muted">бота нет на сервере</section>'; lastBotHtml = ''; return; }
     const inv = Object.entries(b.inventory).sort((x, y) => y[1] - x[1]);
     const live = actors.find((x) => x.name === name);
     const doing = (live && live.act) || (b.mining ? 'копает' : b.walking ? 'идёт' : b.queue.length ? 'крафтит' : 'стоит');
@@ -443,7 +472,7 @@ async function loadBot() {
     body.innerHTML = html;
     box.scrollTop = keep;
     if (tipFor && !document.contains(tipFor)) { const again = body.querySelector(`.slot[data-item="${CSS.escape(tipFor.dataset.item)}"]`); if (again && tip.classList.contains('pinned')) showTip(again, true); else hideTip(); }
-  } catch { /* следующая попытка через 2 секунды */ }
+  } catch { /* испорченный ответ — ждём следующего */ }
 }
 
 // ---------- сессии Claude бота ----------
@@ -635,7 +664,7 @@ window.addEventListener('scroll', () => { if (!tip.classList.contains('hidden'))
 // В тумане войны, как и в игре, ничего не выбирается.
 map.createPane('select').style.zIndex = 460; // рамка выбора — поверх слоёв карты
 map.getPane('select').style.pointerEvents = 'none';
-const ENT = { x: 0, y: 0, timer: null, box: null, html: '', gen: 0 };
+const ENT = { sel: null, box: null, html: '', gen: 0 };
 const watts = (w) => (w >= 1e9 ? `${+(w / 1e9).toFixed(2)} ГВт` : w >= 1e6 ? `${+(w / 1e6).toFixed(2)} МВт` : w >= 1e3 ? `${+(w / 1e3).toFixed(1)} кВт` : `${Math.round(w)} Вт`);
 const num = (v) => (v >= 100 ? Math.round(v) : +v.toFixed(1));
 const GREEN = new Set(['working', 'normal', 'fully_charged', 'charging', 'discharging', 'ghost', 'networks_connected', 'opened_by_circuit_network', 'turned_off_during_daytime', 'thrust_not_required', 'on_the_way']);
@@ -691,34 +720,115 @@ function entHtml(e) {
   return out.join('');
 }
 const list = (v) => (Array.isArray(v) ? v : []); // пустая таблица Lua приходит объектом {}
-function drawEntBox(b) {
-  // Жёлтые уголки вокруг выбранной постройки, как в игре.
+// Жёлтые уголки вокруг постройки, как в игре.
+function corners(b) {
   const [x1, y1, x2, y2] = b, d = Math.min(x2 - x1, y2 - y1) * 0.28;
-  const lines = [[[x1, y1 + d], [x1, y1], [x1 + d, y1]], [[x2 - d, y1], [x2, y1], [x2, y1 + d]], [[x2, y2 - d], [x2, y2], [x2 - d, y2]], [[x1 + d, y2], [x1, y2], [x1, y2 - d]]].map((l) => l.map(([x, y]) => ll(x, y)));
+  return [[[x1, y1 + d], [x1, y1], [x1 + d, y1]], [[x2 - d, y1], [x2, y1], [x2, y1 + d]], [[x2, y2 - d], [x2, y2], [x2 - d, y2]], [[x1 + d, y2], [x1, y2], [x1, y2 - d]]].map((l) => l.map(([x, y]) => ll(x, y)));
+}
+function drawEntBox(b) {
+  const lines = corners(b);
   if (ENT.box) ENT.box.setLatLngs(lines); else ENT.box = L.polyline(lines, { color: '#ffd23a', weight: 3, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
 }
-function closeEnt() { closeBot(); ENT.gen++; clearInterval(ENT.timer); ENT.timer = null; ENT.html = ''; $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
-async function loadEnt(first) {
-  const gen = ENT.gen;
-  let e;
-  try { e = await api(`api/entity?x=${ENT.x}&y=${ENT.y}`); } catch { return; }
-  if (gen !== ENT.gen) return;
+function closeEnt() { closeBot(); ENT.gen++; ENT.sel = null; ENT.html = ''; sendSelect(); $('ent').classList.add('hidden'); if (ENT.box) { ENT.box.remove(); ENT.box = null; } }
+// Что выделено — сообщаем сервису, он присылает свежие данные сам (4 раза в секунду, только изменения).
+function sendSelect() { wsSend(selected ? { t: 'select', bot: selected } : ENT.sel ? { t: 'select', x: ENT.sel.x, y: ENT.sel.y } : { t: 'select' }); }
+function renderEnt(e) {
   if (!e || !e.name) return closeEnt(); // пусто, туман войны или постройку убрали
   if (e.bot) return openBot(e.bot);     // персонаж бота — показываем самого бота
   drawEntBox(e.box);
+  $('ent').classList.remove('bot');
   $('ent-name').textContent = nm(e.name) + (e.ghost ? ' (призрак)' : '');
-  const html = entHtml(e);
+  const html = entHtml(e), first = !ENT.html;
   if (html !== ENT.html) { const body = $('ent'), keep = body.scrollTop; ENT.html = html; $('ent-body').innerHTML = html; body.scrollTop = first ? 0 : keep; }
   $('ent').classList.remove('hidden');
 }
-map.on('click', (ev) => {
+function selectAt(x, y, hit) {
   closeBot();
-  ENT.gen++; ENT.x = +ev.latlng.lng.toFixed(3); ENT.y = +ev.latlng.lat.toFixed(3);
-  clearInterval(ENT.timer);
-  loadEnt(true);
-  ENT.timer = setInterval(() => { if (!document.hidden) loadEnt(false); }, 1000);
+  ENT.gen++; ENT.html = '';
+  ENT.sel = { x: +x.toFixed(3), y: +y.toFixed(3) };
+  // Рамку и название показываем сразу по рамкам с наведения, не дожидаясь ответа игры.
+  if (hit) { drawEntBox(hit.box); $('ent-name').textContent = nm(hit.name) + (hit.ghost ? ' (призрак)' : ''); $('ent-body').innerHTML = '<section class="muted">загрузка…</section>'; $('ent').classList.remove('bot', 'hidden'); }
+  sendSelect();
+}
+map.on('click', (ev) => {
+  const hit = hoverAt(ev.latlng.lng, ev.latlng.lat);
+  // По найденной рамке спрашиваем центр постройки: так ответ не зависит от того, в какой край кликнули.
+  if (hit) selectAt((hit.box[0] + hit.box[2]) / 2, (hit.box[1] + hit.box[3]) / 2, hit); else selectAt(ev.latlng.lng, ev.latlng.lat, null);
 });
 $('ent-close').onclick = closeEnt;
+
+// ---------- наведение ----------
+// Как в игре: постройка под курсором подсвечивается сразу. Рамки всех построек видимых чанков страница получает
+// один раз (и перечитывает раз в 5 секунд, пока курсор рядом) и ищет постройку под курсором сама, без запроса.
+const BOXES = new Map(); // "cx,cy" -> { at, data | false (чанк не виден), pending }
+const BOX_TTL = 5000;
+let hoverBox = null, hoverKey = '', boxQueue = new Set(), boxTimer = null;
+function wantChunks(cx, cy) {
+  const now = Date.now();
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    const k = `${cx + dx},${cy + dy}`, c = BOXES.get(k);
+    if ((!c || now - c.at > BOX_TTL) && !(c && c.pending)) boxQueue.add(k);
+  }
+  if (boxQueue.size && !boxTimer) boxTimer = setTimeout(fetchBoxes, 30);
+}
+async function fetchBoxes() {
+  boxTimer = null;
+  const keys = [...boxQueue].slice(0, 25);
+  keys.forEach((k) => boxQueue.delete(k));
+  for (const k of keys) { const c = BOXES.get(k) || { at: 0, data: null }; c.pending = true; BOXES.set(k, c); }
+  try {
+    const r = await api('api/boxes?c=' + keys.join(';'));
+    const now = Date.now();
+    keys.forEach((k, i) => BOXES.set(k, { at: now, data: r[i] || false }));
+    if (lastMouse) onHover(lastMouse.x, lastMouse.y);
+  } catch { for (const k of keys) { const c = BOXES.get(k); if (c) c.pending = false; } }
+  if (boxQueue.size && !boxTimer) boxTimer = setTimeout(fetchBoxes, 30);
+}
+// Постройка под точкой: из нескольких — с большим приоритетом выделения, затем меньшая; руда — если построек нет.
+function hoverAt(x, y) {
+  const cx = Math.floor(x / 32), cy = Math.floor(y / 32), X = x * 8, Y = y * 8;
+  let best = null;
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    const c = BOXES.get(`${cx + dx},${cy + dy}`), d = c && c.data;
+    if (!d) continue;
+    const b = list(d.b), n = list(d.n);
+    for (let i = 0; i < b.length; i += 7) {
+      if (X < b[i + 1] || X > b[i + 3] || Y < b[i + 2] || Y > b[i + 4]) continue;
+      const area = (b[i + 3] - b[i + 1]) * (b[i + 4] - b[i + 2]);
+      if (!best || b[i + 5] > best.prio || (b[i + 5] === best.prio && area < best.area)) best = { name: n[b[i] - 1], prio: b[i + 5], area, ghost: !!b[i + 6], box: [b[i + 1] / 8, b[i + 2] / 8, b[i + 3] / 8, b[i + 4] / 8] };
+    }
+  }
+  if (best) return best;
+  const c = BOXES.get(`${cx},${cy}`), d = c && c.data;
+  if (d && d.r) {
+    const tx = Math.floor(x), ty = Math.floor(y), k = d.r.charCodeAt((ty - cy * 32) * 32 + (tx - cx * 32)) - 48;
+    if (k > 0) return { name: list(d.rn)[k - 1], box: [tx, ty, tx + 1, ty + 1] };
+  }
+  return null;
+}
+let lastMouse = null;
+const hoverTip = document.createElement('div');
+hoverTip.id = 'hover';
+hoverTip.className = 'hidden';
+document.body.appendChild(hoverTip);
+function onHover(x, y, px, py) {
+  wantChunks(Math.floor(x / 32), Math.floor(y / 32));
+  const hit = hoverAt(x, y), key = hit ? hit.box.join(',') : '';
+  if (px !== undefined) { hoverTip.style.left = px + 16 + 'px'; hoverTip.style.top = py + 18 + 'px'; }
+  if (key === hoverKey) return;
+  hoverKey = key;
+  if (hoverBox) { hoverBox.remove(); hoverBox = null; }
+  hoverTip.classList.toggle('hidden', !hit);
+  map.getContainer().style.cursor = hit ? 'pointer' : '';
+  if (!hit) return;
+  hoverTip.textContent = nm(hit.name) + (hit.ghost ? ' (призрак)' : '');
+  hoverBox = L.polyline(corners(hit.box), { color: '#ffd23a', weight: 2, opacity: 0.85, interactive: false, lineCap: 'square', pane: 'select' }).addTo(map);
+}
+if (matchMedia('(hover: hover)').matches) {
+  map.on('mousemove', (ev) => { lastMouse = { x: ev.latlng.lng, y: ev.latlng.lat }; onHover(lastMouse.x, lastMouse.y, ev.originalEvent.clientX, ev.originalEvent.clientY); });
+  map.on('mouseout', () => { lastMouse = null; hoverKey = ''; hoverTip.classList.add('hidden'); if (hoverBox) { hoverBox.remove(); hoverBox = null; } });
+  map.on('zoomstart movestart', () => hoverTip.classList.add('hidden'));
+}
 
 // ---------- слои карты ----------
 // Те же переключатели, что в виде карты в игре. Данные слоёв сервис читает из игры, пока слой включён хотя бы у одного зрителя.
@@ -889,16 +999,36 @@ function sendView() {
   const b = map.getBounds();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'view', x1: b.getWest(), x2: b.getEast(), y1: b.getSouth(), y2: b.getNorth(), z: viewZ() }));
 }
+// Тайлы двух более грубых уровней вокруг вида держим в кеше браузера: при отдалении они нужны сразу,
+// а весят мало (на уровень грубее — вчетверо меньше тайлов на ту же площадь).
+const warm = new Map(); // url -> Image
+function prefetchCoarse() {
+  const b = map.getBounds(), z = viewZ(), x1 = b.getWest(), x2 = b.getEast(), y1 = Math.min(b.getSouth(), b.getNorth()), y2 = Math.max(b.getSouth(), b.getNorth()), w = x2 - x1, h = y2 - y1;
+  const keep = new Set();
+  for (let d = 1; d <= 2 && z - d >= 0; d++) {
+    const s = span(z - d);
+    for (let x = Math.floor((x1 - w) / s); x <= Math.floor((x2 + w) / s); x++)
+      for (let y = Math.floor((y1 - h) / s); y <= Math.floor((y2 + h) / s); y++) {
+        const k = `${z - d}/${x}/${y}`;
+        if (!tiles.get(k)) continue;
+        const url = tileUrl(k);
+        keep.add(url);
+        if (!warm.has(url)) { const im = new Image(); im.src = url; warm.set(url, im); }
+      }
+  }
+  for (const u of warm.keys()) if (!keep.has(u)) warm.delete(u);
+}
 map.on('moveend', () => {
+  prefetchCoarse();
   const c = map.getCenter();
-  history.replaceState(null, '', `#${c.lng.toFixed(0)},${c.lat.toFixed(0)},${map.getZoom()}`);
+  history.replaceState(null, '', `#${c.lng.toFixed(0)},${c.lat.toFixed(0)},${+map.getZoom().toFixed(2)}`);
   sendView();
   updateFresh();
 });
 document.addEventListener('visibilitychange', sendView);
 function connect() {
   ws = new WebSocket(new URL('ws', location.href.split('#')[0]).href.replace(/^http/, 'ws'));
-  ws.onopen = sendView;
+  ws.onopen = () => { sendView(); sendSelect(); };
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.now) offset = m.now - Date.now();
@@ -911,12 +1041,15 @@ function connect() {
       vers.clear();
       for (const [z, x, y, ts, fog, ver] of m.tiles) setTile(z, x, y, ts, fog, ver);
       for (const k of shown.keys()) refreshTile(k);
+      prefetchCoarse();
       summary = m.summary; events = m.events || [];
       renderSummary(); renderEvents(); onLive(m.live);
     } else if (m.t === 'live') onLive(m);
     else if (m.t === 'tiles') {
       for (const [z, x, y, ts, fog, ver] of m.up) { const old = vers.get(`${z}/${x}/${y}`), k = setTile(z, x, y, ts, fog, ver); if (vers.get(k) !== old) refreshTile(k); }
-    } else if (m.t === 'summary') { summary = m.summary; renderSummary(); }
+    } else if (m.t === 'entity') { if (ENT.sel && m.x === ENT.sel.x && m.y === ENT.sel.y && !selected) renderEnt(m.data); }
+    else if (m.t === 'bot') renderBot(m.name, m.data);
+    else if (m.t === 'summary') { summary = m.summary; renderSummary(); }
     else if (m.t === 'events') { events = events.concat(m.items).slice(-100); renderEvents(); }
   };
   ws.onclose = () => { $('st-conn').textContent = 'нет связи с картой, переподключение…'; $('st-conn').className = 'bad'; setTimeout(connect, 2000); };

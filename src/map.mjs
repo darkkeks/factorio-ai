@@ -14,7 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
-import { layer, entityAt, loadLocale, LAYERS } from './map-inspect.mjs';
+import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
 const lua = makeLua('map', 2); // опрос игры и команды камере
@@ -1348,6 +1348,12 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 2e6 || Math.abs(y) > 2e6) return reply(400, 'application/json', '{"error":"нужны x и y"}');
       return reply(200, 'application/json', JSON.stringify(await entityAt(x, y, SURFACE)));
     }
+    if (url.pathname === '/api/boxes') {
+      // Рамки построек для наведения: ?c=x,y;x,y — до 25 чанков за раз.
+      const chunks = (url.searchParams.get('c') ?? '').split(';').slice(0, 25).map((p) => p.split(',').map(Number)).filter((p) => p.length === 2 && p.every((v) => Number.isInteger(v) && Math.abs(v) < 1e5));
+      if (!chunks.length) return reply(400, 'application/json', '{"error":"нужны чанки"}');
+      return reply(200, 'application/json', JSON.stringify(await boxes(chunks, SURFACE)));
+    }
     if (url.pathname === '/api/layers') {
       // Слои карты: ?l=electric,pollution — только известные имена, каждый слой кешируется.
       const want = [...new Set((url.searchParams.get('l') ?? '').split(','))].filter((l) => LAYERS.includes(l));
@@ -1397,6 +1403,14 @@ wss.on('connection', (ws) => {
   ws.on('message', (data) => {
     try {
       const m = JSON.parse(data);
+      if (m.t === 'select') {
+        // Что выделено у зрителя: постройка в точке или бот. Сервис сам присылает обновления (selectLoop).
+        ws.sel = Number.isFinite(m.x) && Number.isFinite(m.y) && Math.abs(m.x) < 2e6 && Math.abs(m.y) < 2e6 ? { x: m.x, y: m.y }
+          : typeof m.bot === 'string' && m.bot.length < 100 ? { bot: m.bot } : null;
+        ws.selSent = ''; ws.selAt = 0;
+        wakeSelect();
+        return;
+      }
       if (m.t === 'follow') {
         // Зритель выбрал, за кем следить камере живого окна (null — отпустить, камера выбирает сама).
         if (m.name == null) { if (target?.by === ws) target = null; return; }
@@ -1441,4 +1455,33 @@ process.on('SIGUSR2', () => { saveState(); if (encoder) encoder.kill('SIGTERM');
 fs.mkdirSync(TILES, { recursive: true });
 loadState();
 setInterval(saveState, 60_000);
-liveLoop(); chunkListLoop(); chartLoop(); fogLoop(); summaryLoop(); renderLoop(); cameraLoop();
+// ---------- выделенное зрителями ----------
+// Окно выделения обновляется по WebSocket: постройка — 4 раза в секунду, бот — раз в секунду; шлём, только если изменилось.
+const SEL_MS = 250, SEL_BOT_MS = 1000;
+let selWake = null;
+function wakeSelect() { if (selWake) { selWake(); selWake = null; } }
+async function selectLoop() {
+  for (;;) {
+    const now = Date.now(), jobs = new Map(); // ключ -> { get, wss }
+    for (const ws of clients) {
+      const s = ws.sel;
+      if (!s || ws.readyState !== 1 || ws.bufferedAmount > 1_000_000 || now - (ws.selAt || 0) < (s.bot ? SEL_BOT_MS : SEL_MS)) continue;
+      const k = s.bot ? `bot:${s.bot}` : `${s.x},${s.y}`;
+      if (!jobs.has(k)) jobs.set(k, { s, wss: [] });
+      jobs.get(k).wss.push(ws);
+    }
+    await Promise.all([...jobs.values()].map(async ({ s, wss }) => {
+      let data;
+      try { data = s.bot ? (live.bots.some((b) => b.name === s.bot) ? await botInfo(s.bot) : null) : await entityAt(s.x, s.y, SURFACE); } catch { return; }
+      const msg = JSON.stringify(s.bot ? { t: 'bot', name: s.bot, data } : { t: 'entity', x: s.x, y: s.y, data });
+      for (const ws of wss) {
+        if (ws.sel !== s) continue; // пока ждали ответа, зритель выделил другое
+        ws.selAt = Date.now();
+        if (msg !== ws.selSent) { ws.selSent = msg; ws.send(msg); }
+      }
+    }));
+    await Promise.race([sleep(50), new Promise((r) => { selWake = r; })]);
+  }
+}
+
+liveLoop(); selectLoop(); chunkListLoop(); chartLoop(); fogLoop(); summaryLoop(); renderLoop(); cameraLoop();

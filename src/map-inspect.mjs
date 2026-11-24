@@ -93,6 +93,56 @@ for i = 1, try(function() return e.fluids_count end) or 0 do
 end
 return r`,
 
+  // Рамки выделения всех построек в видимых чанках — чтобы страница сама находила постройку под курсором, как игра.
+  // Постройка относится к чанку, в котором её центр. Числа — восьмые доли клетки. Руда — строкой по клетке на символ.
+  // Подвижное (персонажи, роботы, техника, враги) не отдаём: оно устаревает за секунду, его выбирает клик.
+  boxes: `
+    local s, f, out = game.surfaces[A.surface], game.forces.player, {}
+    local SKIP = {smoke=true, ['smoke-with-trigger']=true, particle=true, projectile=true, explosion=true, fire=true, sticker=true,
+      ['flying-text']=true, beam=true, ['highlight-box']=true, ['speech-bubble']=true, corpse=true, ['character-corpse']=true,
+      ['item-request-proxy']=true, ['tile-ghost']=true, arrow=true, ['artillery-flare']=true, stream=true, ['particle-source']=true,
+      character=true, unit=true, ['spider-unit']=true, ['logistic-robot']=true, ['construction-robot']=true, ['combat-robot']=true,
+      car=true, ['spider-vehicle']=true, locomotive=true, ['cargo-wagon']=true, ['fluid-wagon']=true, ['artillery-wagon']=true,
+      ['item-entity']=true, fish=true, resource=true}
+    local floor = math.floor
+    for _, c in pairs(A.chunks) do
+      local x0, y0 = c[1] * 32, c[2] * 32
+      local r = false
+      if f.is_chunk_charted(s, c) and f.is_chunk_visible(s, c) then
+        r = {n={}, b={}}
+        local idx, b = {}, r.b
+        for _, e in pairs(s.find_entities_filtered{area={{x0, y0}, {x0 + 32, y0 + 32}}}) do
+          local pos = e.position
+          if not SKIP[e.type] and pos.x >= x0 and pos.x < x0 + 32 and pos.y >= y0 and pos.y < y0 + 32 then
+            local p = e.prototype
+            if p.selectable_in_game then
+              local n = e.type == 'entity-ghost' and e.ghost_name or e.name
+              local k = idx[n]
+              if not k then k = #r.n + 1 r.n[k] = n idx[n] = k end
+              local sb, m = e.selection_box, #b
+              b[m+1] = k b[m+2] = floor(sb.left_top.x * 8 + 0.5) b[m+3] = floor(sb.left_top.y * 8 + 0.5)
+              b[m+4] = floor(sb.right_bottom.x * 8 + 0.5) b[m+5] = floor(sb.right_bottom.y * 8 + 0.5) b[m+6] = p.selection_priority or 50
+              b[m+7] = e.type == 'entity-ghost' and 1 or 0
+            end
+          end
+        end
+        local res, ridx, buf, any = {}, {}, {}, false
+        for _, e in pairs(s.find_entities_filtered{area={{x0, y0}, {x0 + 32, y0 + 32}}, type='resource'}) do
+          local k = ridx[e.name]
+          if not k then k = #res + 1 res[k] = e.name ridx[e.name] = k end
+          buf[(floor(e.position.y) - y0) * 32 + (floor(e.position.x) - x0) + 1] = k
+          any = true
+        end
+        if any then
+          local str = {}
+          for i = 1, 1024 do str[i] = string.char(48 + (buf[i] or 0)) end
+          r.rn = res r.r = table.concat(str)
+        end
+      end
+      out[#out+1] = r
+    end
+    return out`,
+
   pollution: `
     local s, f, out = game.surfaces[A.surface], game.forces.player, {}
     for c in s.get_chunks() do
@@ -219,12 +269,15 @@ export async function layer(name, surface) {
   try { return await c.pending; } catch (e) { if (c.data) return c.data; throw e; }
 }
 
+/** Рамки выделения в чанках [[cx, cy], …]; для чанка вне видимости — false. */
+export function boxes(chunks, surface) { return lua(LUA.boxes, { surface, chunks }); }
+
 const entCache = new Map(); // "x,y" -> { at, p }
-/** Постройка в точке карты (с точностью до 1/8 клетки); ответ живёт полсекунды. */
+/** Постройка в точке карты (с точностью до 1/8 клетки); ответ живёт 200 мс. */
 export function entityAt(x, y, surface) {
   x = Math.round(x * 8) / 8; y = Math.round(y * 8) / 8;
   const k = `${x},${y}`, now = Date.now();
-  for (const [key, v] of entCache) if (now - v.at > 500) entCache.delete(key);
+  for (const [key, v] of entCache) if (now - v.at > 200) entCache.delete(key);
   let c = entCache.get(k);
   if (!c) { c = { at: now, p: lua(LUA.entity, { surface, x, y }) }; c.p.catch(() => {}); entCache.set(k, c); }
   return c.p;
