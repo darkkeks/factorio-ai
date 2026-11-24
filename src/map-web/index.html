@@ -198,8 +198,36 @@ const span = (z) => 16 * 2 ** (ZMAX - z);
 // Адрес хранит позицию и масштаб: #x,y,z
 const start = (location.hash.slice(1).split(',').map(Number));
 const hasStart = start.length === 3 && start.every(Number.isFinite);
-const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0, zoomDelta: 0.5, wheelPxPerZoomLevel: 120, wheelDebounceTime: 20, zoomControl: true, attributionControl: false, zoomAnimation: true })
+const map = L.map('map', { crs: CRS, minZoom: 0, maxZoom: ZMAX + 1, zoomSnap: 0, zoomDelta: 0.5, scrollWheelZoom: false, zoomControl: true, attributionControl: false, zoomAnimation: true })
   .setView(hasStart ? ll(start[0], start[1]) : ll(0, 0), hasStart ? start[2] : ZMAX - 2);
+
+// Колесо и тачпад — свой обработчик: у Leaflet зум колесом идёт ступеньками с задержкой, а щипок тачпада на Mac
+// (мелкие события колеса с ctrlKey) почти не двигал масштаб. Здесь масштаб меняется пропорционально прокрутке,
+// вокруг курсора, раз в кадр. Safari присылает щипок не колесом, а событиями gesture* — их обрабатываем отдельно.
+{
+  let acc = 0, at = null, raf = 0;
+  const apply = () => {
+    raf = 0;
+    if (!acc) return;
+    map.setZoomAround(at, Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), map.getZoom() + acc)), { animate: false });
+    acc = 0;
+  };
+  const zoomBy = (d, x, y) => {
+    acc += d;
+    at = map.mouseEventToContainerPoint({ clientX: x, clientY: y });
+    if (!raf) raf = requestAnimationFrame(apply);
+  };
+  map.getContainer().addEventListener('wheel', (e) => {
+    e.preventDefault();
+    // Пиксели: щипок (ctrlKey) — крупный шаг на пиксель, прокрутка тачпадом и колесо мыши — мельче (у колеса ~100 на щелчок).
+    const px = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
+    zoomBy(-px * (e.ctrlKey ? 0.012 : 0.004), e.clientX, e.clientY);
+  }, { passive: false });
+  let gStart = 0;
+  map.getContainer().addEventListener('gesturestart', (e) => { e.preventDefault(); gStart = map.getZoom(); });
+  map.getContainer().addEventListener('gesturechange', (e) => { e.preventDefault(); acc = 0; zoomBy(gStart + Math.log2(e.scale) - map.getZoom(), e.clientX, e.clientY); });
+  map.getContainer().addEventListener('gestureend', (e) => e.preventDefault());
+}
 
 // ---------- тайлы с версиями ----------
 const tiles = new Map(); // "z/x/y" -> когда снят по часам сервера (0 — ещё не снят)
