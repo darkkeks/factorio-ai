@@ -122,6 +122,7 @@ O.register('status', {agent = true, dead = true, fn = function(A)
     ammo = U.contents(e.get_inventory(defines.inventory.character_ammo)),
     armor = U.contents(e.get_inventory(defines.inventory.character_armor)),
     weapons = U.list(Equip.weapons(e)),
+    armor_grid = Equip.grid(e),
     shooting = Shoot.view(A),
     throwing = Throw.view(A),
     crafting = U.list(crafting),

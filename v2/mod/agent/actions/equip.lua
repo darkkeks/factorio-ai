@@ -1,22 +1,38 @@
 -- equip / unequip: оружие, патроны и броня между инвентарём персонажа и его слотами экипировки — как игрок
 -- перекладывает их в окне персонажа. Что, куда и сколько — задаёт бот; совместимость патронов с оружием в слоте
 -- и вид предмета в слоте проверяет сама игра (can_set_stack / swap_stack).
+-- Оборудование брони (личный робопорт, батареи, панели, щиты…) — в сетку НАДЕТОЙ брони и обратно, как перетаскивание
+-- в окне брони: предмет уходит из инвентаря, место и допустимость проверяет сама игра (LuaEquipmentGrid.put).
 local U = require('agent.util')
 local Q = require('agent.queue')
 
 local KIND = {gun = 'gun', ammo = 'ammo', armor = 'armor'}
 local INV = {gun = defines.inventory.character_guns, ammo = defines.inventory.character_ammo, armor = defines.inventory.character_armor}
 
+local function kind_of(proto)
+  return KIND[proto.type] or (proto.place_as_equipment_result and 'equipment') or nil
+end
+
 local function check(p)
   local item = U.arg(p.item, 'string', 'item')
   local proto = prototypes.item[item]
   if not proto then U.fail('bad_request', 'нет такого предмета: ' .. item) end
-  if not KIND[proto.type] then U.fail('bad_request', item .. ' — не оружие, не патроны и не броня') end
+  local kind = kind_of(proto)
+  if not kind then U.fail('bad_request', item .. ' — не оружие, не патроны, не броня и не оборудование брони') end
+  U.arg(p.x, 'int', 'x', true)
+  U.arg(p.y, 'int', 'y', true)
+  if (p.x == nil) ~= (p.y == nil) then U.fail('bad_request', 'x и y задаются вместе') end
+  if p.x and kind ~= 'equipment' then U.fail('bad_request', 'x, y — только для оборудования брони') end
+  if p.x and (p.x < 0 or p.y < 0) then U.fail('bad_request', 'x, y: клетка сетки брони, от 0') end
+  if kind == 'equipment' then
+    if p.slot ~= nil then U.fail('bad_request', 'slot — для оружия и патронов; у оборудования брони место задают x, y') end
+    if p.count ~= nil and p.count ~= 1 then U.fail('bad_request', 'оборудование ставится и снимается по одному') end
+  end
   if p.quality ~= nil and (type(p.quality) ~= 'string' or not prototypes.quality[p.quality]) then U.fail('bad_request', 'нет такого качества') end
   U.arg(p.count, 'int', 'count', true)
   if p.count and p.count < 1 then U.fail('bad_request', 'count: от 1') end
   U.arg(p.slot, 'int', 'slot', true)
-  if p.slot and (proto.type == 'armor' and p.slot ~= 1 or p.slot < 1 or p.slot > 3) then U.fail('bad_request', 'slot: 1…3 для оружия и патронов') end
+  if p.slot and kind ~= 'equipment' and (proto.type == 'armor' and p.slot ~= 1 or p.slot < 1 or p.slot > 3) then U.fail('bad_request', 'slot: 1…3 для оружия и патронов') end
 end
 
 local function ident(p)
@@ -29,7 +45,111 @@ end
 
 local function bonus(stack)
   if not stack.valid_for_read or stack.type ~= 'armor' then return 0 end
-  return stack.prototype.get_inventory_size_bonus(stack.quality) or 0
+  local grid = stack.grid
+  return (stack.prototype.get_inventory_size_bonus(stack.quality) or 0) + (grid and grid.inventory_bonus or 0)
+end
+
+local function kj(j) return math.floor(j / 100 + 0.5) / 10 end
+
+--- Сетка надетой брони, как в окне брони: размеры, оборудование по клеткам, заряд. Брони с сеткой нет — nil.
+local function grid_view(e)
+  local grid = e.grid
+  if not grid then return nil end
+  local armor = e.get_inventory(INV.armor)
+  local a = armor and armor[1]
+  local list, used = {}, 0
+  for _, eq in pairs(grid.equipment) do
+    local sh, pos = eq.shape, eq.position
+    local r = {name = eq.name, x = pos.x, y = pos.y, w = sh.width, h = sh.height}
+    if eq.type == 'equipment-ghost' then
+      r.name, r.ghost = eq.ghost_name, true
+    else
+      if eq.quality.name ~= 'normal' then r.quality = eq.quality.name end
+      if eq.max_energy > 0 then r.energy_kj, r.max_energy_kj = kj(eq.energy), kj(eq.max_energy) end
+      if eq.max_shield > 0 then r.shield, r.max_shield = U.r2(eq.shield), U.r2(eq.max_shield) end
+    end
+    used = used + sh.width * sh.height
+    list[#list + 1] = r
+  end
+  table.sort(list, function(l, r) if l.y ~= r.y then return l.y < r.y end return l.x < r.x end)
+  local out = {
+    armor = a and a.valid_for_read and U.item_key(a.name, a.quality.name) or nil,
+    width = grid.width, height = grid.height, free_cells = grid.width * grid.height - used,
+    equipment = U.list(list),
+  }
+  if grid.battery_capacity > 0 then out.battery_kj, out.battery_capacity_kj = kj(grid.available_in_batteries), kj(grid.battery_capacity) end
+  if grid.max_shield > 0 then out.shield, out.max_shield = U.r2(grid.shield), U.r2(grid.max_shield) end
+  if grid.inventory_bonus > 0 then out.inventory_bonus = grid.inventory_bonus end
+  return out
+end
+
+local function worn_grid(e)
+  local grid = e.grid
+  if not grid then U.fail('not_allowed', 'на персонаже нет брони с сеткой оборудования: надень модульную или силовую броню (equip)') end
+  if grid.prototype.locked then U.fail('not_allowed', 'сетка этой брони закрыта для изменений') end
+  return grid
+end
+
+local function equip_grid(A, p)
+  local e = A.entity
+  local main = e.get_main_inventory()
+  local key = U.item_key(p.item, p.quality)
+  local eproto = prototypes.item[p.item].place_as_equipment_result
+  local grid = worn_grid(e)
+  local src = main.find_item_stack(ident(p))
+  if not src then U.fail('no_item', 'в инвентаре нет ' .. key, {item = p.item}) end
+  local allowed = {}
+  for _, c in pairs(grid.prototype.equipment_categories) do allowed[c] = true end
+  local fits = false
+  for _, c in pairs(eproto.equipment_categories) do if allowed[c] then fits = true break end end
+  if not fits then U.fail('not_allowed', p.item .. ' не ставится в сетку этой брони (не та категория оборудования)') end
+  local sh = eproto.shape
+  if p.x and (p.x + sh.width > grid.width or p.y + sh.height > grid.height) then
+    U.fail('no_space', 'не помещается: оборудование ' .. sh.width .. '×' .. sh.height .. ', сетка ' .. grid.width .. '×' .. grid.height
+      .. ' (x, y — левая верхняя клетка, от 0)', {grid = grid_view(e)})
+  end
+  local quality = src.quality.name
+  local eq = grid.put{name = eproto.name, position = p.x and {x = p.x, y = p.y} or nil, quality = quality}
+  if not eq then
+    U.fail('no_space', p.x and 'клетки заняты другим оборудованием: выбери другие x, y или сними мешающее (unequip)'
+      or ('в сетке нет свободного места ' .. sh.width .. '×' .. sh.height .. ': сними лишнее (unequip)'), {grid = grid_view(e)})
+  end
+  main.remove{name = p.item, quality = quality, count = 1}
+  local pos = eq.position
+  return {item = U.item_key(p.item, quality), kind = 'equipment', x = pos.x, y = pos.y, moved = 1, grid = grid_view(e), inventory_slots = #main}
+end
+
+local function unequip_grid(A, p)
+  local e = A.entity
+  local main = e.get_main_inventory()
+  local key = U.item_key(p.item, p.quality)
+  local grid = worn_grid(e)
+  local function is(eq)
+    if not eq or eq.type == 'equipment-ghost' then return false end
+    local take = eq.prototype.take_result
+    return (take and take.name or eq.name) == p.item and (not p.quality or eq.quality.name == p.quality)
+  end
+  local found
+  if p.x then
+    local eq = grid.get{x = p.x, y = p.y}
+    if is(eq) then found = eq end
+  else
+    for _, eq in pairs(grid.equipment) do if is(eq) then found = eq break end end
+  end
+  if not found then
+    U.fail('no_item', key .. ' нет в сетке брони' .. (p.x and (' в клетке ' .. p.x .. ',' .. p.y) or ''), {item = p.item, grid = grid_view(e)})
+  end
+  local quality = found.quality.name
+  -- Оборудование с запасом слотов инвентаря: без него инвентарь сожмётся, лишнее высыпалось бы на землю.
+  local shrink = found.inventory_bonus or 0
+  if shrink > 0 and main.count_empty_stacks() < shrink + 1 then
+    U.fail('no_space', 'без этого оборудования инвентарь меньше на ' .. shrink .. ' слотов: нужно ' .. (shrink + 1) .. ' свободных, есть ' .. main.count_empty_stacks())
+  end
+  if not main.can_insert{name = p.item, quality = quality, count = 1} then U.fail('no_space', 'в инвентаре нет места') end
+  local got = grid.take{equipment = found}
+  if not got then U.fail('not_allowed', 'это оборудование не снимается') end
+  main.insert{name = got.name, quality = got.quality, count = got.count}
+  return {item = U.item_key(got.name, quality), kind = 'equipment', moved = 1, grid = grid_view(e), inventory_slots = #main}
 end
 
 --- Слоты оружия и патронов, как в окне персонажа: [{slot, gun?, ammo?, count?}].
@@ -49,7 +169,8 @@ end
 local function equip(A, p)
   local e = A.entity
   local main = e.get_main_inventory()
-  local kind = KIND[prototypes.item[p.item].type]
+  local kind = kind_of(prototypes.item[p.item])
+  if kind == 'equipment' then return equip_grid(A, p) end
   local dst = e.get_inventory(INV[kind])
   local key = U.item_key(p.item, p.quality)
   local src = main.find_item_stack(ident(p))
@@ -112,7 +233,8 @@ end
 local function unequip(A, p)
   local e = A.entity
   local main = e.get_main_inventory()
-  local kind = KIND[prototypes.item[p.item].type]
+  local kind = kind_of(prototypes.item[p.item])
+  if kind == 'equipment' then return unequip_grid(A, p) end
   local from = e.get_inventory(INV[kind])
   local key = U.item_key(p.item, p.quality)
   local src, slot
@@ -159,4 +281,4 @@ Q.register('unequip', {
   start = function(A, act) return unequip(A, act.p) end,
 })
 
-return {weapons = weapons}
+return {weapons = weapons, grid = grid_view}

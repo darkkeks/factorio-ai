@@ -460,6 +460,78 @@ test('equip / unequip: оружие, патроны и броня между и�
   eq((await call(A, 'equip', { item: 'iron-plate' })).http, 400);
 });
 
+test('equip / unequip: оборудование в сетку надетой брони и обратно, сетка видна в status', async () => {
+  await reset();
+  const give = (items) => world(`local m = storage.agent.agents[A.name].entity.get_main_inventory()
+    for n, c in pairs(A.items) do m.insert{name = n, count = c} end return true`, { name: NAME, items });
+  await give({ 'modular-armor': 1, 'personal-roboport-equipment': 2, 'solar-panel-equipment': 3, 'battery-equipment': 1 });
+  // Без брони с сеткой ставить некуда.
+  let r = await call(A, 'equip', { item: 'solar-panel-equipment' });
+  ok(!r.ok && r.error.code === 'not_allowed', JSON.stringify(r));
+  let st = await call(A, 'status');
+  ok(st.armor_grid === undefined, JSON.stringify(st.armor_grid));
+  r = await call(A, 'equip', { item: 'modular-armor' });
+  ok(r.ok, JSON.stringify(r));
+  st = await call(A, 'status');
+  ok(st.armor_grid.armor === 'modular-armor' && st.armor_grid.width === 5 && st.armor_grid.height === 5 && st.armor_grid.equipment.length === 0
+    && st.armor_grid.free_cells === 25, JSON.stringify(st.armor_grid));
+  // По клеткам и в первое свободное место; предмет уходит из инвентаря.
+  r = await call(A, 'equip', { item: 'personal-roboport-equipment', x: 3, y: 0 });
+  ok(r.ok && r.kind === 'equipment' && r.x === 3 && r.y === 0 && r.grid.equipment.length === 1 && r.grid.free_cells === 21, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'solar-panel-equipment' });
+  ok(r.ok && r.x === 0 && r.y === 0, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'battery-equipment', x: 2, y: 3 });
+  ok(r.ok && r.grid.battery_capacity_kj > 0, JSON.stringify(r));
+  // Занятые клетки, выход за сетку, чужие параметры — отказ, предметы на месте.
+  r = await call(A, 'equip', { item: 'personal-roboport-equipment', x: 2, y: 1 });
+  ok(!r.ok && r.error.code === 'no_space' && r.error.data.grid.equipment.length === 3, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'personal-roboport-equipment', x: 4, y: 4 });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  eq((await call(A, 'equip', { item: 'solar-panel-equipment', x: 1 })).http, 400);
+  eq((await call(A, 'equip', { item: 'solar-panel-equipment', slot: 1 })).http, 400);
+  eq((await call(A, 'equip', { item: 'pistol', x: 1, y: 1 })).http, 400);
+  st = await call(A, 'status');
+  ok(st.inventory['personal-roboport-equipment'] === 1 && st.inventory['solar-panel-equipment'] === 2 && !st.inventory['battery-equipment'], JSON.stringify(st.inventory));
+  const rp = st.armor_grid.equipment.find((x) => x.name === 'personal-roboport-equipment');
+  ok(rp && rp.x === 3 && rp.y === 0 && rp.w === 2 && rp.h === 2 && rp.max_energy_kj > 0, JSON.stringify(st.armor_grid));
+  // Снять: по клетке (любой из занятых) и по имени; не то в клетке — no_item.
+  r = await call(A, 'unequip', { item: 'solar-panel-equipment', x: 4, y: 1 });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  r = await call(A, 'unequip', { item: 'personal-roboport-equipment', x: 4, y: 1 });
+  ok(r.ok && r.kind === 'equipment' && r.grid.equipment.length === 2, JSON.stringify(r));
+  // Инвентарь забит — оборудование остаётся в сетке (батареям в инвентаре некуда лечь).
+  await give({ 'iron-plate': 100000 });
+  r = await call(A, 'unequip', { item: 'battery-equipment' });
+  ok(!r.ok && r.error.code === 'no_space', JSON.stringify(r));
+  await world(`storage.agent.agents[A.name].entity.get_main_inventory().remove{name = 'iron-plate', count = 100000} return true`, { name: NAME });
+  r = await call(A, 'unequip', { item: 'battery-equipment' });
+  ok(r.ok && r.grid.battery_capacity_kj === undefined, JSON.stringify(r));
+  r = await call(A, 'unequip', { item: 'battery-equipment' });
+  ok(!r.ok && r.error.code === 'no_item', JSON.stringify(r));
+  // Снятая броня уносит сетку с собой; надетая снова — показывает её.
+  r = await call(A, 'unequip', { item: 'modular-armor' });
+  ok(r.ok, JSON.stringify(r));
+  st = await call(A, 'status');
+  ok(st.armor_grid === undefined && st.inventory['personal-roboport-equipment'] === 2 && st.inventory['battery-equipment'] === 1
+    && st.inventory['solar-panel-equipment'] === 2, JSON.stringify(st));
+  r = await call(A, 'equip', { item: 'modular-armor' });
+  st = await call(A, 'status');
+  ok(st.armor_grid.equipment.length === 1 && st.armor_grid.equipment[0].name === 'solar-panel-equipment', JSON.stringify(st.armor_grid));
+  // Личный робопорт персонажа бота работает: роботы из инвентаря строят призрак рядом из его же предметов.
+  r = await call(A, 'equip', { item: 'personal-roboport-equipment' });
+  ok(r.ok, JSON.stringify(r));
+  r = await call(A, 'equip', { item: 'battery-equipment' });
+  ok(r.ok, JSON.stringify(r));
+  await give({ 'construction-robot': 5, 'wooden-chest': 2 });
+  await world(`local e = storage.agent.agents[A.name].entity
+    for _, q in pairs(e.grid.equipment) do if q.max_energy > 0 then q.energy = q.max_energy end end -- заряд — подготовка сцены
+    e.surface.create_entity{name = 'entity-ghost', inner_name = 'wooden-chest', position = {A.ox + 34.5, A.oy + 18.5}, force = e.force}
+    return true`, { name: NAME });
+  await call(A, 'act', { actions: [{ type: 'wait', ticks: 600 }] });
+  eq(await count('wooden-chest'), 1, 'робот личного робопорта построил призрак');
+  eq((await inv())['wooden-chest'], 1);
+});
+
 test('repair: область с подходом — только повреждённое своей команды; без подхода — out_of_reach', async () => {
   await reset({ 'repair-pack': 2 });
   await world(`

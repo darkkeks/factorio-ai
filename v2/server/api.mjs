@@ -127,17 +127,23 @@ export const API = {
       'в слот с другими патронами не кладутся (сначала unequip). Броня: слот один, надетая меняется местами с новой; ' +
       'если у новой меньше запас слотов инвентаря, нужно столько же свободных слотов — иначе no_space. ' +
       'Предметы, взятые в инвентарь (transfer take, добыча), игра часто надевает сама — смотри status → weapons, armor. ' +
-      'Стрелять — shoot; гранаты и капсулы надевать не нужно — throw бросает их из инвентаря.',
-    params: { item: 'имя оружия, патронов или брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все', slot: '1…3 — номер слота оружия или патронов' },
-    result: '{item, kind: gun | ammo | armor, slot, moved, replaced?, already?, weapons: [{slot, gun?, ammo?, count?}], inventory_slots — для брони: размер инвентаря после}',
+      'Стрелять — shoot; гранаты и капсулы надевать не нужно — throw бросает их из инвентаря. ' +
+      'Оборудование брони (personal-roboport-equipment, battery-equipment, solar-panel-equipment, energy-shield-equipment, exoskeleton-equipment…): ' +
+      'одна штука из инвентаря ставится в сетку НАДЕТОЙ модульной или силовой брони, как в окне брони; x, y — левая верхняя клетка (от 0), ' +
+      'без них — первое свободное место. Не помещается или клетки заняты — no_space (в data — grid), нет брони с сеткой — not_allowed. ' +
+      'Сетку видно в status → armor_grid. Личному робопорту нужны энергия (панели, батареи, реактор в той же сетке) и строительные роботы в инвентаре.',
+    params: { item: 'имя оружия, патронов, брони или оборудования брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все', slot: '1…3 — номер слота оружия или патронов', x: 'для оборудования брони: столбец левой верхней клетки в сетке, от 0 (вместе с y)', y: 'строка, от 0' },
+    result: '{item, kind: gun | ammo | armor | equipment, slot, moved, replaced?, already?, weapons: [{slot, gun?, ammo?, count?}], inventory_slots — для брони и оборудования: размер инвентаря после; для оборудования — x, y (куда встало) и grid (как status → armor_grid)}',
     example: { item: 'firearm-magazine', count: 20, slot: 1 },
   },
   unequip: {
     kind: 'action', instant: true,
     summary: 'Снять надетое оружие, патроны или броню в инвентарь. Нет свободного слота — no_space; броня с запасом слотов инвентаря ' +
-      'требует столько же свободных слотов плюс один под себя (иначе лишнее высыпалось бы на землю).',
-    params: { item: 'имя надетого предмета', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все из слота', slot: '1…3 — из какого слота (по умолчанию первый с таким предметом)' },
-    result: '{item, kind, slot, moved, weapons?, inventory_slots?}',
+      'требует столько же свободных слотов плюс один под себя (иначе лишнее высыпалось бы на землю). ' +
+      'Оборудование брони: одна штука из сетки надетой брони в инвентарь; x, y — любая клетка, которую оно занимает, без них — первое с таким именем. ' +
+      'Заряд снятого оборудования (батареи, щита) пропадает, как и у игрока.',
+    params: { item: 'имя надетого предмета или оборудования в сетке брони', quality: 'качество (по умолчанию любое)', count: 'для патронов — сколько, по умолчанию все из слота', slot: '1…3 — из какого слота (по умолчанию первый с таким предметом)', x: 'для оборудования брони: клетка сетки, от 0 (вместе с y)', y: 'строка, от 0' },
+    result: '{item, kind, slot, moved, weapons?, inventory_slots?, grid? — для оборудования: сетка после}',
     example: { item: 'pistol' },
   },
   craft: {
@@ -602,7 +608,7 @@ export const API = {
     kind: 'query',
     summary: 'Свой персонаж: позиция, здоровье, инвентарь, экипировка, очередь крафта, очередь действий, дальности.',
     params: {},
-    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), throwing: {item, thrown, count, next_in_ticks, target?, at?} — если идёт серия бросков (throw),crafting, queue, reach: {build, interact, resource}, tick, paused, deaths}. ' +
+    result: '{name, position, health, inventory: {предмет: количество}, free_slots, guns, ammo, armor, weapons: [{slot, gun?, ammo?, count?}] — слоты оружия и патронов по номерам (менять — equip / unequip), armor_grid: {armor, width, height, free_cells, equipment: [{name, x, y, w, h, quality?, energy_kj?, max_energy_kj?, shield?, max_shield?}], battery_kj?, battery_capacity_kj?, shield?, max_shield?, inventory_bonus?} — сетка оборудования надетой брони, если она есть (x, y — левая верхняя клетка от 0; ставить и снимать — equip / unequip), shooting: {mode, seconds_left, killed, target?, at?} — если зажат огонь (shoot), throwing: {item, thrown, count, next_in_ticks, target?, at?} — если идёт серия бросков (throw),crafting, queue, reach: {build, interact, resource}, tick, paused, deaths}. ' +
       'Между гибелью и возрождением персонажа нет, ответ другой: {name, dead: true, respawn_in — секунд игры до возрождения, respawn_tick, died_position — где труп, respawn_position, deaths, tick, paused}',
     example: {},
   },
