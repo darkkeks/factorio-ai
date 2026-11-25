@@ -238,6 +238,10 @@ function decodeFrame(d, prev) {
   let k = 0;
   if (d[k] === 0x31445246) k++;                       // старый формат — без времени
   else if (d[k] === 0x32445246) { k++; decodeFrame.time = d[k++]; }
+  else if (d[k] === 0x33445246) {                      // со временем и прямоугольником окна (1/16 клетки)
+    k++; decodeFrame.time = d[k++];
+    decodeFrame.rect = d[k] || d[k + 2] ? [d[k] / 16, d[k + 1] / 16, d[k + 2] / 16, d[k + 3] / 16] : null; k += 4;
+  }
   else return d;
   const n = d[k++], K = d[k++], opsAt = k; k += K;
   const m = d[k++], cols = k, f = new Int32Array(n * R);
@@ -262,7 +266,7 @@ let decoded = null;               // последний разобранный �
 const playQ = [];                 // [{ f, t }] — разобранные, ещё не показанные
 const offs = [];                  // [{ at, off }] за последние 5 с
 function receive(d) {
-  decodeFrame.time = undefined;
+  decodeFrame.time = undefined; decodeFrame.rect = null;
   decoded = decodeFrame(d, decoded);
   const now = performance.now();
   arrivals.push(now);
@@ -270,7 +274,7 @@ function receive(d) {
   const t = decodeFrame.time;
   offs.push({ at: now, off: now - t });
   while (offs.length && now - offs[0].at > 5000) offs.shift();
-  playQ.push({ f: decoded, t });
+  playQ.push({ f: decoded, t, rect: decodeFrame.rect });
   if (playQ.length > 30) playQ.splice(0, playQ.length - 30);
 }
 function playout() {
@@ -283,13 +287,25 @@ function playout() {
   // Отстали больше чем на полсекунды (вкладка спала и т. п.) — сразу к последнему.
   if (playQ.length && due - playQ[playQ.length - 1].t > 500) pick = playQ.length - 1;
   if (pick < 0) return;
-  frame = playQ[pick].f; frameN++; dirty = true; shows.push(now);
+  frame = playQ[pick].f; liveRect = playQ[pick].rect || null; frameN++; dirty = true; shows.push(now);
   playQ.splice(0, pick + 1);
 }
 const shows = [];
+let liveRect = null; // где живые записи: прямоугольник окна игры, от которого пришёл кадр (клетки)
 
+// Вид сообщаем сервису: он держит в игре окно с запасом вокруг него (свой поток кадров у каждого зрителя).
+let renderWs = null, viewSent = '';
+function sendView() {
+  if (!renderWs || renderWs.readyState !== 1) return;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  const m = view.auto ? { t: 'view', auto: true } : { t: 'view', x: +view.x.toFixed(2), y: +view.y.toFixed(2), w: +(W / view.k).toFixed(2), h: +(H / view.k).toFixed(2) };
+  const s = JSON.stringify(m);
+  if (s !== viewSent) { viewSent = s; renderWs.send(s); }
+}
+setInterval(sendView, 50);
 function connect() {
-  const ws = new WebSocket(new URL('ws?d=1', location.href).href.replace(/^http/, 'ws'));
+  const ws = renderWs = new WebSocket(new URL('ws?d=1', location.href).href.replace(/^http/, 'ws'));
+  ws.onopen = () => { viewSent = ''; sendView(); };
   ws.binaryType = 'arraybuffer';
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') { receive(new Int32Array(e.data)); return; }
@@ -493,8 +509,9 @@ function drawFrame() {
   }
   // Поверх — 2D: граница вида камеры (вне её — только снимки карты, без анимаций).
   octx.setTransform(dpr, 0, 0, dpr, 0, 0); octx.clearRect(0, 0, W, H);
-  if (cam && gameOn) {
-    const x1 = (cam.x - cam.w / 2 - view.x) * k + W / 2, y1 = (cam.y - cam.h / 2 - view.y) * k + H / 2, w = cam.w * k, h = cam.h * k;
+  const lr = liveRect || (cam ? [cam.x - cam.w / 2, cam.y - cam.h / 2, cam.x + cam.w / 2, cam.y + cam.h / 2] : null);
+  if (lr && gameOn) {
+    const x1 = (lr[0] - view.x) * k + W / 2, y1 = (lr[1] - view.y) * k + H / 2, w = (lr[2] - lr[0]) * k, h = (lr[3] - lr[1]) * k;
     octx.fillStyle = 'rgba(0, 0, 0, .45)';
     octx.beginPath(); octx.rect(0, 0, W, H); octx.rect(x1, y1, w, h); octx.fill('evenodd');
     octx.strokeStyle = '#ffcc33'; octx.lineWidth = 1.5; octx.setLineDash([8, 6]); octx.strokeRect(x1, y1, w, h); octx.setLineDash([]);

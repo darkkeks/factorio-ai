@@ -30,7 +30,7 @@ const pngs = new Map();        // номер спрайта -> PNG
 const atlasIdx = new Map();    // адрес атласа -> номер (для адресов кусков атласа)
 const atlasByIdx = [];         // номер -> адрес
 const tilePngs = new Map();    // "номер/x-y" -> PNG куска 1024×1024
-let game = null, frame = null, frameAt = 0, frames = 0, rawFrame = null, convMs = 0, convN = 0, frameTime = 0;
+let game = null, frame = null, frames = 0, convMs = 0, convN = 0, frameTime = 0;
 let gen = Date.now().toString(36); // поколение номеров спрайтов: меняется при переподключении игры (в адресе картинок)
 const viewers = new Set();
 export const renderViewers = () => viewers.size;
@@ -135,19 +135,20 @@ function onMessage(type, data) {
       return;
     }
     broadcast(JSON.stringify({ t: 'atlas' })); // страница перезапросит спрайты, которые не загрузились
-  } else if (type === 1 || type === 5) {
-    // Тип 5 — то же с отметкой времени съёмки (мс, double) перед записями.
-    if (type === 5) { frameTime = data.readDoubleLE(0); data = data.subarray(8); } else frameTime = Date.now();
+  } else if (type === 1 || type === 5 || type === 6) {
+    // 5 — с отметкой времени съёмки; 6 — ещё и с окном: какой RenderParameters (основной вид или окно-камера интерфейса),
+    // его размер, масштаб и центр (camera-hook/v2-capture.js, frame_end).
+    let key = 'main', info = null, time = Date.now();
+    if (type === 5) { time = data.readDoubleLE(0); data = data.subarray(8); }
+    if (type === 6) {
+      time = data.readDoubleLE(0); key = data.readBigUInt64LE(8).toString(16);
+      info = { w: data.readInt16LE(16), h: data.readInt16LE(18), zoom: data.readDoubleLE(24), x: data.readInt32LE(32) / 256, y: data.readInt32LE(36) / 256 };
+      data = data.subarray(40);
+    }
     frames++;
-    // Без зрителей кадр не разбираем (сервису это ~5–10 мс на кадр), только запоминаем — для того, кто придёт.
-    if (!viewers.size) { rawFrame = data; return; }
-    const t = performance.now();
-    frame = convert(data); rawFrame = null;
-    convMs += performance.now() - t; convN++;
-    pushFrame();
+    onWindowFrame(key, info, time, data);
   }
 }
-
 // Кадр от игры: готовые записи SpriteDrawOrder (по 64 байта, см. camera-hook/v2-capture.js) — точка на экране
 // в пикселях, итоговый масштаб, поворот, цвет, вырезка из атласа и ключ сортировки (в нём мировая позиция).
 // Переводим экран в мир: масштаб — итоговый масштаб записи / масштаб спрайта, сдвиг камеры — медиана
@@ -163,10 +164,10 @@ function work(n) {
   if (cv && cv.n >= n) return cv;
   return cv = { n, idx: new Uint32Array(n), sn: new Int32Array(n), pri: new Float64Array(n), lo: new Uint32Array(n), kx: new Float64Array(n), ky: new Float64Array(n), cal: new Float64Array(2 * n) };
 }
-function convert(data) {
+function convert(data, zoomIn = camZoom) {
   if (data.byteOffset & 3) data = Buffer.from(data); // выравнивание для типизированных массивов
   const n = data.length / REC, u = new Uint32Array(data.buffer, data.byteOffset, n * 16), f = new Float32Array(data.buffer, data.byteOffset, n * 16);
-  const W = work(n), zoom = camZoom, Z = 32 * zoom;
+  const W = work(n), zoom = zoomIn, Z = 32 * zoom;
   let m = 0, nc = 0;
   for (let i = 0; i < n; i++) {
     const o = i * 16, s = spritesNum.get(u[o] + u[o + 1] * 4294967296);
@@ -220,6 +221,7 @@ net.createServer((c) => {
   sprites.clear(); spritesNum.clear(); byN.length = 0; atlases.clear(); pngs.clear(); atlasIdx.clear(); atlasByIdx.length = 0; tilePngs.clear();
   gen = Date.now().toString(36);
   for (const ws of viewers) ws.prevFrame = null;
+  wins.clear(); mainKey = 'main'; for (const sl of slots) sl.key = null; // у нового клиента окна — по новым адресам
   broadcast(JSON.stringify({ t: 'reset', gen }));
   // Атлас — десятки мегабайт: куски копим списком и склеиваем один раз, когда сообщение пришло целиком.
   let parts = [], have = 0, need = 4;
@@ -256,27 +258,148 @@ export function setCamera(c) {
   if (s !== camSent) { camSent = s; broadcast(s); }
 }
 function broadcast(s) { for (const ws of viewers) if (ws.readyState === 1) ws.send(s); }
+// ---------- окна ----------
+// Основной вид клиента-камеры следит за ботами (режим «следить»). Зритель, который сам двигает и зумит карту, получает
+// своё окно — элемент интерфейса «камера» (LuaGuiElement camera) у игрока-камеры: игра рисует его отдельно, со своим
+// RenderParameters, перехват отправляет его кадры отдельно. Окно берётся с запасом вокруг вида зрителя: сдвиг и
+// приближение внутри запаса не ждут ничего; иначе окно переезжает (команда через сервер — ~0,1–0,2 с), а страница пока
+// показывает подложку.
+const MAX_WIN = Number(process.env.RENDER_WINDOWS || 4);
+const WIN_W = 960, WIN_H = 540;           // размер окна в пикселях клиента: элемент интерфейса не больше экрана клиента (1280×720), и не как у основного вида — по размеру их и различаем
+const MARGIN = 1.6;                       // окно — во столько раз больше вида зрителя (по каждой стороне)
+const ZMIN = 0.2, ZMAX = 2;               // масштаб окна: дальше игра рисует слишком много, ближе — незачем
+const wins = new Map();                   // ключ (адрес RenderParameters | 'main') -> { info, time, raw, frame, frameAt, at }
+const slots = Array.from({ length: MAX_WIN }, (_, i) => ({ name: `web_render_${i}`, spec: null, applied: null, key: null, busy: false, used: 0 }));
+let runLua = null;                        // (код, аргументы) -> Promise; даёт сервис карты (map.mjs)
+export function setLuaRunner(fn) {
+  runLua = fn;
+  // Окна живут в состоянии игры (и в сохранении): оставшиеся от прошлого запуска сервиса убираем, иначе игра рисует их зря.
+  const clean = () => fn(`local p = game.get_player(A.camera) if not p then return 0 end local n = 0
+    for _, g in pairs(p.gui.screen.children) do if g.name:find('^web_render_') then g.destroy() n = n + 1 end end return n`, {})
+    .then((n) => { if (n) log(`убрано окон от прошлого запуска: ${n}`); }).catch(() => setTimeout(clean, 10_000));
+  setTimeout(clean, 3000);
+}
+
+function onWindowFrame(key, info, time, data) {
+  let w = wins.get(key);
+  if (!w) wins.set(key, w = { key, info: null, time: 0, raw: null, frame: null, frameAt: null, at: 0 });
+  w.info = info; w.time = time; w.at = Date.now(); w.raw = data; w.frame = null;
+  // Чьё это окно: совпадает с тем, что мы поставили окну-слоту (центр и масштаб), — его; иначе основной вид.
+  if (info && !slots.some((s) => s.key === key)) {
+    const s = slots.find((s) => s.applied && Math.abs(s.applied.x - info.x) < 0.6 && Math.abs(s.applied.y - info.y) < 0.6 && !(info.w === mainSize.w && info.h === mainSize.h));
+    if (s) { s.key = key; log(`окно ${s.name}: ${info.w}×${info.h}, масштаб ${info.zoom.toFixed(3)}`); }
+  }
+  if (!slots.some((s) => s.key === key) && (!info || (info.w === mainSize.w && info.h === mainSize.h))) mainKey = key;
+  const subs = [...viewers].filter((ws) => sourceOf(ws) === key);
+  if (!subs.length) return;
+  const t = performance.now();
+  w.frame = convert(data, info ? info.zoom : camZoom);
+  convMs += performance.now() - t; convN++;
+  if (key === mainKey) { frame = w.frame; frameTime = time; }
+  const cache = new Map();
+  for (const ws of subs) sendFrame(ws, w, cache);
+}
+let mainKey = 'main';
+const mainSize = { w: 1280, h: 720 };
+export function setMainSize(w, h) { mainSize.w = w; mainSize.h = h; }
+// Источник кадров зрителя: окно его слота, если оно уже рисует там, где надо; иначе основной вид.
+function sourceOf(ws) {
+  const s = ws.slot;
+  if (s && s.key && wins.get(s.key)?.info && Date.now() - wins.get(s.key).at < 2000) return s.key;
+  return mainKey;
+}
+function rectOf(w) {
+  const i = w.info;
+  if (!i) return cam ? [cam.x - cam.w / 2, cam.y - cam.h / 2, cam.x + cam.w / 2, cam.y + cam.h / 2] : null;
+  const hw = i.w / 2 / 32 / i.zoom, hh = i.h / 2 / 32 / i.zoom;
+  return [i.x - hw, i.y - hh, i.x + hw, i.y + hh];
+}
 // Кадр зрителю — разностью с тем кадром, что ушёл ему в прошлый раз (render-delta.mjs); новому зрителю и после
-// сброса — целиком (разность с пустым). Обычно у всех зрителей прошлый кадр один, кодируем один раз.
+// сброса — целиком (разность с пустым). Зрители одного окна обычно получают одно и то же — кодируем один раз.
 const asInts = (b) => new Int32Array(b.buffer, b.byteOffset, b.length >> 2);
-function sendFrame(ws, cache) {
-  if (ws.readyState !== 1 || ws.bufferedAmount > 2_000_000) return;
-  if (!ws.delta) { ws.send(frame); return; }
-  const cur = asInts(frame), key = ws.prevFrame || null;
-  let enc = cache.get(key);
-  if (!enc) { enc = encodeFrame(cur, key && key.length ? key : null, frameTime); cache.set(key, enc); }
+function sendFrame(ws, w, cache) {
+  if (ws.readyState !== 1 || ws.bufferedAmount > 2_000_000 || !w.frame) return;
+  if (!ws.delta) { ws.send(w.frame); return; }
+  const cur = asInts(w.frame), prev = ws.prevFrame || null;
+  let enc = cache.get(prev);
+  if (!enc) { enc = encodeFrame(cur, prev && prev.length ? prev : null, w.time, rectOf(w)); cache.set(prev, enc); }
   ws.send(enc);
   ws.prevFrame = cur;
 }
-// Кадр уходит зрителям сразу, как пришёл от игры: частоту задаёт перехват (V2_FPS, ровно по времени), лишняя
-// очередь по таймеру здесь давала бы биения и неровные паузы.
-function pushFrame() {
-  if (!frame || frame === frameAt) return;
-  frameAt = frame;
-  const cache = new Map();
-  for (const ws of viewers) sendFrame(ws, cache);
+
+// Вид зрителя: { x, y — центр (клетки), w, h — размер (клетки) } или null — следить за ботами (основной вид).
+function fits(spec, v) {
+  if (!spec) return false;
+  const hw = WIN_W / 2 / 32 / spec.zoom, hh = WIN_H / 2 / 32 / spec.zoom;
+  const inside = v.x - v.w / 2 >= spec.x - hw && v.x + v.w / 2 <= spec.x + hw && v.y - v.h / 2 >= spec.y - hh && v.y + v.h / 2 <= spec.y + hh;
+  // Окно намного больше вида (зритель сильно приблизил) — игра рисует лишнее; перестраиваем, но не ради мелочи.
+  const tooBig = hw * 2 > v.w * MARGIN * 2.5 && spec.zoom < ZMAX;
+  // Вид больше, чем окно может охватить, — окно и так максимальное, лучше не будет.
+  const maxed = spec.zoom <= ZMIN && !inside && Math.abs(v.x - spec.x) < 1 && Math.abs(v.y - spec.y) < 1;
+  return (inside && !tooBig) || maxed;
 }
-setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames}, разбор кадра ${convN ? (convMs / convN).toFixed(1) : '—'} мс, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; convMs = 0; convN = 0; }, 60_000);
+function specFor(v) {
+  const zoom = Math.max(ZMIN, Math.min(ZMAX, Math.min(WIN_W / 32 / (v.w * MARGIN), WIN_H / 32 / (v.h * MARGIN))));
+  return { x: Math.round(v.x * 4) / 4, y: Math.round(v.y * 4) / 4, zoom: Math.round(zoom * 1000) / 1000 };
+}
+function onView(ws, v) {
+  ws.view = v;
+  if (!v) { releaseSlot(ws); return; }
+  if (!ws.slot) {
+    // Свободный слот или давно не нужный; иначе — зритель смотрит основной вид (окон больше нет).
+    const now = Date.now();
+    const s = slots.find((s) => ![...viewers].some((o) => o.slot === s)) ;
+    if (!s) return;
+    ws.slot = s; s.used = now;
+  }
+  const s = ws.slot;
+  if (fits(s.spec, v)) return;
+  s.spec = specFor(v);
+  applySlot(s);
+}
+function releaseSlot(ws) { if (ws.slot) { ws.slot = null; } }
+async function applySlot(s) {
+  if (s.busy || !runLua) return;
+  s.busy = true;
+  try {
+    while (s.spec && s.spec !== s.applied) {
+      const spec = s.spec;
+      await runLua(SLOT_LUA, { name: s.name, x: spec.x, y: spec.y, zoom: spec.zoom, w: WIN_W, h: WIN_H });
+      s.applied = spec;
+    }
+  } catch (e) { log(`окно ${s.name}:`, e.message); s.applied = null; }
+  finally { s.busy = false; }
+}
+// Окно-камера у игрока-камеры: создаётся при первом запросе, дальше меняются только место и масштаб.
+// Команда выполняется у сервера и у клиента-камеры (элементы интерфейса — часть общего состояния игры).
+const SLOT_LUA = `
+  local p = game.get_player(A.camera)
+  if not p then return false end
+  local g = p.gui.screen[A.name]
+  if not g then
+    g = p.gui.screen.add{type = 'camera', name = A.name, position = {A.x, A.y}, surface_index = game.surfaces[A.surface].index, zoom = A.zoom}
+    g.location = {0, 0}
+  end
+  -- Размер и масштаб элемента интерфейса умножаются на масштаб интерфейса игрока — делим, чтобы окно было ровно A.w×A.h
+  local k = p.display_scale or 1
+  g.style.width = math.floor(A.w / k + 0.5) g.style.height = math.floor(A.h / k + 0.5)
+  g.position = {A.x, A.y} g.zoom = A.zoom / k
+  return true`;
+// Окна без зрителей убираем (игра рисует каждое окно каждый кадр).
+setInterval(() => {
+  for (const s of slots) {
+    // У окна есть зритель, а кадров от него нет (окно убрали, клиент перезапустился) — ставим заново.
+    const v = [...viewers].find((o) => o.slot === s);
+    if (v && v.view && s.applied && !s.busy && (!s.key || Date.now() - (wins.get(s.key)?.at || 0) > 5000)) { s.key = null; s.applied = null; s.spec = specFor(v.view); applySlot(s); }
+    if (!s.applied || v) continue;
+    if (Date.now() - s.used < 30_000) continue;
+    s.spec = null; s.applied = null; s.key = null;
+    runLua?.(`local p = game.get_player(A.camera) local g = p and p.gui.screen[A.name] if g then g.destroy() end return true`, { name: s.name }).catch(() => {});
+  }
+  for (const [k, w] of wins) if (Date.now() - w.at > 60_000) wins.delete(k);
+}, 10_000);
+
+setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames} (окон ${wins.size}), разбор кадра ${convN ? (convMs / convN).toFixed(1) : '—'} мс, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; convMs = 0; convN = 0; }, 60_000);
 
 export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
 wssRender.on('connection', (ws, req) => {
@@ -286,10 +409,16 @@ wssRender.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
   if (camSent) ws.send(camSent);
   if (darkSent) ws.send(darkSent);
-  if (rawFrame) { frame = convert(rawFrame); rawFrame = null; }
-  if (frame) sendFrame(ws, new Map());
-  ws.on('close', () => viewers.delete(ws));
-  ws.on('error', () => viewers.delete(ws));
+  ws.on('message', (d) => {
+    let m; try { m = JSON.parse(d); } catch { return; }
+    if (m.t !== 'view') return;
+    if (m.auto) return onView(ws, null);
+    if (![m.x, m.y, m.w, m.h].every(Number.isFinite) || m.w <= 0 || m.h <= 0 || m.w > 1e4 || m.h > 1e4) return;
+    onView(ws, { x: m.x, y: m.y, w: m.w, h: m.h });
+  });
+  const bye = () => { viewers.delete(ws); if (ws.slot) ws.slot.used = Date.now(); releaseSlot(ws); };
+  ws.on('close', bye);
+  ws.on('error', bye);
 });
 
 /** HTTP для /render/…; true — запрос обработан. */

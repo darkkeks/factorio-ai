@@ -6,11 +6,12 @@
 // так сжатие WebSocket (permessage-deflate) работает лучше. Итог на плотной базе — примерно в 3 раза меньше, чем
 // просто сжатый кадр.
 //
-// Формат (Int32): MAGIC, время съёмки (мс по часам камеры, младшие 31 бит), число записей кадра, число операций K, операции, число новых записей M, столбцы новых (R·M).
+// Формат (Int32): MAGIC, время съёмки (мс по часам камеры, младшие 31 бит), прямоугольник окна x0, y0, x1, y1
+// (1/16 клетки; все 0 — неизвестен), число записей кадра, число операций K, операции, число новых записей M, столбцы новых (R·M).
 // Операции по порядку записей кадра: 0 — следующая новая запись; v < 0 — копия записи прошлого кадра с номером −1 − v;
 // v > 0 — ещё v записей прошлого кадра подряд за последней скопированной.
 export const R = 10;
-export const MAGIC = 0x32445246; // 'FRD2'
+export const MAGIC = 0x33445246; // 'FRD3'
 
 const hash = (f, o) => {
   let h = 0x811c9dc5;
@@ -20,7 +21,7 @@ const hash = (f, o) => {
 const same = (a, i, b, j) => { for (let c = 0; c < R; c++) if (a[i + c] !== b[j + c]) return false; return true; };
 
 /** f, prev — Int32Array кадров (prev может быть null — тогда все записи новые). Возвращает Buffer. */
-export function encodeFrame(f, prev, time = 0) {
+export function encodeFrame(f, prev, time = 0, rect = null) {
   const idx = new Map();
   if (prev) for (let o = prev.length - R; o >= 0; o -= R) idx.set(hash(prev, o), o); // при совпадении хешей — первая
   const n = f.length / R, ops = [], nw = [];
@@ -40,9 +41,11 @@ export function encodeFrame(f, prev, time = 0) {
     last = j;
   }
   flush();
-  const m = nw.length / R, out = new Int32Array(5 + ops.length + R * m);
+  const m = nw.length / R, out = new Int32Array(9 + ops.length + R * m);
   let k = 0;
-  out[k++] = MAGIC; out[k++] = Math.round(time) & 0x7fffffff; out[k++] = n; out[k++] = ops.length;
+  out[k++] = MAGIC; out[k++] = Math.round(time) & 0x7fffffff;
+  for (let i = 0; i < 4; i++) out[k++] = rect ? Math.round(rect[i] * 16) : 0;
+  out[k++] = n; out[k++] = ops.length;
   for (const v of ops) out[k++] = v;
   out[k++] = m;
   for (let c = 0; c < R; c++) for (let i = 0; i < m; i++) out[k++] = (c === 1 || c === 2) && i ? nw[i * R + c] - nw[(i - 1) * R + c] : nw[i * R + c];
@@ -53,7 +56,7 @@ export function encodeFrame(f, prev, time = 0) {
 export function decodeFrame(d, prev) {
   let k = 0;
   if (d[k++] !== MAGIC) return d;
-  k++; // время
+  k += 5; // время, прямоугольник окна
   const n = d[k++], K = d[k++], opsAt = k; k += K;
   const m = d[k++], cols = k, f = new Int32Array(n * R);
   let o = 0, last = -2, ni = 0;

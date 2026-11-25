@@ -14,11 +14,14 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
-import { handleRender, wssRender, setCamera, setDarkness, setZoom, renderViewers } from './map-render.mjs';
+import { handleRender, wssRender, setCamera, setDarkness, setZoom, renderViewers, setLuaRunner, setMainSize } from './map-render.mjs';
 import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
 const lua = makeLua('map', 2); // опрос игры и команды камере
+// Окна прототипа отрисовки (/render/) — элементы интерфейса игрока-камеры: команда должна выполниться у клиента, поэтому inline.
+const luaWin = makeLua('map-render', 1);
+setLuaRunner((code, args) => luaWin.inline(code, { camera: CAMERA, surface: SURFACE, ...args }));
 
 const HOST = process.env.MAP_HOST || '172.25.0.1'; // шлюз docker-сети: виден nginx, не виден из интернета
 const PORT = Number(process.env.MAP_PORT || 8766);
@@ -31,6 +34,7 @@ const CAMERA_DIR = process.env.CAMERA_DIR || path.join(os.homedir(), 'factorio-c
 const CAMERA_MANAGE = process.env.CAMERA_MANAGE !== '0';   // 0 — клиент-камеру запускают руками
 const CAMERA_CPUS = process.env.CAMERA_CPUS || '2-7';      // потоки процессора, на которых живёт клиент
 const CAMERA_WINDOW = '1280x720';                          // окно клиента — кадр живого окна; размер снимков от него не зависит
+setMainSize(...CAMERA_WINDOW.split('x').map(Number));
 const CAMERA_DISPLAY = process.env.CAMERA_DISPLAY || ':96'; // дисплей Xvfb клиента
 const CAMERA_DATA = process.env.CAMERA_DATA || path.join(CAMERA_DIR, 'factorio'); // папка данных клиента (config, script-output)
 const CAMERA_ZOOM = 0.75;                                  // масштаб живого окна: 24 пикселя на клетку, 53×30 клеток в кадре

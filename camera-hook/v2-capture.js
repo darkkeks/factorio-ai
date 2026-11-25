@@ -46,7 +46,7 @@ const LIBC = ['socket', 'connect', 'send', 'recv', 'close', 'malloc', 'free', 'm
   'pthread_create', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'pthread_cond_timedwait', 'pthread_cond_signal'];
 const STATE = {};
 for (const [n, size] of [['known', 8 << 17], ['nknown', 8], ['fresh', 8 * 4096], ['nfresh', 8], ['reconnected', 8], ['want_reset', 8], ['path', 112], ['fd', 8],
-  ['kmu', 64], ['qmu', 64], ['qcv', 64], ['lmu', 64], ['q', 8 * 64], ['qh', 8], ['qt', 8], ['lines', 8192], ['nlines', 8], ['last_sent', 8], ['interval_us', 8]]) STATE[n] = Memory.alloc(size);
+  ['kmu', 64], ['qmu', 64], ['qcv', 64], ['lmu', 64], ['q', 8 * 64], ['qh', 8], ['qt', 8], ['lines', 8192], ['nlines', 8], ['last_sent', 8], ['interval_us', 8], ['cur_params', 8], ['wins', 16 * 16]]) STATE[n] = Memory.alloc(size);
 STATE.fd.writeS32(-1);
 const cm = new CModule(`
 #include <glib.h>
@@ -94,6 +94,8 @@ extern char lines[8192];
 extern int nlines;
 extern long long last_sent;
 extern long long interval_us;
+extern volatile u64 cur_params;     /* RenderParameters текущей отрисовки (у каждого окна — свои) */
+extern long long wins[32];           /* окна: пары {RenderParameters*, когда отправлен последний кадр} */
 
 static long long now_us(void) { long long ts[2]; clock_gettime(1, ts); return ts[0] * 1000000 + ts[1] / 1000; } /* CLOCK_MONOTONIC */
 
@@ -147,6 +149,7 @@ static void list(unsigned char *e, unsigned int layer) {
 void onLoad(GumInvocationContext *ic) {
   if (skip) return;
   unsigned char *qq = (unsigned char *) gum_invocation_context_get_nth_argument(ic, 1);
+  cur_params = *(u64 *)qq;   /* DrawQueue+0 — указатель на RenderParameters его отрисовки */
   for (int l = 0; l < 256; l++) list(qq + 0x30 + l * 16, l);
   list(qq + 0x1040, 1000);   /* тени */
   list(qq + 0x1030, 1001);   /* свечение */
@@ -156,7 +159,7 @@ void onLoad(GumInvocationContext *ic) {
 static int qlen(void) { return (qt - qh + QN) % QN; }
 static int push(int type, const void *a, unsigned long na, const void *b, unsigned long nb, int frame) {
   pthread_mutex_lock(qmu);
-  if (qlen() >= QN - 1 || (frame && qlen() >= 3)) { pthread_mutex_unlock(qmu); return 0; } /* сокет не успевает */
+  if (qlen() >= QN - 1 || (frame && qlen() >= 12)) { pthread_mutex_unlock(qmu); return 0; } /* сокет не успевает */
   pthread_mutex_unlock(qmu);
   unsigned char *m = malloc(5 + na + nb);
   if (!m) return 0;
@@ -185,20 +188,36 @@ static unsigned char *pop(int wait_ms) {
 void post2(int type, const void *a, unsigned long na, const void *b, unsigned long nb) { if (fd >= 0) push(type, a, na, b, nb, 0); }
 int connected(void) { return fd >= 0; }
 
-/* Граница кадра (начало DrawEngine::render): кадр — в очередь, если подошло время и сокет успевает. */
+/* Граница отрисовки (начало DrawEngine::render): основной вид и каждое окно-камера интерфейса (LuaGuiElement camera)
+   рисуются отдельно, у каждого — свой RenderParameters. Кадр окна уходит, если с его прошлого кадра прошёл интервал
+   (без 8 мс: при 60 кадрах игры и 30 в секунду — ровно каждый второй) и сокет успевает.
+   Тип 6: double время съёмки (мс), u64 адрес RenderParameters (номер окна), i16 ширина, i16 высота (пиксели), i32 0,
+   double масштаб, i32 x, y центра (1/256 клетки), затем записи.
+   RenderParameters (по updateCornersAndPixelShift): +0x188/+0x18a i16 размер, +0x190 double масштаб, +0x198 MapPosition центра. */
 int frame_end(void) {
   int n = count, sent = 0;
   if (n > CAP) n = CAP;
   if (want_reset) { memset(known, 0, sizeof known); nknown = 0; nfresh = 0; want_reset = 0; }
   long long t = now_us();
-  /* Кадр игры — каждые ~16,7 мс; берём первый, до которого прошло не меньше интервала без 8 мс: при 60 кадрах игры
-     и 30 в секунду это ровно каждый второй. Тип 5 — кадр с отметкой времени съёмки (мс, double) перед записями:
-     страница показывает кадры по этому времени, а не по приходу (сеть и сервис добавляют неровные задержки). */
-  if (fd >= 0 && n > 0 && t - last_sent >= interval_us - 8000) {
-    double ms = t / 1000.0;
-    if (push(5, &ms, 8, buf, (unsigned long)n * REC, 1)) { last_sent = t; sent = 1; }
+  u64 key = cur_params;
+  int w = -1;
+  for (int i = 0; i < 16; i++) if ((u64)wins[2 * i] == key) { w = i; break; }
+  if (w < 0) {                                  /* новое окно — на место самого давно не отправлявшегося */
+    w = 0;
+    for (int i = 1; i < 16; i++) if (wins[2 * i + 1] < wins[2 * w + 1]) w = i;
+    wins[2 * w] = (long long)key; wins[2 * w + 1] = 0;
   }
-  count = 0;
+  if (fd >= 0 && n > 0 && key && t - wins[2 * w + 1] >= interval_us - 8000) {
+    unsigned char h[40], *pp = (unsigned char *)key;
+    memset(h, 0, sizeof h);
+    *(double *)(h + 0) = t / 1000.0;
+    *(u64 *)(h + 8) = key;
+    *(short *)(h + 16) = *(short *)(pp + 0x188); *(short *)(h + 18) = *(short *)(pp + 0x18a);
+    *(double *)(h + 24) = *(double *)(pp + 0x190);
+    *(int *)(h + 32) = *(int *)(pp + 0x198); *(int *)(h + 36) = *(int *)(pp + 0x19c);
+    if (push(6, h, 40, buf, (unsigned long)n * REC, 1)) { wins[2 * w + 1] = t; sent = 1; }
+  }
+  count = 0; cur_params = 0;
   return sent;
 }
 void fresh_done(void) { nfresh = 0; }
