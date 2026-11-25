@@ -14,7 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
-import { handleRender, wssRender, setCamera } from './map-render.mjs';
+import { handleRender, wssRender, setCamera, setDarkness } from './map-render.mjs';
 import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
@@ -73,7 +73,7 @@ const list = (v) => (Array.isArray(v) ? v : []); // пустая таблица 
 
 const LUA = {
   live: `
-    local out = {tick=game.tick, paused=game.tick_paused, bots={}, players={}, chat={}}
+    local out = {tick=game.tick, paused=game.tick_paused, bots={}, players={}, chat={}, dark=game.surfaces[A.surface].darkness}
     -- По зерну генерации узнаём, что на сервере другая карта.
     out.map = tostring(game.surfaces[A.surface].map_gen_settings.seed)
     -- Чем занят бот — той же строкой, что мод показывает над его головой (v2/mod/agent/gui.lua, G.describe):
@@ -313,6 +313,7 @@ async function liveLoop() {
       await aimCamera();
       // Вид клиента-камеры для страницы /render/: центр — тот, за кем она следит.
       const ta = live.target && (live.target.kind === 'bot' ? live.bots : live.players).find((a) => a.name === live.target.name);
+      setDarkness(r.dark ?? 0);
       setCamera(live.camera && ta ? { x: Math.round(ta.x * 4) / 4, y: Math.round(ta.y * 4) / 4, w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM } : null);
       if (live.camera && viewers.size && !encoder) startVideo();
       const fresh = list(r.chat).map((m) => ({ seq: m.seq, from: m.from, text: String(m.text).slice(0, 600), at: Date.now() }));

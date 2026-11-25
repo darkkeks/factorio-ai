@@ -23,10 +23,12 @@ const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
 let gen = '', frame = null, frameN = 0, dirty = true;
 let view = { x: 0, y: 0, k: 24, auto: true };
 let cam = null;       // что видит клиент-камера: {x, y, w, h} в клетках
+let dark = 0;        // темнота поверхности (0 — день), по ней — карта освещения
 let gameOn = false; // подключён ли клиент игры с перехватом
 let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
 
 const shadowCv = document.createElement('canvas'), shadowCtx = shadowCv.getContext('2d'); // буфер теней
+const lightCv = document.createElement('canvas'), lightCtx = lightCv.getContext('2d'); // карта освещения
 const lastImg = new Map(); // место (слой, x, y) -> последний нарисованный там прямоугольник атласа [a, x, y, w, h]
 // Картинки — куски атласов игры 256×256 (/render/atlas/<поколение>/<атлас>/<x>-<y>.png), грузятся по мере надобности;
 // спрайт вырезается из куска при отрисовке (если лежит на стыке кусков — из нескольких).
@@ -82,6 +84,7 @@ function connect() {
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
+    else if (m.t === 'dark') { dark = m.dark; dirty = true; }
     else if (m.t === 'cam') { cam = m.w ? m : null; dirty = true; }
     else if (m.t === 'atlas') dirty = true; // пришёл атлас — недостающие куски перезапросятся при отрисовке
   };
@@ -129,6 +132,7 @@ function draw() {
   if (showBg) background(W, H);
   ctx.imageSmoothingEnabled = true;
   let shown = 0, missing = 0, g = ctx, shadowsDone = false;
+  const lights = [];
   // Тени игра собирает в отдельный буфер (перекрытия не темнеют сильнее) и накладывает его между слоями 119 и 120.
   if (shadowCv.width !== cv.width || shadowCv.height !== cv.height) { shadowCv.width = cv.width; shadowCv.height = cv.height; }
   const flushShadows = () => {
@@ -140,8 +144,9 @@ function draw() {
     const layer = f[o + 3] & 0xffff, rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
     if (layer === 1000 && g === ctx && !shadowsDone) { shadowsDone = true; g = shadowCtx; g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H); }
     else if (layer !== 1000) flushShadows();
-    // Слой 255 — освещение (карта света, днём не видна), спрайты-«только свет» — тоже.
-    if (!s || s.fl & 8 || layer === 255) continue;
+    // Слой 255 — источники света, 1001 — копии светящихся слоёв для карты света: в сцену не рисуем, они идут в карту освещения.
+    if (!s) continue;
+    if (layer === 255 || layer === 1001) { if (dark > 0.02) lights.push(o); continue; }
     const cxr = f[o + 7] & 0xffff, cyr = f[o + 7] >>> 16, cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16;
     // Прямоугольник в атласе; кадр анимации, кусок атласа для которого ещё грузится, — рисуем прошлый с этого места.
     const src = [s.a, s.ax + cxr, s.ay + cyr, cw, ch];
@@ -163,12 +168,32 @@ function draw() {
       if (ok) lastImg.set(slot, src); else missing++;
     };
     if (layer === 1000) put(1, 'source-over');                                   // тень — в буфер теней
-    else if (layer === 1001 || (s.fl & 4)) put(Math.max(tl, ta), 'lighter');     // свечение — сложением
+    else if (s.fl & 4) put(Math.max(tl, ta), 'lighter');                        // свечение — сложением
     else if (Math.abs(tl - ta) < 0.02) put(ta, 'source-over');
     else { if (ta > 0) put(ta, 'destination-out'); if (tl > 0) put(tl, 'lighter'); }
     shown++;
   }
   flushShadows();
+  // Ночь, как в игре: сцена умножается на карту освещения — фоновая яркость (1 − темнота) плюс источники света сложением.
+  if (dark > 0.02) {
+    if (lightCv.width !== cv.width || lightCv.height !== cv.height) { lightCv.width = cv.width; lightCv.height = cv.height; }
+    const lg = lightCtx, amb = Math.round(255 * (1 - dark));
+    lg.setTransform(dpr, 0, 0, dpr, 0, 0); lg.globalCompositeOperation = 'source-over'; lg.globalAlpha = 1;
+    lg.fillStyle = `rgb(${amb}, ${amb}, ${Math.min(255, amb + 12)})`; lg.fillRect(0, 0, W, H);
+    lg.globalCompositeOperation = 'lighter';
+    for (const o of lights) {
+      const s = spr[f[o]], layer = f[o + 3] & 0xffff, rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
+      const cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16, w = cw * f[o + 4] / 1000 / 32 * view.k, h = ch * f[o + 5] / 1000 / 32 * view.k;
+      const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
+      if (cx - w > W || cy - h > H || cx + w < 0 || cy + h < 0) continue;
+      const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
+      lg.globalAlpha = layer === 1001 ? 1 : Math.max(ta, tl);
+      const src = [s.a, s.ax + (f[o + 7] & 0xffff), s.ay + (f[o + 7] >>> 16), cw, ch];
+      if (rot) { lg.save(); lg.translate(cx, cy); lg.rotate(rot); drawAtlas(lg, ...src, -w / 2, -h / 2, w, h); lg.restore(); }
+      else drawAtlas(lg, ...src, cx - w / 2, cy - h / 2, w, h);
+    }
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = 1; ctx.drawImage(lightCv, 0, 0); ctx.restore();
+  }
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   // Вне вида камеры — только снимки карты (без анимаций): затемняем и обводим границу.

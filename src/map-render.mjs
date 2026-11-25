@@ -221,6 +221,13 @@ net.createServer((c) => {
 // ---------- зрители ----------
 // Что видит клиент-камера: прямоугольник в клетках. Всё вне его на странице — только подложка со снимков.
 let cam = null, camSent = '';
+// Темнота поверхности (0 — день, до ~0.85 — ночь): страница строит по ней карту освещения.
+let dark = 0, darkSent = '';
+export function setDarkness(d) {
+  dark = Math.round(d * 100) / 100;
+  const s = JSON.stringify({ t: 'dark', dark });
+  if (s !== darkSent) { darkSent = s; broadcast(s); }
+}
 export function setCamera(c) {
   cam = c;
   const s = c ? JSON.stringify({ t: 'cam', ...c }) : '{"t":"cam"}';
@@ -240,6 +247,7 @@ wssRender.on('connection', (ws) => {
   ws.send(JSON.stringify({ t: 'reset', gen }));
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
   if (camSent) ws.send(camSent);
+  if (darkSent) ws.send(darkSent);
   if (frame) ws.send(frame);
   ws.on('close', () => viewers.delete(ws));
   ws.on('error', () => viewers.delete(ws));
