@@ -488,6 +488,7 @@ function specFor(v) {
 }
 function onView(ws, v) {
   ws.view = v;
+  if (v) sendGround(ws); // земля под новым видом — сразу, не дожидаясь очередного круга рассылки
   if (!v) { releaseSlot(ws); return; }
   if (!ws.slot) {
     // Свободный слот или давно не нужный; иначе — зритель смотрит основной вид (окон больше нет).
