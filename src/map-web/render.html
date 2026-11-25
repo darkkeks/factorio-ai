@@ -117,17 +117,30 @@ function background(W, H) {
   const x1 = Math.floor((view.x - W / 2 / view.k) / span), x2 = Math.floor((view.x + W / 2 / view.k) / span);
   const y1 = Math.floor((view.y - H / 2 / view.k) / span), y2 = Math.floor((view.y + H / 2 / view.k) / span);
   const bucket = Math.floor(Date.now() / 30000); // перечитываем снимки раз в полминуты
-  for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) {
+  const get = (z, x, y) => {
     const k = `${z}/${x}/${y}`;
     let t = bg.get(k);
-    if (!t || t.at !== bucket) {
-      const img = new Image(), nt = { img, ok: false, at: bucket, prev: t && t.ok ? t : null };
+    if (!t || (t.at !== bucket && !t.bad) || (t.bad && t.at !== bucket && bucket % 4 === 0)) {
+      const img = new Image(), nt = { img, ok: false, bad: false, at: bucket, prev: t && t.ok ? t : t && t.prev };
       img.onload = () => { nt.ok = true; nt.prev = null; dirty = true; };
+      img.onerror = () => { nt.bad = true; dirty = true; };
       img.src = `../tiles/${k}.jpg?b=${bucket}`;
       bg.set(k, t = nt);
     }
-    const show = t.ok ? t : t.prev;
-    if (show) ctx.drawImage(show.img, (x * span - view.x) * view.k + W / 2, (y * span - view.y) * view.k + H / 2, span * view.k + 0.5, span * view.k + 0.5);
+    return t.ok ? t : t.prev;
+  };
+  for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) {
+    const dx = (x * span - view.x) * view.k + W / 2, dy = (y * span - view.y) * view.k + H / 2, ds = span * view.k + 0.5;
+    const show = get(z, x, y);
+    if (show) { ctx.drawImage(show.img, dx, dy, ds, ds); continue; }
+    // Снимка этого уровня нет (подробный z6 снимается только там, где смотрят) — кусок более крупного уровня.
+    for (let d = 1; d <= Math.min(z, 3); d++) {
+      const p = get(z - d, Math.floor(x / 2 ** d), Math.floor(y / 2 ** d));
+      if (!p) continue;
+      const s = p.img.naturalWidth / 2 ** d, sx = (x - Math.floor(x / 2 ** d) * 2 ** d) * s, sy = (y - Math.floor(y / 2 ** d) * 2 ** d) * s;
+      ctx.drawImage(p.img, sx, sy, s, s, dx, dy, ds, ds);
+      break;
+    }
   }
 }
 
@@ -176,11 +189,12 @@ function draw() {
     // Если яркость цвета записи равна его прозрачности (обычный случай) — это обычное наложение с прозрачностью.
     // Иначе (дым, свечение с α = 0) — два шага: приглушить фон на α·α_записи и добавить картинку с весом яркости.
     const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
+    const flip = f[o + 9] & 0x300; // флаги записи: 0x100 — отразить по горизонтали, 0x200 — по вертикали (провода, углы)
     const put = (alpha, op) => {
       g.globalAlpha = alpha; g.globalCompositeOperation = op;
       const draw = (r, x, y) => (r instanceof HTMLCanvasElement ? (g.drawImage(r, x, y, w * view.k, h * view.k), true) : drawAtlas(g, r[0], r[1], r[2], r[3], r[4], x, y, w * view.k, h * view.k));
       let ok;
-      if (rot) { g.save(); g.translate(cx, cy); g.rotate(rot); ok = draw(src, -w / 2 * view.k, -h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), -w / 2 * view.k, -h / 2 * view.k); g.restore(); }
+      if (rot || flip) { g.save(); g.translate(cx, cy); g.rotate(rot); if (flip) g.scale(flip & 0x100 ? -1 : 1, flip & 0x200 ? -1 : 1); ok = draw(src, -w / 2 * view.k, -h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), -w / 2 * view.k, -h / 2 * view.k); g.restore(); }
       else { ok = draw(src, cx - w / 2 * view.k, cy - h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), cx - w / 2 * view.k, cy - h / 2 * view.k); }
       if (ok) { if (!(src instanceof HTMLCanvasElement)) lastImg.set(slot, src); } else missing++;
     };
