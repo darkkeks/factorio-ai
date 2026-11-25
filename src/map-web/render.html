@@ -55,6 +55,23 @@ function drawAtlas(g2, a, sx, sy, sw, sh, dx, dy, dw, dh) {
   }
   return true;
 }
+// Вид страницы сообщаем основному сервису карты (тот же /ws, что у основной страницы): камера в первую очередь
+// снимает тайлы подложки под ним. Уровень — тот, что рисует подложка.
+let mapWs = null;
+function sendBgView() {
+  if (!mapWs || mapWs.readyState !== 1) return;
+  if (document.hidden || !showBg) return mapWs.send(JSON.stringify({ t: 'view', none: true }));
+  const W = cv.clientWidth, H = cv.clientHeight, z = Math.max(0, Math.min(6, Math.round(5 + Math.log2(view.k / 32))));
+  mapWs.send(JSON.stringify({ t: 'view', x1: view.x - W / 2 / view.k, x2: view.x + W / 2 / view.k, y1: view.y - H / 2 / view.k, y2: view.y + H / 2 / view.k, z }));
+}
+function connectMap() {
+  mapWs = new WebSocket(new URL('../ws', location.href).href.replace(/^http/, 'ws'));
+  mapWs.onopen = sendBgView;
+  mapWs.onclose = () => setTimeout(connectMap, 3000);
+}
+connectMap();
+setInterval(sendBgView, 2000);
+
 function connect() {
   const ws = new WebSocket(new URL('ws', location.href).href.replace(/^http/, 'ws'));
   ws.binaryType = 'arraybuffer';
