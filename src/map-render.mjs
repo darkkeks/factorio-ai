@@ -225,6 +225,7 @@ net.createServer((c) => {
   for (const ws of viewers) ws.prevFrame = null;
   wins.clear(); mainKey = 'main'; for (const sl of slots) sl.key = null; // у нового клиента окна — по новым адресам
   ground.clear(); for (const ws of viewers) ws.groundSent = null; // номера спрайтов у земли — от прошлого подключения
+  sweepAt = 0; // новый клиент — обойти заново
   broadcast(JSON.stringify({ t: 'reset', gen }));
   // Атлас — десятки мегабайт: куски копим списком и склеиваем один раз, когда сообщение пришло целиком.
   let parts = [], have = 0, need = 4;
@@ -268,7 +269,7 @@ function broadcast(s) { for (const ws of viewers) if (ws.readyState === 1) ws.se
 // от начала сетки, +0x28/+0x2c f32 размер спрайта (пиксели), +0x30..+0x37 байты (размер в клетках и др.), +0x38 f32.
 // Храним по чанкам (по клетке заказа): новая подготовка области заменяет заказы с клетками в этой области; заказы,
 // пришедшие в нескольких соседних областях (большие спрайты на стыке), — одним (по совпадению всех полей).
-const ground = new Map();   // "cx,cy" -> { cx, cy, ver, recs: Map(ключ -> Int32Array(GR)), buf }
+const ground = new Map();   // "cx,cy" -> { cx, cy, ver, at, buf: Int32Array 'GND1' }
 let groundVer = 0;
 const GR = 12;              // целых на заказ для страницы
 function onGround(data) {
@@ -285,16 +286,28 @@ function onGround(data) {
     c.groups.push({ eff: h[7], layer: h[8], at: o, n });
     o += n * 64;
   }
-  const dirty = new Set();
+  // Чанк хранится одним буфером (страничный формат 'GND1': 4 целых заголовка + по GR на заказ): миллионы отдельных
+  // заказов объектами съедали гигабайты. При обновлении области затронутые чанки разбираются, правятся и собираются заново.
+  const edits = new Map();  // "cx,cy" -> { cx, cy, list: [Int32Array(GR)] }
+  const edit = (cx, cy) => {
+    const k = `${cx},${cy}`;
+    let e = edits.get(k);
+    if (!e) {
+      const ch = ground.get(k), list = [];
+      if (ch) for (let i = 0; i < ch.buf[3]; i++) list.push(ch.buf.subarray(4 + i * GR, 4 + (i + 1) * GR));
+      edits.set(k, e = { cx, cy, list, keys: null });
+    }
+    return e;
+  };
   if (fs.existsSync(path.join(path.dirname(SOCK), "ground-debug"))) for (const c of conv.values()) log(`земля: область ${c.r.map((v) => v.toFixed(1)).join(' ')}, групп ${c.groups.length}, заказов ${c.groups.reduce((s, g) => s + g.n, 0)}`);
   for (const c of conv.values()) {
     const [x1, y1, x2, y2] = c.r;
     // Убрать старые заказы с клеткой внутри области.
     for (let cx = Math.floor(x1 / 32); cx <= Math.floor((x2 - 1e-6) / 32); cx++) for (let cy = Math.floor(y1 / 32); cy <= Math.floor((y2 - 1e-6) / 32); cy++) {
-      const ch = ground.get(`${cx},${cy}`);
-      if (!ch) continue;
-      for (const [key, r] of ch.recs) if (r[2] >= x1 && r[2] < x2 && r[3] >= y1 && r[3] < y2) ch.recs.delete(key);
-      dirty.add(ch);
+      if (!ground.has(`${cx},${cy}`) && !edits.has(`${cx},${cy}`)) continue;
+      const e = edit(cx, cy);
+      e.list = e.list.filter((r) => !(r[2] >= x1 && r[2] < x2 && r[3] >= y1 && r[3] < y2));
+      e.keys = null;
     }
     for (const g of c.groups) for (let i = 0; i < g.n; i++) {
       const p = g.at + i * 64;
@@ -308,39 +321,83 @@ function onGround(data) {
       r[6] = data.readInt32LE(p + 0x30); r[7] = data.readInt32LE(p + 0x34);
       r[8] = Math.round(data.readFloatLE(p + 0x38) * 1000); r[9] = data.readInt32LE(p + 0x18);
       r[10] = g.eff; r[11] = g.layer * 65536 + i;   // слой и порядок внутри подготовки
-      const cx = Math.floor(r[2] / 32), cy = Math.floor(r[3] / 32), k = `${cx},${cy}`;
-      let ch = ground.get(k);
-      if (!ch) ground.set(k, ch = { cx, cy, ver: 0, recs: new Map(), buf: null });
-      ch.recs.set(r.subarray(0, 11).join(',') + ',' + g.layer, r);
-      dirty.add(ch);
+      const e = edit(Math.floor(r[2] / 32), Math.floor(r[3] / 32));
+      // Тот же заказ уже есть (большой спрайт на стыке двух областей) — второй раз не кладём.
+      e.keys ??= new Set(e.list.map((q) => q.subarray(0, 11).join(',') + ',' + (q[11] >> 16)));
+      const key = r.subarray(0, 11).join(',') + ',' + g.layer;
+      if (e.keys.has(key)) continue;
+      e.keys.add(key); e.list.push(r);
     }
   }
   // Порядок в чанке: слой, клетка (по строкам), порядок внутри подготовки.
-  for (const ch of dirty) {
-    const list = [...ch.recs.values()].sort((a, b) => (a[11] >> 16) - (b[11] >> 16) || a[3] - b[3] || a[2] - b[2] || (a[11] & 0xffff) - (b[11] & 0xffff));
+  for (const e of edits.values()) {
+    const list = e.list.sort((a, b) => (a[11] >> 16) - (b[11] >> 16) || a[3] - b[3] || a[2] - b[2] || (a[11] & 0xffff) - (b[11] & 0xffff));
     const out = new Int32Array(4 + list.length * GR);
-    out[0] = 0x31444e47; out[1] = ch.cx; out[2] = ch.cy; out[3] = list.length; // 'GND1'
+    out[0] = 0x31444e47; out[1] = e.cx; out[2] = e.cy; out[3] = list.length; // 'GND1'
     list.forEach((r, i) => out.set(r, 4 + i * GR));
-    ch.buf = Buffer.from(out.buffer); ch.ver = ++groundVer;
+    ground.set(`${e.cx},${e.cy}`, { cx: e.cx, cy: e.cy, buf: out, ver: ++groundVer, at: Date.now() });
   }
   groundDirty = true;
+  for (const c of conv.values()) for (const w of [...groundWaiters]) if (c.r[0] <= w.x + 1 && c.r[2] >= w.x - 1 && c.r[1] <= w.y + 1 && c.r[3] >= w.y - 1) { groundWaiters.delete(w); w.done(); }
 }
 let groundDirty = false;
+const groundWaiters = new Set();
+const waitGround = (x, y, ms) => new Promise((done) => { const w = { x, y, done }; groundWaiters.add(w); setTimeout(() => { if (groundWaiters.delete(w)) done(); }, ms); });
+
+// Обходчик: окно-камера в мелком масштабе проходит по всей разведанной карте — игра готовит для него землю, и она есть
+// заранее, до того как туда посмотрит зритель (окно зрителя переезжает за 0,3–0,5 с, а земля под ним уже нарисована).
+// Ближнее к зрителям и камере — первым. После обхода окно убирается (каждое окно стоит игре кадров), повтор — через 10 минут.
+const SWEEP_ZOOM = 0.25, SWEEP_EVERY = 10 * 60_000;
+let sweepAt = 0;
+async function sweepLoop() {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (!game || !runLua || Date.now() - sweepAt < SWEEP_EVERY) continue;
+    try {
+      const charted = await runLua(`local s = game.surfaces[A.surface] local f = game.forces.player local out = {}
+        for c in s.get_chunks() do if f.is_chunk_charted(s, c) then out[#out + 1] = c.x out[#out + 1] = c.y end end return out`, {});
+      const hw = WIN_W / 2 / 32 / SWEEP_ZOOM, hh = WIN_H / 2 / 32 / SWEEP_ZOOM;
+      const cells = new Map();
+      for (let i = 0; i + 1 < charted.length; i += 2) {
+        const gx = Math.floor(charted[i] * 32 / (hw * 2) ), gy = Math.floor(charted[i + 1] * 32 / (hh * 2));
+        cells.set(`${gx},${gy}`, [(gx + 0.5) * hw * 2, (gy + 0.5) * hh * 2]);
+      }
+      const near = [...viewers].map((v) => v.view).filter(Boolean).concat(cam ? [cam] : []);
+      const dist = (c) => Math.min(1e9, ...near.map((v) => Math.hypot(c[0] - v.x, c[1] - v.y)));
+      const list = [...cells.values()].sort((a, b) => dist(a) - dist(b));
+      const t0 = Date.now();
+      log(`обход земли: разведано чанков ${charted.length / 2}, позиций окна ${list.length}`);
+      for (const [i, [x, y]] of list.entries()) {
+        if (!game) break;
+        if (i && i % 100 === 0) log(`обход земли: ${i}/${list.length}, ${((Date.now() - t0) / 1000).toFixed(0)} с, чанков с землёй ${ground.size}`);
+        await runLua(SLOT_LUA, { name: 'web_render_sweep', x, y, zoom: SWEEP_ZOOM, w: WIN_W, h: WIN_H });
+        await waitGround(x, y, 1500);
+      }
+      await runLua(`local p = game.get_player(A.camera) local g = p and p.gui.screen.web_render_sweep if g then g.destroy() end return true`, {});
+      log(`обход земли: за ${((Date.now() - t0) / 1000).toFixed(0)} с, чанков с землёй ${ground.size}`);
+      sweepAt = Date.now();
+    } catch (e) { log('обход земли:', e.message); }
+  }
+}
+setTimeout(sweepLoop, 10_000);
 // Чанки зрителю: вокруг его вида (или вида камеры), новые и изменившиеся.
 function sendGround(ws) {
   if (ws.readyState !== 1 || ws.bufferedAmount > 4_000_000) return;
   const v = ws.view || (cam ? { x: cam.x, y: cam.y, w: cam.w, h: cam.h } : null);
   if (!v) return;
-  if (fs.existsSync(path.join(path.dirname(SOCK), 'ground-debug')) && Math.random() < 0.05) log(`земля зрителю ${ws.dbgId ??= Math.random().toString(36).slice(2, 6)} (${ws._socket?.remoteAddress}, ${ws.protocol}, ${ws.extensions}): вид ${JSON.stringify(v)}, чанков в памяти ${ground.size}, отправлено ${ws.groundSent?.size ?? 0}`);
   ws.groundSent ??= new Map();
-  const x1 = Math.floor((v.x - v.w) / 32), x2 = Math.floor((v.x + v.w) / 32), y1 = Math.floor((v.y - v.h) / 32), y2 = Math.floor((v.y + v.h) / 32);
+  // Сначала — то, что на экране, затем с запасом в два экрана с каждой стороны: при сдвиге и отдалении земля уже у страницы.
+  const order = [];
+  for (const m of [0.5, 2.5]) {
+    const x1 = Math.floor((v.x - v.w * m) / 32), x2 = Math.floor((v.x + v.w * m) / 32), y1 = Math.floor((v.y - v.h * m) / 32), y2 = Math.floor((v.y + v.h * m) / 32);
+    for (let cx = x1; cx <= x2; cx++) for (let cy = y1; cy <= y2; cy++) order.push([cx, cy]);
+  }
   let sent = 0;
-  for (let cx = x1; cx <= x2; cx++) for (let cy = y1; cy <= y2; cy++) {
+  for (const [cx, cy] of order) {
     const c = ground.get(`${cx},${cy}`);
     if (!c || ws.groundSent.get(`${cx},${cy}`) === c.ver) continue;
-    ws.send(c.buf, (err) => { if (err) log(`земля: не отправилась: ${err.message}`); }); ws.groundSent.set(`${cx},${cy}`, c.ver);
-    if (fs.existsSync(path.join(path.dirname(SOCK), 'ground-debug'))) log(`земля -> ${ws.dbgId ??= Math.random().toString(36).slice(2, 6)}: ${cx},${cy} v${c.ver} ${c.buf.length} байт, в буфере ${ws.bufferedAmount}`);
-    if (++sent >= 64) return;
+    ws.send(Buffer.from(c.buf.buffer, c.buf.byteOffset, c.buf.byteLength)); ws.groundSent.set(`${cx},${cy}`, c.ver);
+    if (++sent >= 96) return;
   }
 }
 setInterval(() => { for (const ws of viewers) if (ws.delta) sendGround(ws); groundDirty = false; }, 250);
@@ -501,7 +558,7 @@ setInterval(() => {
 
 setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames} (окон ${wins.size}), разбор кадра ${convN ? (convMs / convN).toFixed(1) : '—'} мс, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; convMs = 0; convN = 0; }, 60_000);
 
-export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
+export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: { threshold: 1024 } });
 wssRender.on('connection', (ws, req) => {
   ws.delta = /[?&]d=1/.test(req?.url || ''); // страница умеет разность (старые открытые вкладки получают кадры целиком)
   viewers.add(ws);
@@ -511,6 +568,7 @@ wssRender.on('connection', (ws, req) => {
   if (darkSent) ws.send(darkSent);
   ws.on('message', (d) => {
     let m; try { m = JSON.parse(d); } catch { return; }
+    if (m.t === 'gforget' && Array.isArray(m.keys)) { for (const k of m.keys.slice(0, 5000)) ws.groundSent?.delete(String(k)); return; }
     if (m.t !== 'view') return;
     if (m.auto) return onView(ws, null);
     if (![m.x, m.y, m.w, m.h].every(Number.isFinite) || m.w <= 0 || m.h <= 0 || m.w > 1e4 || m.h > 1e4) return;

@@ -354,7 +354,7 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') {
       const d = new Int32Array(e.data);
-      if (d[0] === 0x31444e47) { groundChunks.set(`${d[1]},${d[2]}`, d); dirty = true; return; } // земля чанка
+      if (d[0] === 0x31444e47) { groundChunks.set(`${d[1]},${d[2]}`, d); dirty = true; forgetGround(); return; } // земля чанка
       receive(d); return;
     }
     const m = JSON.parse(e.data);
@@ -448,6 +448,15 @@ function netStat() {
 // клетка x, y, размер спрайта (пиксели) w, h, байты +0x30..+0x33 и +0x34..+0x37, масштаб ×1000, +0x18, эффект, группа.
 const groundChunks = new Map(); // "cx,cy" -> Int32Array
 let showGround = true;          // клавиша G
+// Не больше GROUND_MAX чанков в памяти страницы: дальние забываем и говорим сервису — пришлёт снова, когда понадобятся.
+const GROUND_MAX = 2500;
+function forgetGround() {
+  if (groundChunks.size <= GROUND_MAX) return;
+  const far = [...groundChunks.keys()].map((k) => { const [cx, cy] = k.split(',').map(Number); return [k, Math.hypot(cx * 32 + 16 - view.x, cy * 32 + 16 - view.y)]; })
+    .sort((a, b) => b[1] - a[1]).slice(0, groundChunks.size - GROUND_MAX * 0.8).map((e) => e[0]);
+  for (const k of far) groundChunks.delete(k);
+  if (renderWs && renderWs.readyState === 1) renderWs.send(JSON.stringify({ t: 'gforget', keys: far }));
+}
 function emitGround(vw, vh) {
   let n = 0;
   const x1 = Math.floor((view.x - vw) / 32), x2 = Math.floor((view.x + vw) / 32), y1 = Math.floor((view.y - vh) / 32), y2 = Math.floor((view.y + vh) / 32);
@@ -458,7 +467,15 @@ function emitGround(vw, vh) {
       const s = spr[d[o]];
       if (!s) continue;
       const b = d[o + 6], tw = b & 255, th = (b >>> 8) & 255;
-      if (!tw || !th || tw > 16 || th > 16) continue;   // декали и прочее — позже
+      if (s.fl & 0x80) {
+        // Декаль земли (большие пятна): байты +0x30/+0x31 — доля клетки (1/256) к позиции, +0x38 — масштаб; пиксели атласа — 64 на клетку при масштабе 1.
+        const sc = d[o + 8] / 1000 || 0.5, w = s.w * sc / 32, h = s.h * sc / 32;
+        const x = d[o + 2] + (b & 255) / 256 - view.x, y = d[o + 3] + ((b >>> 8) & 255) / 256 - view.y;
+        emit(x, y, w, h, 0, 1, 1, s.a, s.ax, s.ay, s.w, s.h, 1, 1, 1, 1, 0);
+        n++;
+        continue;
+      }
+      if (!tw || !th || tw > 16 || th > 16) continue;
       const x = d[o + 2] + tw / 2 - view.x, y = d[o + 3] + th / 2 - view.y;
       const m = d[o + 1] >= 0 ? spr[d[o + 1]] : null;
       if (d[o + 1] >= 0 && !m) continue;
@@ -503,8 +520,9 @@ function drawFrame() {
     const o = i * R, s = spr[f[o]];
     if (!s) continue;
     const layer = f[o + 3] & 0xffff;
-    // Слой 92 — декали (трава, камешки на земле): они уже есть на снимке-подложке, второй раз — вдвое гуще и ярче, чем в игре.
-    if (layer === 92 && showBg) continue;
+    // Слой 92 — декали (трава, камешки на земле): на снимке-подложке они уже есть, второй раз — вдвое гуще и ярче, чем в игре;
+    // поверх своей земли (чанк есть) — рисуем.
+    if (layer === 92 && showBg && !(showGround && groundChunks.has(`${Math.floor(f[o + 1] / 8192)},${Math.floor(f[o + 2] / 8192)}`))) continue;
     // Слой 255 — источники света, 1001 — копии светящихся слоёв для карты света: в сцену не рисуем.
     if (layer === 255 || layer === 1001) { if (night) lights.push(o); continue; }
     const cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16, w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;
