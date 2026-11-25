@@ -302,10 +302,16 @@ function draw() {
       const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
       if (cx - w > W || cy - h > H || cx + w < 0 || cy + h < 0) continue;
       const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
-      lg.globalAlpha = layer === 1001 ? 1 : Math.max(ta, tl);
       const src = [s.a, s.ax + (f[o + 7] & 0xffff), s.ay + (f[o + 7] >>> 16), cw, ch];
-      if (rot) { lg.save(); lg.translate(cx, cy); lg.rotate(rot); drawAtlas(lg, ...src, -w / 2, -h / 2, w, h); lg.restore(); }
-      else drawAtlas(lg, ...src, cx - w / 2, cy - h / 2, w, h);
+      // Цвет света — в цвете записи (уже умножен на силу, как у цветных фонарей); без цвета (rgb = 0) — белый свет силой α.
+      const cr = tint & 255, cg = (tint >>> 8) & 255, cb = (tint >>> 16) & 255;
+      const colored = layer === 255 && Math.max(cr, cg, cb) - Math.min(cr, cg, cb) > 8;
+      const img = colored ? tinted(src, (tint & 0xffffff) | 0xff000000) : null;
+      if (colored && !img) continue;
+      lg.globalAlpha = colored ? 1 : layer === 1001 ? 1 : Math.max(ta, tl);
+      const put = (x, y) => (img ? lg.drawImage(img, x, y, w, h) : drawAtlas(lg, ...src, x, y, w, h));
+      if (rot) { lg.save(); lg.translate(cx, cy); lg.rotate(rot); put(-w / 2, -h / 2); lg.restore(); }
+      else put(cx - w / 2, cy - h / 2);
     }
     applyNight(Math.min(1, dark / 0.85));
   }
