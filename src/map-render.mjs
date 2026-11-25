@@ -20,9 +20,9 @@ const SOCK = process.env.V2_SOCK || path.join(os.homedir(), 'factorio-camera/hoo
 const PAGE = path.join(ROOT, 'src/map-web/render.html');
 const LUT_NIGHT = path.join(process.env.GAME_DATA || path.join(os.homedir(), 'factorio-camera/factorio/data'), 'core/graphics/color_luts/lut-night.png');
 const DUMP = path.join(os.homedir(), 'factorio-camera/hook/raw'); // есть папка — сжатые атласы пишутся туда (отладка)
-const SEND_MS = 100;           // кадров зрителям — не чаще 10 в секунду
 const log = (...a) => console.log(new Date().toISOString().slice(11, 23), '[render]', ...a);
 
+const spritesNum = new Map(); // числовой адрес -> то же описание (быстрый поиск при разборе кадра)
 const sprites = new Map();     // адрес спрайта в игре -> { n, ...описание }
 const byN = [];                // номер -> описание
 const atlases = new Map();     // адрес атласа -> { w, h, rgba } | 'wait'
@@ -30,7 +30,7 @@ const pngs = new Map();        // номер спрайта -> PNG
 const atlasIdx = new Map();    // адрес атласа -> номер (для адресов кусков атласа)
 const atlasByIdx = [];         // номер -> адрес
 const tilePngs = new Map();    // "номер/x-y" -> PNG куска 1024×1024
-let game = null, frame = null, frameAt = 0, frames = 0;
+let game = null, frame = null, frameAt = 0, frames = 0, rawFrame = null, convMs = 0, convN = 0, frameTime = 0;
 let gen = Date.now().toString(36); // поколение номеров спрайтов: меняется при переподключении игры (в адресе картинок)
 const viewers = new Set();
 export const renderViewers = () => viewers.size;
@@ -111,7 +111,7 @@ function onMessage(type, data) {
     for (const d of JSON.parse(data.toString('latin1'))) {
       if (sprites.has(d.id)) continue;
       const s = { ...d, n: byN.length };
-      sprites.set(d.id, s); byN.push(s); fresh.push(s);
+      sprites.set(d.id, s); spritesNum.set(parseInt(d.id, 16), s); byN.push(s); fresh.push(s);
       if (!atlases.has(d.atlas)) { atlases.set(d.atlas, 'wait'); game?.write(`atlas ${d.atlas}\n`); }
       if (!atlasIdx.has(d.atlas)) { atlasIdx.set(d.atlas, atlasByIdx.length); atlasByIdx.push(d.atlas); }
     }
@@ -135,9 +135,16 @@ function onMessage(type, data) {
       return;
     }
     broadcast(JSON.stringify({ t: 'atlas' })); // страница перезапросит спрайты, которые не загрузились
-  } else if (type === 1) {
+  } else if (type === 1 || type === 5) {
+    // Тип 5 — то же с отметкой времени съёмки (мс, double) перед записями.
+    if (type === 5) { frameTime = data.readDoubleLE(0); data = data.subarray(8); } else frameTime = Date.now();
     frames++;
-    frame = convert(data);
+    // Без зрителей кадр не разбираем (сервису это ~5–10 мс на кадр), только запоминаем — для того, кто придёт.
+    if (!viewers.size) { rawFrame = data; return; }
+    const t = performance.now();
+    frame = convert(data); rawFrame = null;
+    convMs += performance.now() - t; convN++;
+    pushFrame();
   }
 }
 
@@ -148,48 +155,56 @@ function onMessage(type, data) {
 // тени (слой 1000) — одним буфером между слоями 119 и 120.
 const REC = 64;
 let lastCal = 0, calBad = 0;
-const median = (a) => { a.sort((x, y) => x - y); return a.length ? a[a.length >> 1] : 0; };
+// Без BigInt и объектов на запись (было ~29 мс на кадр в 15 тыс. записей — при 30 кадрах в секунду это весь процессор):
+// поля читаются типизированными массивами, ключ — двумя u32, спрайт — по числовому адресу.
+const ord = (l) => (l === 1000 ? 239 : l === 1001 ? 511 : l * 2);
+let cv = null; // рабочие массивы, растут по надобности
+function work(n) {
+  if (cv && cv.n >= n) return cv;
+  return cv = { n, idx: new Uint32Array(n), sn: new Int32Array(n), pri: new Float64Array(n), lo: new Uint32Array(n), kx: new Float64Array(n), ky: new Float64Array(n), cal: new Float64Array(2 * n) };
+}
 function convert(data) {
-  const n = data.length / REC, recs = [], zs = [];
+  if (data.byteOffset & 3) data = Buffer.from(data); // выравнивание для типизированных массивов
+  const n = data.length / REC, u = new Uint32Array(data.buffer, data.byteOffset, n * 16), f = new Float32Array(data.buffer, data.byteOffset, n * 16);
+  const W = work(n), zoom = camZoom, Z = 32 * zoom;
+  let m = 0, nc = 0;
   for (let i = 0; i < n; i++) {
-    const o = i * REC, s = sprites.get('0x' + data.readBigUInt64LE(o).toString(16));
+    const o = i * 16, s = spritesNum.get(u[o] + u[o + 1] * 4294967296);
     if (!s) continue;
-    const fl = data.readUInt32LE(o + 28);
-    if (fl & 0x400) continue;                      // такие записи игра пропускает при отрисовке
-    const key = data.readBigUInt64LE(o + 8), v = (key - 0x8000000000000080n) & 0xffffffffffffffffn;
-    let kx = Number((v >> 6n) & 0xffffffffn) - 2 ** 28; if (kx >= 2 ** 31) kx -= 2 ** 32;
-    let ky = Number(v >> 35n); if (ky >= 2 ** 28) ky -= 2 ** 29;
-    const r = { s, key, fl, kx: kx / 256, ky: ky / 256, px: data.readFloatLE(o + 16), py: data.readFloatLE(o + 20), rot: data.readUInt32LE(o + 24),
-      sx: data.readFloatLE(o + 32), sy: data.readFloatLE(o + 36), tint: data.readUInt32LE(o + 40) | 0,
-      cx: Math.round(data.readFloatLE(o + 44)), cy: Math.round(data.readFloatLE(o + 48)), cw: Math.round(data.readFloatLE(o + 52)), ch: Math.round(data.readFloatLE(o + 56)),
-      layer: data.readUInt32LE(o + 60) };
-    if (s.scale > 0 && r.sx > 0) zs.push(r.sx / s.scale);
-    recs.push(r);
+    if (u[o + 7] & 0x400) continue;                // такие записи игра пропускает при отрисовке
+    const lo = u[o + 2], hi = u[o + 3];
+    // v = ключ − 0x8000000000000080; x — биты 6–37 минус 2^28, y — биты 35 и выше (29 бит со знаком), единица 1/256 клетки.
+    const vlo = (lo - 0x80) >>> 0, vhi = (hi - 0x80000000 - (lo < 0x80 ? 1 : 0)) >>> 0;
+    let kx = (((vlo >>> 6) | ((vhi & 0x3f) << 26)) >>> 0) - 2 ** 28; if (kx >= 2 ** 31) kx -= 2 ** 32;
+    let ky = vhi >>> 3; if (ky >= 2 ** 28) ky -= 2 ** 29;
+    W.idx[m] = i; W.sn[i] = s.n; W.pri[i] = ord(u[o + 15]) * 4294967296 + hi; W.lo[i] = lo;
+    // Калибруем по спрайтам без сдвига (предметы, значки): у них точка на экране — ровно позиция из ключа.
+    if (!u[o + 6] && Math.abs(s.shiftX) < 0.01 && Math.abs(s.shiftY) < 0.01 && Math.abs(kx) < 2.56e8 && Math.abs(ky) < 2.56e8) {
+      W.cal[2 * nc] = f[o + 4] - Z * kx / 256; W.cal[2 * nc + 1] = f[o + 5] - Z * ky / 256; nc++;
+    }
+    m++;
   }
-  // Масштаб — у самой камеры (ширина её вида известна сервису карты); медиана по записям врёт: у значков свой масштаб.
-  const zoom = camZoom, Z = 32 * zoom;
-  const cxs = [], cys = [];
-  // Калибруем по спрайтам без сдвига (предметы, значки): у них точка на экране — ровно позиция из ключа.
-  for (const r of recs) if (Math.abs(r.kx) < 1e6 && Math.abs(r.ky) < 1e6 && !r.rot && Math.abs(r.s.shiftX) < 0.01 && Math.abs(r.s.shiftY) < 0.01) { cxs.push(r.px - Z * r.kx); cys.push(r.py - Z * r.ky); }
   // Сдвиг экрана — самое частое значение (экранные точки у спрайтов без сдвига совпадают до пикселя), а не медиана.
-  const mode = (a) => { const c = new Map(); let best = 0, bv = 0; for (const v of a) { const k = Math.round(v * 4); const n = (c.get(k) || 0) + 1; c.set(k, n); if (n > best) { best = n; bv = k / 4; } } return [bv, best]; };
-  const [CX, nx] = mode(cxs), [CY, ny] = mode(cys);
+  const mode = (d) => { const c = new Map(); let best = 0, bv = 0; for (let i = 0; i < nc; i++) { const k = Math.round(W.cal[2 * i + d] * 4); const q = (c.get(k) || 0) + 1; c.set(k, q); if (q > best) { best = q; bv = k / 4; } } return [bv, best]; };
+  const [CX, nx] = mode(0), [CY, ny] = mode(1);
   if (Math.min(nx, ny) < 5) calBad++;
-  if (Date.now() - lastCal > 600000) { lastCal = Date.now(); log(`калибровка: плохих кадров ${calBad}, совпадений ${nx}/${ny} из ${cxs.length}, масштаб ${zoom.toFixed(3)}, центр экрана в мире ${((640 - CX) / Z).toFixed(2)}, ${((360 - CY) / Z).toFixed(2)}, записей ${recs.length}, пример ключ ${recs[0]?.kx},${recs[0]?.ky} экран ${recs[0]?.px},${recs[0]?.py}`); }
-  const ord = (l) => (l === 1000 ? 239 : l === 1001 ? 511 : l * 2);
-  recs.sort((a, b) => ord(a.layer) - ord(b.layer) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  if (Date.now() - lastCal > 600000) { lastCal = Date.now(); log(`калибровка: плохих кадров ${calBad}, совпадений ${nx}/${ny} из ${nc}, масштаб ${zoom.toFixed(3)}, центр экрана в мире ${((640 - CX) / Z).toFixed(2)}, ${((360 - CY) / Z).toFixed(2)}, записей ${m}`); }
+  // Порядок как в игре: по слою, внутри — по ключу сортировки (u64 без знака).
+  const idx = W.idx.subarray(0, m), pri = W.pri, klo = W.lo;
+  idx.sort((a, b) => pri[a] - pri[b] || klo[a] - klo[b]);
   // Браузеру — по 10 целых (последнее — флаги записи): номер спрайта, x, y (1/256 клетки), поворот (16 бит) | слой (16 бит),
   // масштаб x, y (×1000, в «пикселях атласа на 32 клетки»), цвет, вырезка x|y<<16, w|h<<16.
-  const out = new Int32Array(recs.length * 10);
+  const out = new Int32Array(m * 10);
   let k = 0;
-  for (const r of recs) {
-    out[k++] = r.s.n;
-    out[k++] = Math.round((r.px - CX) / Z * 256); out[k++] = Math.round((r.py - CY) / Z * 256);
-    out[k++] = ((r.rot >>> 16) << 16) | (r.layer & 0xffff);
-    out[k++] = Math.round(r.sx / zoom * 1000); out[k++] = Math.round(r.sy / zoom * 1000);
-    out[k++] = r.tint;
-    out[k++] = (r.cx & 0xffff) | (r.cy << 16); out[k++] = (r.cw & 0xffff) | (r.ch << 16);
-    out[k++] = r.fl; // флаги записи (режим смешивания и т. п.)
+  for (let q = 0; q < m; q++) {
+    const i = idx[q], o = i * 16;
+    out[k++] = W.sn[i];
+    out[k++] = Math.round((f[o + 4] - CX) / Z * 256); out[k++] = Math.round((f[o + 5] - CY) / Z * 256);
+    out[k++] = ((u[o + 6] >>> 16) << 16) | (u[o + 15] & 0xffff);
+    out[k++] = Math.round(f[o + 8] / zoom * 1000); out[k++] = Math.round(f[o + 9] / zoom * 1000);
+    out[k++] = u[o + 10] | 0;
+    out[k++] = (Math.round(f[o + 11]) & 0xffff) | (Math.round(f[o + 12]) << 16); out[k++] = (Math.round(f[o + 13]) & 0xffff) | (Math.round(f[o + 14]) << 16);
+    out[k++] = u[o + 7] | 0; // флаги записи (режим смешивания и т. п.)
   }
   return Buffer.from(out.buffer, 0, k * 4);
 }
@@ -202,7 +217,7 @@ net.createServer((c) => {
   log('игра подключилась');
   setTimeout(() => broadcast(JSON.stringify({ t: 'game', on: true })), 0);
   // Атласы, полученные раньше, могли устареть (другой запуск игры) — начинаем с чистого листа.
-  sprites.clear(); byN.length = 0; atlases.clear(); pngs.clear(); atlasIdx.clear(); atlasByIdx.length = 0; tilePngs.clear();
+  sprites.clear(); spritesNum.clear(); byN.length = 0; atlases.clear(); pngs.clear(); atlasIdx.clear(); atlasByIdx.length = 0; tilePngs.clear();
   gen = Date.now().toString(36);
   for (const ws of viewers) ws.prevFrame = null;
   broadcast(JSON.stringify({ t: 'reset', gen }));
@@ -249,17 +264,19 @@ function sendFrame(ws, cache) {
   if (!ws.delta) { ws.send(frame); return; }
   const cur = asInts(frame), key = ws.prevFrame || null;
   let enc = cache.get(key);
-  if (!enc) { enc = encodeFrame(cur, key && key.length ? key : null); cache.set(key, enc); }
+  if (!enc) { enc = encodeFrame(cur, key && key.length ? key : null, frameTime); cache.set(key, enc); }
   ws.send(enc);
   ws.prevFrame = cur;
 }
-setInterval(() => {
+// Кадр уходит зрителям сразу, как пришёл от игры: частоту задаёт перехват (V2_FPS, ровно по времени), лишняя
+// очередь по таймеру здесь давала бы биения и неровные паузы.
+function pushFrame() {
   if (!frame || frame === frameAt) return;
   frameAt = frame;
   const cache = new Map();
   for (const ws of viewers) sendFrame(ws, cache);
-}, SEND_MS);
-setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames}, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; }, 60_000);
+}
+setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames}, разбор кадра ${convN ? (convMs / convN).toFixed(1) : '—'} мс, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; convMs = 0; convN = 0; }, 60_000);
 
 export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
 wssRender.on('connection', (ws, req) => {
@@ -269,6 +286,7 @@ wssRender.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
   if (camSent) ws.send(camSent);
   if (darkSent) ws.send(darkSent);
+  if (rawFrame) { frame = convert(rawFrame); rawFrame = null; }
   if (frame) sendFrame(ws, new Map());
   ws.on('close', () => viewers.delete(ws));
   ws.on('error', () => viewers.delete(ws));

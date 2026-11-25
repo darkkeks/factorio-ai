@@ -97,7 +97,9 @@ setInterval(sendBgView, 2000);
 function decodeFrame(d, prev) {
   const R = 10;
   let k = 0;
-  if (d[k++] !== 0x31445246) return d;
+  if (d[k] === 0x31445246) k++;                       // старый формат — без времени
+  else if (d[k] === 0x32445246) { k++; decodeFrame.time = d[k++]; }
+  else return d;
   const n = d[k++], K = d[k++], opsAt = k; k += K;
   const m = d[k++], cols = k, f = new Int32Array(n * R);
   let o = 0, last = -2, ni = 0, px = 0, py = 0;
@@ -114,13 +116,46 @@ function decodeFrame(d, prev) {
   return f;
 }
 
+// Показ по времени съёмки, а не по приходу: кадр с отметкой камеры t показывается в момент t + сдвиг часов + запас.
+// Сдвиг — наименьшая (за 5 с) разница «пришёл − снят», запас PLAY_DELAY_MS сглаживает неровные задержки сети и сервиса.
+const PLAY_DELAY_MS = 80;
+let decoded = null;               // последний разобранный кадр (от него считается разность следующего)
+const playQ = [];                 // [{ f, t }] — разобранные, ещё не показанные
+const offs = [];                  // [{ at, off }] за последние 5 с
+function receive(d) {
+  decodeFrame.time = undefined;
+  decoded = decodeFrame(d, decoded);
+  const now = performance.now();
+  arrivals.push(now);
+  if (decodeFrame.time === undefined) { frame = decoded; frameN++; dirty = true; return; } // без отметок — сразу
+  const t = decodeFrame.time;
+  offs.push({ at: now, off: now - t });
+  while (offs.length && now - offs[0].at > 5000) offs.shift();
+  playQ.push({ f: decoded, t });
+  if (playQ.length > 30) playQ.splice(0, playQ.length - 30);
+}
+function playout() {
+  if (!playQ.length) return;
+  const now = performance.now();
+  let base = Infinity; for (const o of offs) base = Math.min(base, o.off);
+  const due = now - base - PLAY_DELAY_MS;   // по часам камеры: какой кадр показывать сейчас
+  let pick = -1;
+  for (let i = 0; i < playQ.length; i++) if (playQ[i].t <= due) pick = i;
+  // Отстали больше чем на полсекунды (вкладка спала и т. п.) — сразу к последнему.
+  if (playQ.length && due - playQ[playQ.length - 1].t > 500) pick = playQ.length - 1;
+  if (pick < 0) return;
+  frame = playQ[pick].f; frameN++; dirty = true; shows.push(now);
+  playQ.splice(0, pick + 1);
+}
+const shows = [];
+
 function connect() {
   const ws = new WebSocket(new URL('ws?d=1', location.href).href.replace(/^http/, 'ws'));
   ws.binaryType = 'arraybuffer';
   ws.onmessage = (e) => {
-    if (typeof e.data !== 'string') { frame = decodeFrame(new Int32Array(e.data), frame); frameN++; arrivals.push(performance.now()); dirty = true; return; }
+    if (typeof e.data !== 'string') { receive(new Int32Array(e.data)); return; }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; tiles.clear(); lastImg.clear(); tintCache.clear(); }
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; decoded = null; playQ.length = 0; tiles.clear(); lastImg.clear(); tintCache.clear(); }
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
@@ -243,7 +278,9 @@ function netStat() {
   while (arrivals.length && now - arrivals[0] > 3000) arrivals.shift();
   let gap = arrivals.length ? now - arrivals[arrivals.length - 1] : 0;
   for (let i = 1; i < arrivals.length; i++) gap = Math.max(gap, arrivals[i] - arrivals[i - 1]);
-  return `от камеры ${(arrivals.length / 3).toFixed(1)} кадр/с, самая длинная пауза ${gap.toFixed(0)} мс`;
+  while (shows.length && now - shows[0] > 3000) shows.shift();
+  let sgap = 0; for (let i = 1; i < shows.length; i++) sgap = Math.max(sgap, shows[i] - shows[i - 1]);
+  return `от камеры ${(arrivals.length / 3).toFixed(1)} кадр/с, самая длинная пауза ${gap.toFixed(0)} мс; показано ${(shows.length / 3).toFixed(1)} кадр/с, пауза до ${sgap.toFixed(0)} мс`;
 }
 let drawMs = 0;
 function draw() {
@@ -254,6 +291,7 @@ function draw() {
 function drawFrame() {
   const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
   if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; dirty = true; }
+  playout();
   if (!dirty) return;
   dirty = false;
   // Без клиента игры показываем хотя бы подложку — и говорим, почему нет построек.
