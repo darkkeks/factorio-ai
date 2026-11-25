@@ -44,9 +44,15 @@ const skip = Memory.alloc(8);
 // Сообщение сервису: u32 длина (тип + данные), u8 тип, данные. Тип 1 — кадр, 2 — описания спрайтов (JSON), 3 — атлас.
 const LIBC = ['socket', 'connect', 'send', 'recv', 'close', 'malloc', 'free', 'memcpy', 'memset', 'memmove', 'usleep', 'clock_gettime',
   'pthread_create', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'pthread_cond_timedwait', 'pthread_cond_signal'];
-const STATE = {};
+const TCAP = 16 << 20;   // байт заказов земли за кадр (чанки, которые игра подготовила для отрисовки)
+const STATE = {}, STATE_SIZE = {};
 for (const [n, size] of [['known', 8 << 17], ['nknown', 8], ['fresh', 8 * 4096], ['nfresh', 8], ['reconnected', 8], ['want_reset', 8], ['path', 112], ['fd', 8],
-  ['kmu', 64], ['qmu', 64], ['qcv', 64], ['lmu', 64], ['q', 8 * 64], ['qh', 8], ['qt', 8], ['lines', 8192], ['nlines', 8], ['last_sent', 8], ['interval_us', 8], ['cur_params', 8], ['wins', 16 * 16]]) STATE[n] = Memory.alloc(size);
+  ['kmu', 64], ['qmu', 64], ['qcv', 64], ['lmu', 64], ['q', 8 * 64], ['qh', 8], ['qt', 8], ['lines', 8192], ['nlines', 8], ['last_sent', 8], ['interval_us', 8], ['cur_params', 8], ['wins', 16 * 16],
+  ['tbuf', TCAP], ['tlen', 8], ['tmu', 64], ['tmap', 8 * 9 * 64], ['tmapn', 8], ['tout', TCAP], ['thash', 8 * 3 * 512]]) { STATE[n] = Memory.alloc(size); STATE_SIZE[n] = size; }
+{ // Memory.alloc не обязан отдавать нули, а мьютексы и счётчики должны начинаться с нуля.
+  const memset = new NativeFunction(Module.getGlobalExportByName('memset'), 'pointer', ['pointer', 'int', 'size_t']);
+  for (const [n, p] of Object.entries(STATE)) memset(p, 0, STATE_SIZE[n]);
+}
 STATE.fd.writeS32(-1);
 const cm = new CModule(`
 #include <glib.h>
@@ -96,6 +102,15 @@ extern long long last_sent;
 extern long long interval_us;
 extern volatile u64 cur_params;     /* RenderParameters текущей отрисовки (у каждого окна — свои) */
 extern long long wins[32];           /* окна: пары {RenderParameters*, когда отправлен последний кадр} */
+/* Земля: заказы TileDrawOrder чанков, подготовленных игрой в этом кадре (см. onTileConvert / onTileAdd). */
+#define TCAP ${TCAP}
+extern unsigned char tbuf[];
+extern int tlen;
+extern u64 tmu[8];
+extern long long tmap[9 * 64];       /* TileBatchDrawOrder* -> TileDrawQueue*, область x1, y1, x2, y2 (1/256), начало сетки x, y, номер подготовки */
+extern int tmapn;
+extern unsigned char tout[];
+extern u64 thash[3 * 512];         /* область (x1,y1 | x2,y2) -> хеш её последней отправленной подготовки */
 
 static long long now_us(void) { long long ts[2]; clock_gettime(1, ts); return ts[0] * 1000000 + ts[1] / 1000; } /* CLOCK_MONOTONIC */
 
@@ -155,6 +170,58 @@ void onLoad(GumInvocationContext *ic) {
   list(qq + 0x1030, 1001);   /* свечение */
 }
 
+/* Земля. Игра готовит землю областями: TileDrawQueue (заказы по 80 слоям) -> TileDrawQueue::convertToTileBatch(пакет)
+   -> TileBatchDrawOrder::add(начало, конец вектора TileDrawOrder, эффект) по слоям. Область — чанк (при загрузке)
+   или полоса, впервые попавшая в вид (остальное игра берёт из прошлого кадра). Из TileDrawQueue при convertToTileBatch
+   берём область (+0x32b8 левый верхний, +0x32c0 правый нижний угол, 1/256 клетки) и клетку, от которой считаются позиции
+   заказов (+0x3258); в add — слой: номер вектора TileDrawQueue (+i·0x18, i < 80), чей begin совпал; иначе 100 + смещение.
+   В tbuf: [i32 x1, y1, x2, y2, начало x, y, номер подготовки, эффект, слой, число заказов] + заказы по 64 байта. */
+#define TH 10
+void onTileConvert(GumInvocationContext *ic) {
+  if (skip) return;
+  unsigned char *tdq = (unsigned char *) gum_invocation_context_get_nth_argument(ic, 0);
+  long long batch = (long long) gum_invocation_context_get_nth_argument(ic, 1);
+  pthread_mutex_lock(tmu);
+  int i = tmapn++ % 64;
+  long long *m = tmap + i * 9;
+  m[0] = batch; m[1] = (long long) tdq;
+  m[2] = *(int *)(tdq + 0x32b8); m[3] = *(int *)(tdq + 0x32bc); m[4] = *(int *)(tdq + 0x32c0); m[5] = *(int *)(tdq + 0x32c4);
+  m[6] = *(int *)(tdq + 0x3258); m[7] = *(int *)(tdq + 0x325c); m[8] = tmapn;
+  pthread_mutex_unlock(tmu);
+}
+void onTileAdd(GumInvocationContext *ic) {
+  if (skip || fd < 0) return;
+  long long batch = (long long) gum_invocation_context_get_nth_argument(ic, 0);
+  unsigned char *b = (unsigned char *) gum_invocation_context_get_nth_argument(ic, 1);
+  unsigned char *e = (unsigned char *) gum_invocation_context_get_nth_argument(ic, 2);
+  int eff = (int)(long long) gum_invocation_context_get_nth_argument(ic, 3);
+  long n = (e - b) / 64;
+  if (n <= 0 || n > 100000) return;
+  pthread_mutex_lock(tmu);
+  int k = -1;
+  /* Самая свежая подготовка этого пакета (один и тот же пакет игра может готовить дважды за кадр). */
+  for (int j = 0; j < 64 && j < tmapn; j++) { int i = (tmapn - 1 - j) % 64; if (tmap[i * 9] == batch) { k = i; break; } }
+  if (k >= 0 && tlen + TH * 4 + n * 64 <= TCAP) {
+    long long *m = tmap + k * 9;
+    unsigned char *tdq = (unsigned char *) m[1];
+    int layer = -1;
+    for (int l = 0; l < 80; l++) if (*(unsigned char **)(tdq + l * 0x18) == b) { layer = l; break; }
+    if (layer < 0) for (long off = 0x780; off < 0x3300; off += 8) if (*(unsigned char **)(tdq + off) == b) { layer = 100 + (int)(off / 8); break; }
+    int *h = (int *)(tbuf + tlen);
+    h[0] = (int) m[2]; h[1] = (int) m[3]; h[2] = (int) m[4]; h[3] = (int) m[5]; h[4] = (int) m[6]; h[5] = (int) m[7];
+    h[6] = (int) m[8]; h[7] = eff; h[8] = layer; h[9] = (int) n;
+    memcpy(tbuf + tlen + TH * 4, b, n * 64);
+    tlen += TH * 4 + n * 64;
+  }
+  pthread_mutex_unlock(tmu);
+  if (k < 0) return;
+  for (long j = 0; j < n; j++) {
+    u64 sp = *(u64 *)(b + j * 64), mk = *(u64 *)(b + j * 64 + 8);
+    if (sp) is_new(sp - 0x68);
+    if (mk) is_new(mk - 0x68);
+  }
+}
+
 /* Очередь сообщений (кольцо): каждое — [u32 длина = 1 + данные][u8 тип][данные] одним куском. */
 static int qlen(void) { return (qt - qh + QN) % QN; }
 static int push(int type, const void *a, unsigned long na, const void *b, unsigned long nb, int frame) {
@@ -197,7 +264,7 @@ int connected(void) { return fd >= 0; }
 int frame_end(void) {
   int n = count, sent = 0;
   if (n > CAP) n = CAP;
-  if (want_reset) { memset(known, 0, sizeof known); nknown = 0; nfresh = 0; want_reset = 0; }
+  if (want_reset) { memset(known, 0, sizeof known); nknown = 0; nfresh = 0; memset(thash, 0, 8 * 3 * 512); want_reset = 0; }
   long long t = now_us();
   u64 key = cur_params;
   int w = -1;
@@ -217,6 +284,31 @@ int frame_end(void) {
     *(int *)(h + 32) = *(int *)(pp + 0x198); *(int *)(h + 36) = *(int *)(pp + 0x19c);
     if (push(6, h, 40, buf, (unsigned long)n * REC, 1)) { wins[2 * w + 1] = t; sent = 1; }
   }
+  /* Земля, подготовленная к этой отрисовке, — отдельным сообщением (тип 7), без ограничения частоты: её мало и редко. */
+  /* Окна-камеры интерфейса готовят землю каждый кадр заново, хотя она та же: подготовку области отправляем, только если
+     её содержимое изменилось с прошлой отправки (хеш по области). */
+  pthread_mutex_lock(tmu);
+  int olen = 0, p = 0;
+  while (p + TH * 4 <= tlen) {
+    int *h0 = (int *)(tbuf + p), id = h0[6];
+    int q = p; u64 hs = 0xcbf29ce484222325ull;
+    while (q + TH * 4 <= tlen && ((int *)(tbuf + q))[6] == id) {      /* все группы этой подготовки */
+      int *h = (int *)(tbuf + q); long len = TH * 4 + (long)h[9] * 64;
+      for (long i = 0; i < len; i += 8) if (i < 24 || i >= 28) { hs ^= *(u64 *)(tbuf + q + i); hs *= 0x100000001b3ull; } /* без номера подготовки */
+      q += len;
+    }
+    u64 key = ((u64)(unsigned)h0[0] << 32 | (unsigned)h0[1]) ^ ((u64)(unsigned)h0[2] << 32 | (unsigned)h0[3]) * 31;
+    int slot = (int)(key % 509), hit = 0;
+    for (int t = 0; t < 8; t++) { int sl = (slot + t) % 512; if (thash[sl * 3] == key || !thash[sl * 3]) { slot = sl; hit = thash[sl * 3] == key; break; } }
+    if (!(hit && thash[slot * 3 + 1] == hs)) {
+      memcpy(tout + olen, tbuf + p, q - p); olen += q - p;
+      thash[slot * 3] = key; thash[slot * 3 + 1] = hs;
+    }
+    p = q;
+  }
+  if (olen > 0 && fd >= 0) push(7, tout, olen, 0, 0, 0);
+  tlen = 0;
+  pthread_mutex_unlock(tmu);
   count = 0; cur_params = 0;
   return sent;
 }
@@ -267,6 +359,8 @@ void start(const char *sock, int fps) {
 }
 `, Object.assign({ buf, count, skip }, Object.fromEntries(LIBC.map((n) => [n, Module.getGlobalExportByName(n)])), STATE));
 Interceptor.attach(find('_ZN10DrawEngine4loadEPK9DrawQueue'), cm.onLoad);
+Interceptor.attach(find('_ZNK13TileDrawQueue18convertToTileBatchER18TileBatchDrawOrder'), cm.onTileConvert);
+Interceptor.attach(find('_ZN18TileBatchDrawOrder3addERKSt6vectorI13TileDrawOrder'), cm.onTileAdd);
 
 // ---------- связь с сервисом ----------
 const C = {
@@ -379,3 +473,5 @@ Interceptor.attach(find('_ZN10DrawEngine6renderE'), { onEnter() {
   statMs += Date.now() - t0;
 } });
 console.log('[v2] перехват установлен');
+
+

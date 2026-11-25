@@ -117,9 +117,10 @@ function ready(a, sx, sy, sw, sh) {
   return ok;
 }
 
-// Экземпляр (17 чисел): центр (клетки от центра вида), прямоугольник в своих осях (x0, y0, w, h, клетки),
-// поворот, вырезка в куске (u0, v0, u1, v1, пиксели), слой текстуры, цвет RGBA (0..1), режим (0 — обычный, 1 — сложением).
-const IF = 17;
+// Экземпляр (22 числа): центр (клетки от центра вида), прямоугольник в своих осях (x0, y0, w, h, клетки),
+// поворот, вырезка в куске (u0, v0, u1, v1, пиксели), слой текстуры, цвет RGBA (0..1), режим (0 — обычный, 1 — сложением),
+// маска (земля, переходы): вырезка в куске маски и её слой (−1 — без маски; маска — прозрачность, BC4).
+const IF = 22;
 let inst = new Float32Array(IF * 20000), ni = 0;
 function emit(cx, cy, w, h, rot, fx, fy, a, sx, sy, sw, sh, tr, tg, tb, ta, mode) {
   const kx = w / sw, ky = h / sh;
@@ -138,14 +139,38 @@ function emit(cx, cy, w, h, rot, fx, fy, a, sx, sy, sw, sh, tr, tg, tb, ta, mode
       const o = ni++ * IF;
       inst[o] = cx; inst[o + 1] = cy; inst[o + 2] = lx; inst[o + 3] = ly; inst[o + 4] = lw; inst[o + 5] = lh; inst[o + 6] = rot;
       inst[o + 7] = u0; inst[o + 8] = v0; inst[o + 9] = u1; inst[o + 10] = v1; inst[o + 11] = slot;
-      inst[o + 12] = tr; inst[o + 13] = tg; inst[o + 14] = tb; inst[o + 15] = ta; inst[o + 16] = mode;
+      inst[o + 12] = tr; inst[o + 13] = tg; inst[o + 14] = tb; inst[o + 15] = ta; inst[o + 16] = mode; inst[o + 21] = -1;
     }
+}
+// Спрайт с маской (переходы земли): прямоугольник режется по стыкам кусков и картинки, и маски — в каждом кусочке
+// обе вырезки лежат каждая в одном куске атласа.
+function emitMasked(cx, cy, w, h, a, sx, sy, sw, sh, ma, mx, my, mw, mh) {
+  const cuts = (s0, sl, m0, ml) => {
+    const c = [0, 1];
+    for (let k = Math.floor(s0 / TILE) + 1; k * TILE < s0 + sl; k++) c.push((k * TILE - s0) / sl);
+    for (let k = Math.floor(m0 / TILE) + 1; k * TILE < m0 + ml; k++) c.push((k * TILE - m0) / ml);
+    return [...new Set(c)].sort((p, q) => p - q);
+  };
+  const cu = cuts(sx, sw, mx, mw), cv = cuts(sy, sh, my, mh);
+  for (let j = 0; j + 1 < cv.length; j++) for (let i = 0; i + 1 < cu.length; i++) {
+    const f0 = cu[i], f1 = cu[i + 1], g0 = cv[j], g1 = cv[j + 1];
+    const px = sx + (f0 + f1) / 2 * sw, py = sy + (g0 + g1) / 2 * sh, qx = mx + (f0 + f1) / 2 * mw, qy = my + (g0 + g1) / 2 * mh;
+    const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE), ux = Math.floor(qx / TILE), uy = Math.floor(qy / TILE);
+    const slot = tile(a, tx, ty), mslot = tile(ma, ux, uy);
+    if (slot < 0 || mslot < 0) continue;
+    if ((ni + 1) * IF > inst.length) { const b = new Float32Array(inst.length * 2); b.set(inst); inst = b; }
+    const o = ni++ * IF;
+    inst[o] = cx; inst[o + 1] = cy; inst[o + 2] = -w / 2 + f0 * w; inst[o + 3] = -h / 2 + g0 * h; inst[o + 4] = (f1 - f0) * w; inst[o + 5] = (g1 - g0) * h; inst[o + 6] = 0;
+    inst[o + 7] = sx + f0 * sw - tx * TILE; inst[o + 8] = sy + g0 * sh - ty * TILE; inst[o + 9] = sx + f1 * sw - tx * TILE; inst[o + 10] = sy + g1 * sh - ty * TILE; inst[o + 11] = slot;
+    inst[o + 12] = 1; inst[o + 13] = 1; inst[o + 14] = 1; inst[o + 15] = 1; inst[o + 16] = 0;
+    inst[o + 17] = mx + f0 * mw - ux * TILE; inst[o + 18] = my + g0 * mh - uy * TILE; inst[o + 19] = mx + f1 * mw - ux * TILE; inst[o + 20] = my + g1 * mh - uy * TILE; inst[o + 21] = mslot;
+  }
 }
 
 const SPRITE_VS = `#version 300 es
-in vec2 a_c; in vec4 a_rect; in float a_rot; in vec4 a_uv; in float a_slot; in vec4 a_tint; in float a_mode;
+in vec2 a_c; in vec4 a_rect; in float a_rot; in vec4 a_uv; in float a_slot; in vec4 a_tint; in float a_mode; in vec4 a_muv; in float a_mslot;
 uniform vec2 u_scale; // клетка -> clip
-out vec3 v_uv; out vec4 v_tint; flat out int v_arr; flat out float v_mode;
+out vec3 v_uv; out vec4 v_tint; flat out int v_arr; flat out float v_mode; out vec3 v_muv; flat out int v_marr;
 void main() {
   vec2 q = vec2(gl_VertexID & 1, gl_VertexID >> 1);
   vec2 l = a_rect.xy + q * a_rect.zw;
@@ -154,21 +179,26 @@ void main() {
   gl_Position = vec4(p * u_scale, 0.0, 1.0);
   v_uv = vec3(mix(a_uv.xy, a_uv.zw, q) / 256.0, mod(a_slot, 256.0));
   v_arr = int(a_slot) / 256; v_tint = a_tint; v_mode = a_mode;
+  v_muv = vec3(mix(a_muv.xy, a_muv.zw, q) / 256.0, mod(max(a_mslot, 0.0), 256.0)); v_marr = a_mslot < 0.0 ? -1 : int(a_mslot) / 256;
 }`;
 const SPRITE_FS = `#version 300 es
 precision highp float; precision highp sampler2DArray;
 uniform sampler2DArray u_t0, u_t1, u_t2, u_t3, u_t4, u_t5;
-in vec3 v_uv; in vec4 v_tint; flat in int v_arr; flat in float v_mode;
+in vec3 v_uv; in vec4 v_tint; flat in int v_arr; flat in float v_mode; in vec3 v_muv; flat in int v_marr;
 out vec4 o;
+vec4 at(int a, vec3 uv) {
+  return a == 0 ? texture(u_t0, uv) : a == 1 ? texture(u_t1, uv) : a == 2 ? texture(u_t2, uv) :
+    a == 3 ? texture(u_t3, uv) : a == 4 ? texture(u_t4, uv) : texture(u_t5, uv);
+}
 void main() {
-  vec4 t = v_arr == 0 ? texture(u_t0, v_uv) : v_arr == 1 ? texture(u_t1, v_uv) : v_arr == 2 ? texture(u_t2, v_uv) :
-    v_arr == 3 ? texture(u_t3, v_uv) : v_arr == 4 ? texture(u_t4, v_uv) : texture(u_t5, v_uv);
+  vec4 t = at(v_arr, v_uv);
   o = t * v_tint;                         // предумноженная картинка × цвет записи
+  if (v_marr >= 0) o *= at(v_marr, v_muv).a;   // маска перехода земли
   if (v_mode > 0.5) o.a = 0.0;            // 1 — свечение и свет: сложением
 }`;
 const sprite = program(SPRITE_VS, SPRITE_FS);
 const ibuf = gl.createBuffer(), vao = gl.createVertexArray();
-const ATTRS = [['a_c', 2, 0], ['a_rect', 4, 2], ['a_rot', 1, 6], ['a_uv', 4, 7], ['a_slot', 1, 11], ['a_tint', 4, 12], ['a_mode', 1, 16]];
+const ATTRS = [['a_c', 2, 0], ['a_rect', 4, 2], ['a_rot', 1, 6], ['a_uv', 4, 7], ['a_slot', 1, 11], ['a_tint', 4, 12], ['a_mode', 1, 16], ['a_muv', 4, 17], ['a_mslot', 1, 21]];
 const attrLoc = ATTRS.map(([nm]) => gl.getAttribLocation(sprite.p, nm));
 // Пустые массивы-заглушки: у сэмплера в шейдере обязательно должна быть текстура нужного вида.
 const emptyArr = gl.createTexture();
@@ -322,9 +352,13 @@ function connect() {
   ws.onopen = () => { viewSent = ''; sendView(); };
   ws.binaryType = 'arraybuffer';
   ws.onmessage = (e) => {
-    if (typeof e.data !== 'string') { receive(new Int32Array(e.data)); return; }
+    if (typeof e.data !== 'string') {
+      const d = new Int32Array(e.data);
+      if (d[0] === 0x31444e47) { groundChunks.set(`${d[1]},${d[2]}`, d); dirty = true; return; } // земля чанка
+      receive(d); return;
+    }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; decoded = null; playQ.length = 0; resetAtlas(); }
+    if (m.t === 'reset') { groundChunks.clear(); gen = m.gen; spr.length = 0; frame = null; decoded = null; playQ.length = 0; resetAtlas(); }
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
@@ -410,6 +444,33 @@ function netStat() {
   let sgap = 0; for (let i = 1; i < shows.length; i++) sgap = Math.max(sgap, shows[i] - shows[i - 1]);
   return `от камеры ${(arrivals.length / 3).toFixed(1)} кадр/с, самая длинная пауза ${gap.toFixed(0)} мс; показано ${(shows.length / 3).toFixed(1)} кадр/с, пауза до ${sgap.toFixed(0)} мс`;
 }
+// Земля — заказы TileDrawOrder по чанкам (src/map-render.mjs, onGround): по 12 целых — спрайт, маска (−1 — нет),
+// клетка x, y, размер спрайта (пиксели) w, h, байты +0x30..+0x33 и +0x34..+0x37, масштаб ×1000, +0x18, эффект, группа.
+const groundChunks = new Map(); // "cx,cy" -> Int32Array
+let showGround = true;          // клавиша G
+function emitGround(vw, vh) {
+  let n = 0;
+  const x1 = Math.floor((view.x - vw) / 32), x2 = Math.floor((view.x + vw) / 32), y1 = Math.floor((view.y - vh) / 32), y2 = Math.floor((view.y + vh) / 32);
+  for (let cx = x1; cx <= x2; cx++) for (let cy = y1; cy <= y2; cy++) {
+    const d = groundChunks.get(`${cx},${cy}`);
+    if (!d) continue;
+    for (let i = 0, o = 4; i < d[3]; i++, o += 12) {
+      const s = spr[d[o]];
+      if (!s) continue;
+      const b = d[o + 6], tw = b & 255, th = (b >>> 8) & 255;
+      if (!tw || !th || tw > 16 || th > 16) continue;   // декали и прочее — позже
+      const x = d[o + 2] + tw / 2 - view.x, y = d[o + 3] + th / 2 - view.y;
+      const m = d[o + 1] >= 0 ? spr[d[o + 1]] : null;
+      if (d[o + 1] >= 0 && !m) continue;
+      if (m) emitMasked(x, y, tw, th, s.a, s.ax, s.ay, s.w, s.h, m.a, m.ax, m.ay, m.w, m.h);
+      else emit(x, y, tw, th, 0, 1, 1, s.a, s.ax, s.ay, s.w, s.h, 1, 1, 1, 1, 0);
+      n++;
+    }
+  }
+  return n;
+}
+addEventListener('keydown', (e) => { if (e.key === 'g' || e.key === 'п') { showGround = !showGround; dirty = true; } });
+
 let drawMs = 0;
 function draw() {
   requestAnimationFrame(draw);
@@ -435,6 +496,7 @@ function drawFrame() {
   // Записи -> экземпляры: сцена до теней [0, sh0), тени [sh0, sh1), сцена после [sh1, sc1), свет [sc1, ni).
   ni = 0;
   let sh0 = -1, sh1 = -1, shown = 0, missing = 0;
+  const groundN = showGround ? emitGround(W / 2 / k, H / 2 / k) : 0;
   const lights = [];
   const vw = W / 2 / k, vh = H / 2 / k;
   for (let i = 0; i < n; i++) {

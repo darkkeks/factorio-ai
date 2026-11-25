@@ -74,3 +74,20 @@ export function decodeBC3(src, w, h) {
   }
   return out;
 }
+
+/** BC1 (DXT1): 8 байт на блок 4×4, цвет; при c0 ≤ c1 третий цвет палитры — прозрачный. Возвращает RGBA (земля). */
+export function decodeBC1(src, w, h) {
+  const bw = Math.ceil(w / 4), bh = Math.ceil(h / 4), out = Buffer.alloc(w * h * 4), c = new Array(48);
+  for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+    const b = (by * bw + bx) * 8, c0 = src[b] | (src[b + 1] << 8), c1 = src[b + 2] | (src[b + 3] << 8), four = c0 > c1;
+    bc1(src, b, c, four);
+    let bits = src[b + 4] | (src[b + 5] << 8) | (src[b + 6] << 16) | (src[b + 7] << 24);
+    for (let i = 0; i < 16; i++, bits >>>= 2) {
+      const px = bx * 4 + (i & 3), py = by * 4 + (i >> 2);
+      if (px >= w || py >= h) continue;
+      const o = (py * w + px) * 4;
+      out[o] = c[i * 3]; out[o + 1] = c[i * 3 + 1]; out[o + 2] = c[i * 3 + 2]; out[o + 3] = !four && (bits & 3) === 3 ? 0 : 255;
+    }
+  }
+  return out;
+}

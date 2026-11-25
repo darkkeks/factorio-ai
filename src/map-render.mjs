@@ -94,14 +94,14 @@ function spritePng(n, cx = 0, cy = 0, cw = 0, ch = 0) {
 // ---------- распаковка в отдельном потоке ----------
 let worker = null, jobId = 0;
 const jobs = new Map();
-function decode(raw, w, h) {
+function decode(raw, w, h, fmt2) {
   if (!worker) {
     worker = new Worker(new URL('./bcn-worker.mjs', import.meta.url));
     worker.on('message', ({ id, rgba }) => { jobs.get(id)?.(rgba); jobs.delete(id); });
     worker.on('error', (e) => { log('распаковка:', e.message); for (const r of jobs.values()) r(null); jobs.clear(); worker = null; });
   }
   const id = ++jobId;
-  return new Promise((resolve) => { jobs.set(id, resolve); worker.postMessage({ id, raw, w, h }, [raw.buffer]); });
+  return new Promise((resolve) => { jobs.set(id, resolve); worker.postMessage({ id, raw, w, h, fmt2 }, [raw.buffer]); });
 }
 
 // ---------- приём от игры ----------
@@ -125,7 +125,7 @@ function onMessage(type, data) {
     else {
       if (fs.existsSync(DUMP)) fs.writeFileSync(path.join(DUMP, `raw-${head.w}x${head.h}-${head.fmt}-${head.fmt2}-${head.atlas}.bin`), raw);
       const copy = new Uint8Array(raw.length); copy.set(raw);
-      decode(copy, head.w, head.h).then((rgba) => {
+      decode(copy, head.w, head.h, head.fmt2).then((rgba) => {
         if (atlases.get(head.atlas) !== 'wait') return; // игра переподключилась
         if (!rgba) { log(`атлас ${head.atlas}: ${head.cls} ${head.w}×${head.h}, ${raw.length} байт — формат не распознан`); return; }
         atlases.set(head.atlas, { w: head.w, h: head.h, rgba: Buffer.from(rgba.buffer, rgba.byteOffset, rgba.length) });
@@ -135,6 +135,8 @@ function onMessage(type, data) {
       return;
     }
     broadcast(JSON.stringify({ t: 'atlas' })); // страница перезапросит спрайты, которые не загрузились
+  } else if (type === 7) {
+    onGround(data);
   } else if (type === 1 || type === 5 || type === 6) {
     // 5 — с отметкой времени съёмки; 6 — ещё и с окном: какой RenderParameters (основной вид или окно-камера интерфейса),
     // его размер, масштаб и центр (camera-hook/v2-capture.js, frame_end).
@@ -222,6 +224,7 @@ net.createServer((c) => {
   gen = Date.now().toString(36);
   for (const ws of viewers) ws.prevFrame = null;
   wins.clear(); mainKey = 'main'; for (const sl of slots) sl.key = null; // у нового клиента окна — по новым адресам
+  ground.clear(); for (const ws of viewers) ws.groundSent = null; // номера спрайтов у земли — от прошлого подключения
   broadcast(JSON.stringify({ t: 'reset', gen }));
   // Атлас — десятки мегабайт: куски копим списком и склеиваем один раз, когда сообщение пришло целиком.
   let parts = [], have = 0, need = 4;
@@ -258,6 +261,90 @@ export function setCamera(c) {
   if (s !== camSent) { camSent = s; broadcast(s); }
 }
 function broadcast(s) { for (const ws of viewers) if (ws.readyState === 1) ws.send(s); }
+// ---------- земля ----------
+// Игра готовит землю областями (camera-hook/v2-capture.js, тип 7): чанк при загрузке или полоса, впервые попавшая в вид.
+// Подготовка — группы заказов TileDrawOrder по слоям земли (слой — номер вектора TileDrawQueue) с эффектом группы.
+// Заказ (64 байта): +0x00 спрайт (+0x68), +0x08 маска (спрайт +0x68 или 0), +0x18 u32 (?), +0x1c/+0x1e u16 клетка
+// от начала сетки, +0x28/+0x2c f32 размер спрайта (пиксели), +0x30..+0x37 байты (размер в клетках и др.), +0x38 f32.
+// Храним по чанкам (по клетке заказа): новая подготовка области заменяет заказы с клетками в этой области; заказы,
+// пришедшие в нескольких соседних областях (большие спрайты на стыке), — одним (по совпадению всех полей).
+const ground = new Map();   // "cx,cy" -> { cx, cy, ver, recs: Map(ключ -> Int32Array(GR)), buf }
+let groundVer = 0;
+const GR = 12;              // целых на заказ для страницы
+function onGround(data) {
+  if (data.byteOffset & 3) data = Buffer.from(data);
+  const conv = new Map();   // номер подготовки -> { r: [x1, y1, x2, y2] (клетки), ox, oy, groups }
+  let o = 0;
+  while (o + 40 <= data.length) {
+    const h = []; for (let i = 0; i < 10; i++) h.push(data.readInt32LE(o + i * 4));
+    o += 40;
+    const n = h[9];
+    if (o + n * 64 > data.length) break;
+    let c = conv.get(h[6]);
+    if (!c) conv.set(h[6], c = { r: [h[0] / 256, h[1] / 256, h[2] / 256, h[3] / 256], ox: h[4], oy: h[5], groups: [] });
+    c.groups.push({ eff: h[7], layer: h[8], at: o, n });
+    o += n * 64;
+  }
+  const dirty = new Set();
+  if (fs.existsSync(path.join(path.dirname(SOCK), "ground-debug"))) for (const c of conv.values()) log(`земля: область ${c.r.map((v) => v.toFixed(1)).join(' ')}, групп ${c.groups.length}, заказов ${c.groups.reduce((s, g) => s + g.n, 0)}`);
+  for (const c of conv.values()) {
+    const [x1, y1, x2, y2] = c.r;
+    // Убрать старые заказы с клеткой внутри области.
+    for (let cx = Math.floor(x1 / 32); cx <= Math.floor((x2 - 1e-6) / 32); cx++) for (let cy = Math.floor(y1 / 32); cy <= Math.floor((y2 - 1e-6) / 32); cy++) {
+      const ch = ground.get(`${cx},${cy}`);
+      if (!ch) continue;
+      for (const [key, r] of ch.recs) if (r[2] >= x1 && r[2] < x2 && r[3] >= y1 && r[3] < y2) ch.recs.delete(key);
+      dirty.add(ch);
+    }
+    for (const g of c.groups) for (let i = 0; i < g.n; i++) {
+      const p = g.at + i * 64;
+      const sp = spritesNum.get(Number(data.readBigUInt64LE(p)) - 0x68), mp = data.readBigUInt64LE(p + 8);
+      const mask = mp ? spritesNum.get(Number(mp) - 0x68) : null;
+      if (!sp || (mp && !mask)) continue;
+      const r = new Int32Array(GR);
+      r[0] = sp.n; r[1] = mask ? mask.n : -1;
+      r[2] = c.ox + data.readUInt16LE(p + 0x1c); r[3] = c.oy + data.readUInt16LE(p + 0x1e);
+      r[4] = Math.round(data.readFloatLE(p + 0x28)); r[5] = Math.round(data.readFloatLE(p + 0x2c));
+      r[6] = data.readInt32LE(p + 0x30); r[7] = data.readInt32LE(p + 0x34);
+      r[8] = Math.round(data.readFloatLE(p + 0x38) * 1000); r[9] = data.readInt32LE(p + 0x18);
+      r[10] = g.eff; r[11] = g.layer * 65536 + i;   // слой и порядок внутри подготовки
+      const cx = Math.floor(r[2] / 32), cy = Math.floor(r[3] / 32), k = `${cx},${cy}`;
+      let ch = ground.get(k);
+      if (!ch) ground.set(k, ch = { cx, cy, ver: 0, recs: new Map(), buf: null });
+      ch.recs.set(r.subarray(0, 11).join(',') + ',' + g.layer, r);
+      dirty.add(ch);
+    }
+  }
+  // Порядок в чанке: слой, клетка (по строкам), порядок внутри подготовки.
+  for (const ch of dirty) {
+    const list = [...ch.recs.values()].sort((a, b) => (a[11] >> 16) - (b[11] >> 16) || a[3] - b[3] || a[2] - b[2] || (a[11] & 0xffff) - (b[11] & 0xffff));
+    const out = new Int32Array(4 + list.length * GR);
+    out[0] = 0x31444e47; out[1] = ch.cx; out[2] = ch.cy; out[3] = list.length; // 'GND1'
+    list.forEach((r, i) => out.set(r, 4 + i * GR));
+    ch.buf = Buffer.from(out.buffer); ch.ver = ++groundVer;
+  }
+  groundDirty = true;
+}
+let groundDirty = false;
+// Чанки зрителю: вокруг его вида (или вида камеры), новые и изменившиеся.
+function sendGround(ws) {
+  if (ws.readyState !== 1 || ws.bufferedAmount > 4_000_000) return;
+  const v = ws.view || (cam ? { x: cam.x, y: cam.y, w: cam.w, h: cam.h } : null);
+  if (!v) return;
+  if (fs.existsSync(path.join(path.dirname(SOCK), 'ground-debug')) && Math.random() < 0.05) log(`земля зрителю ${ws.dbgId ??= Math.random().toString(36).slice(2, 6)} (${ws._socket?.remoteAddress}, ${ws.protocol}, ${ws.extensions}): вид ${JSON.stringify(v)}, чанков в памяти ${ground.size}, отправлено ${ws.groundSent?.size ?? 0}`);
+  ws.groundSent ??= new Map();
+  const x1 = Math.floor((v.x - v.w) / 32), x2 = Math.floor((v.x + v.w) / 32), y1 = Math.floor((v.y - v.h) / 32), y2 = Math.floor((v.y + v.h) / 32);
+  let sent = 0;
+  for (let cx = x1; cx <= x2; cx++) for (let cy = y1; cy <= y2; cy++) {
+    const c = ground.get(`${cx},${cy}`);
+    if (!c || ws.groundSent.get(`${cx},${cy}`) === c.ver) continue;
+    ws.send(c.buf, (err) => { if (err) log(`земля: не отправилась: ${err.message}`); }); ws.groundSent.set(`${cx},${cy}`, c.ver);
+    if (fs.existsSync(path.join(path.dirname(SOCK), 'ground-debug'))) log(`земля -> ${ws.dbgId ??= Math.random().toString(36).slice(2, 6)}: ${cx},${cy} v${c.ver} ${c.buf.length} байт, в буфере ${ws.bufferedAmount}`);
+    if (++sent >= 64) return;
+  }
+}
+setInterval(() => { for (const ws of viewers) if (ws.delta) sendGround(ws); groundDirty = false; }, 250);
+
 // ---------- окна ----------
 // Основной вид клиента-камеры следит за ботами (режим «следить»). Зритель, который сам двигает и зумит карту, получает
 // своё окно — элемент интерфейса «камера» (LuaGuiElement camera) у игрока-камеры: игра рисует его отдельно, со своим
@@ -364,11 +451,20 @@ async function applySlot(s) {
   try {
     while (s.spec && s.spec !== s.applied) {
       const spec = s.spec;
-      await runLua(SLOT_LUA, { name: s.name, x: spec.x, y: spec.y, zoom: spec.zoom, w: WIN_W, h: WIN_H });
-      s.applied = spec;
+      // Землю игра готовит только для чанков, впервые попавших в окно (остальное берёт из прошлого кадра). Если в
+      // области окна есть чанки, которых у нас нет, чуть меняем масштаб — окно перерисовывает землю целиком.
+      const nudge = groundMissing(spec) ? 1 + (s.nudge = -(s.nudge || 1e-4)) : 1;
+      await runLua(SLOT_LUA, { name: s.name, x: spec.x, y: spec.y, zoom: spec.zoom * nudge, w: WIN_W, h: WIN_H });
+      s.applied = spec; s.groundAt = Date.now();
     }
   } catch (e) { log(`окно ${s.name}:`, e.message); s.applied = null; }
   finally { s.busy = false; }
+}
+function groundMissing(spec) {
+  const hw = WIN_W / 2 / 32 / spec.zoom, hh = WIN_H / 2 / 32 / spec.zoom;
+  for (let cx = Math.floor((spec.x - hw) / 32); cx <= Math.floor((spec.x + hw) / 32); cx++)
+    for (let cy = Math.floor((spec.y - hh) / 32); cy <= Math.floor((spec.y + hh) / 32); cy++) if (!ground.has(`${cx},${cy}`)) return true;
+  return false;
 }
 // Окно-камера у игрока-камеры: создаётся при первом запросе, дальше меняются только место и масштаб.
 // Команда выполняется у сервера и у клиента-камеры (элементы интерфейса — часть общего состояния игры).
@@ -378,8 +474,11 @@ const SLOT_LUA = `
   local g = p.gui.screen[A.name]
   if not g then
     g = p.gui.screen.add{type = 'camera', name = A.name, position = {A.x, A.y}, surface_index = game.surfaces[A.surface].index, zoom = A.zoom}
-    g.location = {0, 0}
   end
+  -- Почти за краем экрана клиента (виден угол 5×5): основной вид клиента остаётся чистым, а землю игра для окна
+  -- готовит, только если оно хоть немного на экране (совсем за краем — рисует постройки, но не землю).
+  local r = p.display_resolution
+  g.location = {r.width - 5, r.height - 5}
   -- Размер и масштаб элемента интерфейса умножаются на масштаб интерфейса игрока — делим, чтобы окно было ровно A.w×A.h
   local k = p.display_scale or 1
   g.style.width = math.floor(A.w / k + 0.5) g.style.height = math.floor(A.h / k + 0.5)
@@ -391,6 +490,7 @@ setInterval(() => {
     // У окна есть зритель, а кадров от него нет (окно убрали, клиент перезапустился) — ставим заново.
     const v = [...viewers].find((o) => o.slot === s);
     if (v && v.view && s.applied && !s.busy && (!s.key || Date.now() - (wins.get(s.key)?.at || 0) > 5000)) { s.key = null; s.applied = null; s.spec = specFor(v.view); applySlot(s); }
+    else if (v && s.applied && !s.busy && Date.now() - (s.groundAt || 0) > 3000 && groundMissing(s.applied)) { s.spec = { ...s.applied }; applySlot(s); }
     if (!s.applied || v) continue;
     if (Date.now() - s.used < 30_000) continue;
     s.spec = null; s.applied = null; s.key = null;
