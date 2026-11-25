@@ -7,74 +7,213 @@
 <style>
   html, body { height: 100%; margin: 0; background: #000; color: #e8e6e1; font: 14px/1.35 system-ui, sans-serif; overflow: hidden; }
   canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #ov { position: absolute; left: 0; top: 0; pointer-events: none; }
   #info { position: absolute; left: 10px; top: 10px; padding: 5px 10px; background: rgba(24, 24, 24, .9); border: 1px solid #3a3a3a; border-radius: 4px; pointer-events: none; }
   #info b { color: #ffcc33; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<svg width="0" height="0" style="position:absolute"><filter id="night" color-interpolation-filters="sRGB"><feColorMatrix id="nightm" type="matrix" values="1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0"/></filter></svg>
+<canvas id="ov"></canvas>
 <div id="info"><b>отрисовка в браузере · прототип</b> — игра рисуется в браузере из очереди отрисовки клиента. <span id="st">подключение…</span></div>
 <script>
 'use strict';
 // Прототип: кадр — список «спрайт № n в точке (x, y) с масштабом и цветом», присланный сервисом по WebSocket.
-// Картинки спрайтов — вырезки из атласов игры (/render/sprite/<поколение>/<n>.png), грузятся по мере появления.
-const cv = document.getElementById('c'), ctx = cv.getContext('2d');
-const spr = [];            // n -> { w, h, sx, sy, sc, img, ok }
+// Картинки спрайтов — куски атласов игры (/render/atlas/<поколение>/<атлас>/<x>-<y>.png), грузятся по мере надобности.
+// Отрисовка — WebGL2: все спрайты кадра — несколько вызовов отрисовки «экземплярами», смешивание — формулой игры
+// (предумноженная прозрачность): результат = картинка·цвет_записи + фон·(1 − α·α_записи). На Canvas 2D это было
+// 8–9 тыс. drawImage и тысячи смен режима смешивания на кадр — 100+ мс даже на видеокарте.
+const cv = document.getElementById('c'), ov = document.getElementById('ov'), octx = ov.getContext('2d');
+const gl = cv.getContext('webgl2', { alpha: false, premultipliedAlpha: true, antialias: false });
+if (!gl) document.getElementById('st').textContent = 'браузер не дал WebGL2 — отрисовка невозможна (включите аппаратное ускорение)';
+const spr = [];            // n -> { w, h, sx, sy, sc, a, ax, ay, fl }
 let gen = '', frame = null, frameN = 0, dirty = true;
 let view = { x: 0, y: 0, k: 24, auto: true };
 let cam = null;       // что видит клиент-камера: {x, y, w, h} в клетках
 let dark = 0;        // темнота поверхности (0 — день), по ней — карта освещения
 let gameOn = false; // подключён ли клиент игры с перехватом
-let showBg = true; // клавиша B — показать/скрыть подложку // центр в клетках, пикселей на клетку
+let showBg = true; // клавиша B — показать/скрыть подложку
 
-const shadowCv = document.createElement('canvas'), shadowCtx = shadowCv.getContext('2d'); // буфер теней
-const lightCv = document.createElement('canvas'), lightCtx = lightCv.getContext('2d'); // карта освещения
-const lastImg = new Map(); // место (слой, x, y) -> последний нарисованный там прямоугольник атласа [a, x, y, w, h]
-// Картинки — куски атласов игры 256×256 (/render/atlas/<поколение>/<атлас>/<x>-<y>.png), грузятся по мере надобности;
-// спрайт вырезается из куска при отрисовке (если лежит на стыке кусков — из нескольких).
-const TILE = 256, tiles = new Map(); // "a/x-y" -> { img, ok }
+function shader(type, src) {
+  const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vs)); gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); u[nm] = gl.getUniformLocation(p, nm); }
+  return { p, u };
+}
+
+// Куски атласов 256×256 — слои текстурных массивов (до 4 массивов по 256 слоёв); спрайт на стыке кусков — несколько четырёхугольников.
+const TILE = 256, ARR_LAYERS = 256, MAX_ARRS = 4;
+const arrs = [];           // { tex, used, mip }
+const tiles = new Map();   // "a/x-y" -> { img, slot: массив·256 + слой, −1 — ещё нет }
+const lastSrc = new Map(); // место (слой, x, y) -> последний целиком загруженный прямоугольник атласа [a, x, y, w, h]
+function allocLayer() {
+  let a = arrs.find((x) => x.used < ARR_LAYERS);
+  if (!a) {
+    if (arrs.length >= MAX_ARRS) { resetAtlas(); return -1; } // места нет — начинаем заново (куски перегрузятся)
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 9, gl.RGBA8, TILE, TILE, ARR_LAYERS);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    arrs.push(a = { tex, used: 0, mip: false });
+  }
+  return arrs.indexOf(a) * ARR_LAYERS + a.used++;
+}
+function resetAtlas() {
+  for (const a of arrs) gl.deleteTexture(a.tex);
+  arrs.length = 0; tiles.clear(); lastSrc.clear();
+}
 function tile(a, tx, ty) {
   const k = `${a}/${tx}-${ty}`;
   let t = tiles.get(k);
   if (!t) {
-    t = { img: new Image(), ok: false };
-    t.img.onload = () => { t.ok = true; dirty = true; };
-    t.img.onerror = () => { setTimeout(() => tiles.delete(k), 2000); }; // атлас ещё распаковывается — попросим снова
+    const g0 = gen;
+    t = { img: new Image(), slot: -1 };
+    t.img.onload = () => {
+      if (g0 !== gen || tiles.get(k) !== t) return;
+      const slot = allocLayer();
+      if (slot < 0) return;
+      const ar = arrs[slot >> 8];
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, ar.tex);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      // Кусок у края атласа может быть меньше 256 — кладём как есть, остальное в слое не используется.
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, slot & 255, t.img.width, t.img.height, 1, gl.RGBA, gl.UNSIGNED_BYTE, t.img);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      ar.mip = true; t.slot = slot; t.img = null; dirty = true;
+    };
+    t.img.onerror = () => { setTimeout(() => { if (tiles.get(k) === t) tiles.delete(k); }, 2000); }; // атлас ещё распаковывается — попросим снова
     t.img.src = `atlas/${gen}/${a}/${tx}-${ty}.png`;
     tiles.set(k, t);
   }
-  return t.ok ? t.img : null;
+  return t.slot;
 }
-// Картинка, умноженная на цвет записи (для цветного оттенка: призраки, раскраска): холст с кешем.
-const tintCache = new Map();
-function tinted(src, tint) {
-  const k = src.join(',') + ':' + tint;
-  let c = tintCache.get(k);
-  if (c) return c;
-  c = document.createElement('canvas'); c.width = src[3]; c.height = src[4];
-  const t = c.getContext('2d');
-  if (!drawAtlas(t, ...src, 0, 0, src[3], src[4])) return null;
-  // Попиксельно: цвет картинки × цвет записи, прозрачность картинки не трогаем.
-  const d = t.getImageData(0, 0, c.width, c.height), px = d.data, r = (tint & 255) / 255, gg = ((tint >>> 8) & 255) / 255, b = ((tint >>> 16) & 255) / 255;
-  for (let i = 0; i < px.length; i += 4) { px[i] *= r; px[i + 1] *= gg; px[i + 2] *= b; }
-  t.putImageData(d, 0, 0);
-  if (tintCache.size > 3000) tintCache.clear();
-  tintCache.set(k, c);
-  return c;
-}
-// Нарисовать прямоугольник атласа (sx, sy, sw, sh) в (dx, dy, dw, dh); false — если какой-то кусок ещё не загружен.
-function drawAtlas(g2, a, sx, sy, sw, sh, dx, dy, dw, dh) {
+function ready(a, sx, sy, sw, sh) {
   if (a === undefined || !sw || !sh) return false;
-  const tx1 = Math.floor(sx / TILE), tx2 = Math.floor((sx + sw - 1) / TILE), ty1 = Math.floor(sy / TILE), ty2 = Math.floor((sy + sh - 1) / TILE);
-  for (let ty = ty1; ty <= ty2; ty++) for (let tx = tx1; tx <= tx2; tx++) if (!tile(a, tx, ty)) return false;
-  const kx = dw / sw, ky = dh / sh;
-  for (let ty = ty1; ty <= ty2; ty++) for (let tx = tx1; tx <= tx2; tx++) {
-    const x0 = Math.max(sx, tx * TILE), x1 = Math.min(sx + sw, tx * TILE + TILE), y0 = Math.max(sy, ty * TILE), y1 = Math.min(sy + sh, ty * TILE + TILE);
-    g2.drawImage(tile(a, tx, ty), x0 - tx * TILE, y0 - ty * TILE, x1 - x0, y1 - y0, dx + (x0 - sx) * kx, dy + (y0 - sy) * ky, (x1 - x0) * kx, (y1 - y0) * ky);
-  }
-  return true;
+  let ok = true;
+  for (let ty = Math.floor(sy / TILE); ty <= Math.floor((sy + sh - 1) / TILE); ty++)
+    for (let tx = Math.floor(sx / TILE); tx <= Math.floor((sx + sw - 1) / TILE); tx++) if (tile(a, tx, ty) < 0) ok = false;
+  return ok;
 }
+
+// Экземпляр (17 чисел): центр (клетки от центра вида), прямоугольник в своих осях (x0, y0, w, h, клетки),
+// поворот, вырезка в куске (u0, v0, u1, v1, пиксели), слой текстуры, цвет RGBA (0..1), режим (0 — обычный, 1 — сложением).
+const IF = 17;
+let inst = new Float32Array(IF * 20000), ni = 0;
+function emit(cx, cy, w, h, rot, fx, fy, a, sx, sy, sw, sh, tr, tg, tb, ta, mode) {
+  const kx = w / sw, ky = h / sh;
+  for (let ty = Math.floor(sy / TILE); ty <= Math.floor((sy + sh - 1) / TILE); ty++)
+    for (let tx = Math.floor(sx / TILE); tx <= Math.floor((sx + sw - 1) / TILE); tx++) {
+      const slot = tile(a, tx, ty);
+      if (slot < 0) continue;
+      const x0 = Math.max(sx, tx * TILE), x1 = Math.min(sx + sw, tx * TILE + TILE), y0 = Math.max(sy, ty * TILE), y1 = Math.min(sy + sh, ty * TILE + TILE);
+      // Кусок в своих осях спрайта (до поворота); отражение — зеркально относительно центра.
+      let lx = -w / 2 + (x0 - sx) * kx, ly = -h / 2 + (y0 - sy) * ky;
+      const lw = (x1 - x0) * kx, lh = (y1 - y0) * ky;
+      let u0 = x0 - tx * TILE, u1 = x1 - tx * TILE, v0 = y0 - ty * TILE, v1 = y1 - ty * TILE;
+      if (fx < 0) { lx = -lx - lw; const t = u0; u0 = u1; u1 = t; }
+      if (fy < 0) { ly = -ly - lh; const t = v0; v0 = v1; v1 = t; }
+      if ((ni + 1) * IF > inst.length) { const b = new Float32Array(inst.length * 2); b.set(inst); inst = b; }
+      const o = ni++ * IF;
+      inst[o] = cx; inst[o + 1] = cy; inst[o + 2] = lx; inst[o + 3] = ly; inst[o + 4] = lw; inst[o + 5] = lh; inst[o + 6] = rot;
+      inst[o + 7] = u0; inst[o + 8] = v0; inst[o + 9] = u1; inst[o + 10] = v1; inst[o + 11] = slot;
+      inst[o + 12] = tr; inst[o + 13] = tg; inst[o + 14] = tb; inst[o + 15] = ta; inst[o + 16] = mode;
+    }
+}
+
+const SPRITE_VS = `#version 300 es
+in vec2 a_c; in vec4 a_rect; in float a_rot; in vec4 a_uv; in float a_slot; in vec4 a_tint; in float a_mode;
+uniform vec2 u_scale; // клетка -> clip
+out vec3 v_uv; out vec4 v_tint; flat out int v_arr; flat out float v_mode;
+void main() {
+  vec2 q = vec2(gl_VertexID & 1, gl_VertexID >> 1);
+  vec2 l = a_rect.xy + q * a_rect.zw;
+  float c = cos(a_rot), s = sin(a_rot);
+  vec2 p = a_c + vec2(l.x * c - l.y * s, l.x * s + l.y * c);
+  gl_Position = vec4(p * u_scale, 0.0, 1.0);
+  v_uv = vec3(mix(a_uv.xy, a_uv.zw, q) / 256.0, mod(a_slot, 256.0));
+  v_arr = int(a_slot) / 256; v_tint = a_tint; v_mode = a_mode;
+}`;
+const SPRITE_FS = `#version 300 es
+precision highp float; precision highp sampler2DArray;
+uniform sampler2DArray u_t0, u_t1, u_t2, u_t3;
+in vec3 v_uv; in vec4 v_tint; flat in int v_arr; flat in float v_mode;
+out vec4 o;
+void main() {
+  vec4 t = v_arr == 0 ? texture(u_t0, v_uv) : v_arr == 1 ? texture(u_t1, v_uv) : v_arr == 2 ? texture(u_t2, v_uv) : texture(u_t3, v_uv);
+  o = t * v_tint;                         // предумноженная картинка × цвет записи
+  if (v_mode > 0.5) o.a = 0.0;            // 1 — свечение и свет: сложением
+}`;
+const sprite = program(SPRITE_VS, SPRITE_FS);
+const ibuf = gl.createBuffer(), vao = gl.createVertexArray();
+const ATTRS = [['a_c', 2, 0], ['a_rect', 4, 2], ['a_rot', 1, 6], ['a_uv', 4, 7], ['a_slot', 1, 11], ['a_tint', 4, 12], ['a_mode', 1, 16]];
+const attrLoc = ATTRS.map(([nm]) => gl.getAttribLocation(sprite.p, nm));
+// Пустые массивы-заглушки: у сэмплера в шейдере обязательно должна быть текстура нужного вида.
+const emptyArr = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, emptyArr); gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, 1, 1, 1);
+function drawRange(first, count, scale) {
+  if (count <= 0) return;
+  gl.useProgram(sprite.p);
+  for (let i = 0; i < MAX_ARRS; i++) { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D_ARRAY, arrs[i] ? arrs[i].tex : emptyArr); gl.uniform1i(sprite.u['u_t' + i], i); }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform2f(sprite.u.u_scale, scale[0], scale[1]);
+  gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+  ATTRS.forEach(([, size, off], i) => {
+    const loc = attrLoc[i];
+    if (loc < 0) return;
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, IF * 4, (first * IF + off) * 4);
+    gl.vertexAttribDivisor(loc, 1);
+  });
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+  gl.bindVertexArray(null);
+}
+
+// Простые четырёхугольники: подложка (снимки), наложение буфера теней, ночь.
+const QUAD_VS = `#version 300 es
+uniform vec4 u_rect; uniform vec4 u_src; // clip x0, y0, x1, y1; текстура u0, v0, u1, v1
+out vec2 v_uv;
+void main() { vec2 q = vec2(gl_VertexID & 1, gl_VertexID >> 1); gl_Position = vec4(mix(u_rect.xy, u_rect.zw, q), 0.0, 1.0); v_uv = mix(u_src.xy, u_src.zw, q); }`;
+const quad = program(QUAD_VS, `#version 300 es
+precision highp float; uniform sampler2D u_tex; uniform float u_k; in vec2 v_uv; out vec4 o;
+void main() { o = texture(u_tex, v_uv) * u_k; }`);
+const nightP = program(QUAD_VS, `#version 300 es
+precision highp float; uniform sampler2D u_scene, u_light; uniform mat3 u_m; in vec2 v_uv; out vec4 o;
+void main() {
+  vec3 c = texture(u_scene, v_uv).rgb, L = min(texture(u_light, v_uv).rgb, 1.0);
+  o = vec4(mix(u_m * c, c, L), 1.0);   // ночь — матрица из таблицы цветов игры; где светит — дневной цвет
+}`);
+const emptyVao = gl.createVertexArray();
+function drawQuad(pr, rect, src) {
+  gl.useProgram(pr.p);
+  gl.uniform4f(pr.u.u_rect, rect[0], rect[1], rect[2], rect[3]); gl.uniform4f(pr.u.u_src, src[0], src[1], src[2], src[3]);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+// Буферы кадра размером с экран: тени, сцена (для ночи), карта света.
+const target = () => ({ tex: gl.createTexture(), fb: gl.createFramebuffer(), w: 0, h: 0 });
+function sizeTarget(t, w, h) {
+  if (t.w === w && t.h === h) return;
+  t.w = w; t.h = h;
+  gl.bindTexture(gl.TEXTURE_2D, t.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+const shadowT = target(), sceneT = target(), lightT = target();
+
 // Вид страницы сообщаем основному сервису карты (тот же /ws, что у основной страницы): камера в первую очередь
 // снимает тайлы подложки под ним. Уровень — тот, что рисует подложка.
 let mapWs = null;
@@ -155,7 +294,7 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') { receive(new Int32Array(e.data)); return; }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; decoded = null; playQ.length = 0; tiles.clear(); lastImg.clear(); tintCache.clear(); }
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; decoded = null; playQ.length = 0; resetAtlas(); }
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
@@ -169,106 +308,65 @@ connect();
 
 // Подложка: снимки основной карты (/tiles/z/x/y.jpg). Землю игра рисует из кеша текстур чанков, мимо очереди
 // отрисовки, поэтому пока берём её со снимков; постройки на снимке совпадают с нарисованными поверх.
-const bg = new Map(); // "z/x/y" -> { img, ok, at }
-function background(W, H) {
+const bg = new Map(); // "z/x/y" -> { tex, ok, bad, at, prev }
+function bgTile(z, x, y, bucket) {
+  const k = `${z}/${x}/${y}`;
+  let t = bg.get(k);
+  if (!t || (t.at !== bucket && !t.bad) || (t.bad && t.at !== bucket && bucket % 4 === 0)) {
+    const img = new Image(), nt = { tex: null, ok: false, bad: false, at: bucket, prev: t && t.ok ? t : t && t.prev };
+    img.onload = () => {
+      nt.tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, nt.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      nt.ok = true; if (nt.prev?.tex) gl.deleteTexture(nt.prev.tex); nt.prev = null; dirty = true;
+    };
+    img.onerror = () => { nt.bad = true; dirty = true; };
+    img.src = `../tiles/${k}.jpg?b=${bucket}`;
+    bg.set(k, t = nt);
+  }
+  return t.ok ? t : t.prev;
+}
+function background(W, H, toClip) {
   const z = Math.max(0, Math.min(6, Math.round(5 + Math.log2(view.k / 32)))), span = 16 * 2 ** (5 - z);
   const x1 = Math.floor((view.x - W / 2 / view.k) / span), x2 = Math.floor((view.x + W / 2 / view.k) / span);
   const y1 = Math.floor((view.y - H / 2 / view.k) / span), y2 = Math.floor((view.y + H / 2 / view.k) / span);
   const bucket = Math.floor(Date.now() / 30000); // перечитываем снимки раз в полминуты
-  const get = (z, x, y) => {
-    const k = `${z}/${x}/${y}`;
-    let t = bg.get(k);
-    if (!t || (t.at !== bucket && !t.bad) || (t.bad && t.at !== bucket && bucket % 4 === 0)) {
-      const img = new Image(), nt = { img, ok: false, bad: false, at: bucket, prev: t && t.ok ? t : t && t.prev };
-      img.onload = () => { nt.ok = true; nt.prev = null; dirty = true; };
-      img.onerror = () => { nt.bad = true; dirty = true; };
-      img.src = `../tiles/${k}.jpg?b=${bucket}`;
-      bg.set(k, t = nt);
-    }
-    return t.ok ? t : t.prev;
-  };
+  gl.useProgram(quad.p); gl.uniform1f(quad.u.u_k, 1); gl.uniform1i(quad.u.u_tex, 0); gl.activeTexture(gl.TEXTURE0);
   for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) {
-    const dx = (x * span - view.x) * view.k + W / 2, dy = (y * span - view.y) * view.k + H / 2, ds = span * view.k + 0.5;
-    const show = get(z, x, y);
-    if (show) { ctx.drawImage(show.img, dx, dy, ds, ds); continue; }
+    const rect = toClip(x * span, y * span, (x + 1) * span, (y + 1) * span);
+    let show = bgTile(z, x, y, bucket), src = [0, 0, 1, 1];
     // Снимка этого уровня нет (подробный z6 снимается только там, где смотрят) — кусок более крупного уровня.
-    for (let d = 1; d <= Math.min(z, 3); d++) {
-      const p = get(z - d, Math.floor(x / 2 ** d), Math.floor(y / 2 ** d));
+    for (let d = 1; !show && d <= Math.min(z, 3); d++) {
+      const p = bgTile(z - d, Math.floor(x / 2 ** d), Math.floor(y / 2 ** d), bucket);
       if (!p) continue;
-      const s = p.img.naturalWidth / 2 ** d, sx = (x - Math.floor(x / 2 ** d) * 2 ** d) * s, sy = (y - Math.floor(y / 2 ** d) * 2 ** d) * s;
-      ctx.drawImage(p.img, sx, sy, s, s, dx, dy, ds, ds);
-      break;
+      const f = 1 / 2 ** d, sx = (x - Math.floor(x / 2 ** d) * 2 ** d) * f, sy = (y - Math.floor(y / 2 ** d) * 2 ** d) * f;
+      show = p; src = [sx, sy, sx + f, sy + f];
     }
+    if (!show) continue;
+    gl.bindTexture(gl.TEXTURE_2D, show.tex);
+    drawQuad(quad, rect, src);
   }
+  // Старые снимки далеко за краем вида — выбрасываем (видеопамять).
+  if (bg.size > 400) for (const [k, t] of bg) { if (t.at !== bucket) { if (t.tex) gl.deleteTexture(t.tex); bg.delete(k); } }
 }
 
-// Таблица цветов ночи: 256×16 — 16 срезов по синему, в срезе красный по x, зелёный по y (как в игре, data/core/graphics/color_luts).
-let nightLut = null, lutTab = null, lutW = -1;
+// Таблица цветов ночи (lut-night из данных игры) почти линейна: белый ≈ сумма чистых красного, зелёного, синего.
+// Поэтому ночь — матрица цвета из углов таблицы, смешанная с единичной по темноте.
+let nightLut = null;
 {
   const img = new Image();
   img.onload = () => { const c = document.createElement('canvas'); c.width = 256; c.height = 16; const g = c.getContext('2d'); g.drawImage(img, 0, 0); nightLut = g.getImageData(0, 0, 256, 16).data; dirty = true; };
   img.src = 'lut-night.png';
 }
-// Готовая таблица 64³ для смеси «как есть ↔ ночь» с весом w (трилинейная выборка из 16³ один раз на смену веса).
-function lutTable(w) {
-  const q = Math.round(w * 32) / 32;
-  if (q === lutW) return lutTab;
-  const t = lutTab || new Uint8ClampedArray(64 * 64 * 64 * 3), L = nightLut;
-  const at = (r, g, b, k) => L[(g * 256 + b * 16 + r) * 4 + k];
-  for (let b = 0; b < 64; b++) for (let g = 0; g < 64; g++) for (let r = 0; r < 64; r++) {
-    const fr = r / 63 * 15, fg = g / 63 * 15, fb = b / 63 * 15;
-    const ir = Math.min(14, fr | 0), ig = Math.min(14, fg | 0), ib = Math.min(14, fb | 0), tr = fr - ir, tg = fg - ig, tb = fb - ib;
-    const o = ((b * 64 + g) * 64 + r) * 3, c = [r * 255 / 63, g * 255 / 63, b * 255 / 63];
-    for (let k = 0; k < 3; k++) {
-      let v = 0;
-      for (let d = 0; d < 8; d++) {
-        const dr = d & 1, dg = (d >> 1) & 1, db = d >> 2;
-        v += (dr ? tr : 1 - tr) * (dg ? tg : 1 - tg) * (db ? tb : 1 - tb) * at(ir + dr, ig + dg, ib + db, k);
-      }
-      t[o + k] = c[k] + (v - c[k]) * q;
-    }
-  }
-  lutW = q; return lutTab = t;
-}
-// Быстрый путь — на видеокарте: таблица ночи почти линейна (белый ≈ сумма чистых красного, зелёного, синего),
-// поэтому это матрица цвета (SVG-фильтр feColorMatrix) из углов таблицы. Свет: итог = ночь·(1 − L) + день·L.
-const canFilter = typeof ctx.filter === 'string';
-const mk = () => { const c = document.createElement('canvas'); return [c, c.getContext('2d')]; };
-const [nightCv, nightG] = mk(), [litCv, litG] = mk(), [invCv, invG] = mk();
-let matW = -1;
-function applyNightGpu(w) {
-  const W = cv.width, H = cv.height;
-  for (const c of [nightCv, litCv, invCv]) if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
-  const q = Math.round(w * 64) / 64;
-  if (q !== matW) {
-    matW = q;
-    const L = nightLut, at = (r, g, b, k) => L[(g * 256 + b * 16 + r) * 4 + k] / 255;
-    const col = [[15, 0, 0], [0, 15, 0], [0, 0, 15]], m = [];
-    for (let k = 0; k < 3; k++) { for (let j = 0; j < 3; j++) m.push((k === j ? 1 : 0) + (at(...col[j], k) - (k === j ? 1 : 0)) * q); m.push(0, 0); }
-    m.push(0, 0, 0, 1, 0);
-    document.getElementById('nightm').setAttribute('values', m.map((v) => v.toFixed(4)).join(' '));
-  }
-  const reset = (g) => { g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; g.filter = 'none'; };
-  reset(nightG); nightG.filter = 'url(#night)'; nightG.drawImage(cv, 0, 0); nightG.filter = 'none';
-  reset(invG); invG.fillStyle = '#fff'; invG.fillRect(0, 0, W, H); invG.globalCompositeOperation = 'difference'; invG.drawImage(lightCv, 0, 0);
-  nightG.globalCompositeOperation = 'multiply'; nightG.drawImage(invCv, 0, 0);
-  reset(litG); litG.drawImage(cv, 0, 0); litG.globalCompositeOperation = 'multiply'; litG.drawImage(lightCv, 0, 0);
-  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
-  ctx.globalCompositeOperation = 'copy'; ctx.drawImage(nightCv, 0, 0);
-  ctx.globalCompositeOperation = 'lighter'; ctx.drawImage(litCv, 0, 0);
-  ctx.restore();
-}
-function applyNight(w) {
-  if (canFilter) return applyNightGpu(w);
-  const t = lutTable(w), sc = ctx.getImageData(0, 0, cv.width, cv.height), lm = lightCtx.getImageData(0, 0, cv.width, cv.height), d = sc.data, l = lm.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i + 1], b = d[i + 2], o = (((b >> 2) * 64 + (g >> 2)) * 64 + (r >> 2)) * 3;
-    const lr = l[i], lgg = l[i + 1], lb = l[i + 2];
-    if (lr | lgg | lb) {
-      d[i] = t[o] + (r - t[o]) * lr / 255; d[i + 1] = t[o + 1] + (g - t[o + 1]) * lgg / 255; d[i + 2] = t[o + 2] + (b - t[o + 2]) * lb / 255;
-    } else { d[i] = t[o]; d[i + 1] = t[o + 1]; d[i + 2] = t[o + 2]; }
-  }
-  ctx.putImageData(sc, 0, 0);
+function nightMatrix(w) {
+  const L = nightLut, at = (r, g, b, k) => L[(g * 256 + b * 16 + r) * 4 + k] / 255;
+  const col = [[15, 0, 0], [0, 15, 0], [0, 0, 15]], m = new Float32Array(9);
+  // mat3 в GLSL — по столбцам: столбец j — во что переходит чистый цвет j.
+  for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) m[j * 3 + k] = (k === j ? 1 : 0) + (at(...col[j], k) - (k === j ? 1 : 0)) * w;
+  return m;
 }
 
 // Для строки состояния: когда приходили кадры (за 3 с) и сколько занимает отрисовка — чтобы видеть, рвёт ли сеть/камера или браузер.
@@ -289,114 +387,117 @@ function draw() {
   try { drawFrame(); } finally { if (performance.now() - t0 > 1) drawMs = drawMs * 0.8 + (performance.now() - t0) * 0.2; }
 }
 function drawFrame() {
-  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-  if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; dirty = true; }
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight, Wd = Math.round(W * dpr), Hd = Math.round(H * dpr);
+  if (cv.width !== Wd || cv.height !== Hd) { cv.width = Wd; cv.height = Hd; ov.width = Wd; ov.height = Hd; dirty = true; }
   playout();
   if (!dirty) return;
   dirty = false;
-  // Без клиента игры показываем хотя бы подложку — и говорим, почему нет построек.
-  // Запись (9 целых): спрайт, x, y (1/256 клетки, центр), поворот<<16 | слой, масштаб x, y (×1000, атлас → 32 на клетку),
-  // цвет RGBA, вырезка x | y<<16, w | h<<16. Порядок записей — уже игровой (слой, ключ сортировки), рисуем подряд.
+  // Запись (10 целых): спрайт, x, y (1/256 клетки, центр), поворот<<16 | слой, масштаб x, y (×1000, атлас → 32 на клетку),
+  // цвет RGBA, вырезка x | y<<16, w | h<<16, флаги. Порядок записей — уже игровой (слой, ключ сортировки), рисуем подряд.
   const R = 10, f = gameOn && frame ? frame : new Int32Array(0), n = f.length / R;
   if (view.auto && cam) { view.x = cam.x; view.y = cam.y; }
   // Камера ни за кем не следит (на сервере нет ботов и игроков) — центр по записям кадра.
   else if (view.auto && n) { let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += f[i * R + 1]; sy += f[i * R + 2]; } view.x = sx / n / 256; view.y = sy / n / 256; }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  if (showBg) background(W, H);
-  ctx.imageSmoothingEnabled = true;
-  let shown = 0, missing = 0, g = ctx, shadowsDone = false;
+  const k = view.k, night = dark > 0.02 && nightLut;
+  const scale = [2 * k / W, -2 * k / H];
+  const toClip = (x0, y0, x1, y1) => [(x0 - view.x) * scale[0], (y0 - view.y) * scale[1], (x1 - view.x) * scale[0], (y1 - view.y) * scale[1]];
+  // Записи -> экземпляры: сцена до теней [0, sh0), тени [sh0, sh1), сцена после [sh1, sc1), свет [sc1, ni).
+  ni = 0;
+  let sh0 = -1, sh1 = -1, shown = 0, missing = 0;
   const lights = [];
-  // Тени игра собирает в отдельный буфер (перекрытия не темнеют сильнее) и накладывает его между слоями 119 и 120.
-  if (shadowCv.width !== cv.width || shadowCv.height !== cv.height) { shadowCv.width = cv.width; shadowCv.height = cv.height; }
-  const flushShadows = () => {
-    if (g === ctx) return;
-    g = ctx; ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 0.5; ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(shadowCv, 0, 0); ctx.restore();
-  };
+  const vw = W / 2 / k, vh = H / 2 / k;
   for (let i = 0; i < n; i++) {
     const o = i * R, s = spr[f[o]];
-    const layer = f[o + 3] & 0xffff, rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
-    if (layer === 1000 && g === ctx && !shadowsDone) { shadowsDone = true; g = shadowCtx; g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H); }
-    else if (layer !== 1000) flushShadows();
-    // Слой 255 — источники света, 1001 — копии светящихся слоёв для карты света: в сцену не рисуем, они идут в карту освещения.
     if (!s) continue;
+    const layer = f[o + 3] & 0xffff;
     // Слой 92 — декали (трава, камешки на земле): они уже есть на снимке-подложке, второй раз — вдвое гуще и ярче, чем в игре.
     if (layer === 92 && showBg) continue;
-    if (layer === 255 || layer === 1001) { if (dark > 0.02) lights.push(o); continue; }
-    const cxr = f[o + 7] & 0xffff, cyr = f[o + 7] >>> 16, cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16;
-    // Прямоугольник в атласе; кадр анимации, кусок атласа для которого ещё грузится, — рисуем прошлый с этого места.
-    let src = [s.a, s.ax + cxr, s.ay + cyr, cw, ch];
+    // Слой 255 — источники света, 1001 — копии светящихся слоёв для карты света: в сцену не рисуем.
+    if (layer === 255 || layer === 1001) { if (night) lights.push(o); continue; }
+    const cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16, w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;
+    const cx = f[o + 1] / 256 - view.x, cy = f[o + 2] / 256 - view.y, r = Math.max(w, h);
+    if (cx - r > vw || cx + r < -vw || cy - r > vh || cy + r < -vh) continue;
+    // Кадр анимации, кусок атласа для которого ещё грузится, — рисуем прошлый с этого места (иначе мигает).
+    let src = [s.a, s.ax + (f[o + 7] & 0xffff), s.ay + (f[o + 7] >>> 16), cw, ch];
     const slot = `${layer}:${f[o + 1]}:${f[o + 2]}`;
-    const w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;      // размер в клетках
-    const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
-    const r = Math.max(w, h) * view.k;
-    if (cx - r > W || cy - r > H || cx + r < 0 || cy + r < 0) continue;
-    // Смешивание как в игре (предумноженная прозрачность): результат = картинка·цвет_записи + фон·(1 − α·α_записи).
-    // Если яркость цвета записи равна его прозрачности (обычный случай) — это обычное наложение с прозрачностью.
-    // Иначе (дым, свечение с α = 0) — два шага: приглушить фон на α·α_записи и добавить картинку с весом яркости.
-    const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
-    const flip = f[o + 9] & 0x300; // флаги записи: 0x100 — отразить по горизонтали, 0x200 — по вертикали (провода, углы)
-    const put = (alpha, op) => {
-      g.globalAlpha = alpha; g.globalCompositeOperation = op;
-      const draw = (r, x, y) => (r instanceof HTMLCanvasElement ? (g.drawImage(r, x, y, w * view.k, h * view.k), true) : drawAtlas(g, r[0], r[1], r[2], r[3], r[4], x, y, w * view.k, h * view.k));
-      let ok;
-      if (rot || flip) { g.save(); g.translate(cx, cy); g.rotate(rot); if (flip) g.scale(flip & 0x100 ? -1 : 1, flip & 0x200 ? -1 : 1); ok = draw(src, -w / 2 * view.k, -h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), -w / 2 * view.k, -h / 2 * view.k); g.restore(); }
-      else { ok = draw(src, cx - w / 2 * view.k, cy - h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), cx - w / 2 * view.k, cy - h / 2 * view.k); }
-      if (ok) { if (!(src instanceof HTMLCanvasElement)) lastImg.set(slot, src); } else missing++;
-    };
-    if (layer === 1000) put(1, 'source-over');                                   // тень — в буфер теней
-    else if (s.fl & 4) put(Math.max(tl, ta), 'lighter');                        // свечение — сложением
-    else {
-      const r = (tint & 255) / 255, gg = ((tint >>> 8) & 255) / 255, b = ((tint >>> 16) & 255) / 255;
-      const gray = Math.max(r, gg, b) - Math.min(r, gg, b) < 0.03;
-      if (gray && Math.abs(tl - ta) < 0.02) put(ta, 'source-over');                 // обычное наложение
-      else {
-        const t = gray ? null : tinted(src, tint);
-        if (t || gray) {                                                           // картинка с цветом ещё не готова — пропускаем целиком
-          if (ta > 0) put(ta, 'destination-out');                                  // приглушить фон на α·α_записи
-          if (!t) { if (tl > 0) put(tl, 'lighter'); }                              // добавить картинку·цвет
-          else { const keep = src; src = t; put(1, 'lighter'); src = keep; }
-        } else missing++;
-      }
-    }
+    if (ready(src[0], src[1], src[2], src[3], src[4])) lastSrc.set(slot, src);
+    else { const l = lastSrc.get(slot); if (l && ready(l[0], l[1], l[2], l[3], l[4])) src = l; else { missing++; continue; } }
+    if (layer === 1000 && sh0 < 0) sh0 = ni;
+    if (layer !== 1000 && sh0 >= 0 && sh1 < 0) sh1 = ni;
+    const tint = f[o + 6] >>> 0, tr = (tint & 255) / 255, tg = ((tint >>> 8) & 255) / 255, tb = ((tint >>> 16) & 255) / 255, ta = (tint >>> 24) / 255;
+    const rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI, fl = f[o + 9];
+    if (s.fl & 4 && layer !== 1000) {
+      // Свечение — сложением; цвет записи без цвета (rgb = 0) — сила в α.
+      if (tr + tg + tb > 0) emit(cx, cy, w, h, rot, fl & 0x100 ? -1 : 1, fl & 0x200 ? -1 : 1, src[0], src[1], src[2], src[3], src[4], tr, tg, tb, ta, 1);
+      else emit(cx, cy, w, h, rot, fl & 0x100 ? -1 : 1, fl & 0x200 ? -1 : 1, src[0], src[1], src[2], src[3], src[4], ta, ta, ta, ta, 1);
+    } else emit(cx, cy, w, h, rot, fl & 0x100 ? -1 : 1, fl & 0x200 ? -1 : 1, src[0], src[1], src[2], src[3], src[4], tr, tg, tb, ta, 0);
     shown++;
   }
-  flushShadows();
-  // Ночь, как в игре: цвета сцены проходят через таблицу цветов ночи (lut-night из данных игры — темнее и синее),
-  // смешанную с исходными по времени суток; где светят фонари и окна, остаётся дневной цвет — по яркости карты света.
-  if (dark > 0.02 && nightLut) {
-    if (lightCv.width !== cv.width || lightCv.height !== cv.height) { lightCv.width = cv.width; lightCv.height = cv.height; }
-    const lg = lightCtx;
-    lg.setTransform(dpr, 0, 0, dpr, 0, 0); lg.globalCompositeOperation = 'source-over'; lg.globalAlpha = 1;
-    lg.fillStyle = '#000'; lg.fillRect(0, 0, W, H);
-    lg.globalCompositeOperation = 'lighter';
-    for (const o of lights) {
-      const s = spr[f[o]], layer = f[o + 3] & 0xffff, rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
-      const cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16, w = cw * f[o + 4] / 1000 / 32 * view.k, h = ch * f[o + 5] / 1000 / 32 * view.k;
-      const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
-      if (cx - w > W || cy - h > H || cx + w < 0 || cy + h < 0) continue;
-      const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
-      const src = [s.a, s.ax + (f[o + 7] & 0xffff), s.ay + (f[o + 7] >>> 16), cw, ch];
-      // Цвет света — в цвете записи (уже умножен на силу, как у цветных фонарей); без цвета (rgb = 0) — белый свет силой α.
-      const cr = tint & 255, cg = (tint >>> 8) & 255, cb = (tint >>> 16) & 255;
-      const colored = layer === 255 && Math.max(cr, cg, cb) - Math.min(cr, cg, cb) > 8;
-      const img = colored ? tinted(src, (tint & 0xffffff) | 0xff000000) : null;
-      if (colored && !img) continue;
-      lg.globalAlpha = colored ? 1 : layer === 1001 ? 1 : Math.max(ta, tl);
-      const put = (x, y) => (img ? lg.drawImage(img, x, y, w, h) : drawAtlas(lg, ...src, x, y, w, h));
-      if (rot) { lg.save(); lg.translate(cx, cy); lg.rotate(rot); put(-w / 2, -h / 2); lg.restore(); }
-      else put(cx - w / 2, cy - h / 2);
-    }
-    applyNight(Math.min(1, dark / 0.85));
+  if (sh0 >= 0 && sh1 < 0) sh1 = ni;
+  const sc1 = ni;
+  for (const o of lights) {
+    const s = spr[f[o]], layer = f[o + 3] & 0xffff;
+    const cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16, w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;
+    const cx = f[o + 1] / 256 - view.x, cy = f[o + 2] / 256 - view.y, r = Math.max(w, h);
+    if (cx - r > vw || cx + r < -vw || cy - r > vh || cy + r < -vh) continue;
+    const src = [s.a, s.ax + (f[o + 7] & 0xffff), s.ay + (f[o + 7] >>> 16), cw, ch];
+    if (!ready(...src)) continue;
+    const tint = f[o + 6] >>> 0, cr = tint & 255, cg = (tint >>> 8) & 255, cb = (tint >>> 16) & 255, ta = (tint >>> 24) / 255, tl = (cr + cg + cb) / 765;
+    // Цвет света — в цвете записи (уже умножен на силу, как у цветных фонарей); без цвета — белый свет силой α.
+    const colored = layer === 255 && Math.max(cr, cg, cb) - Math.min(cr, cg, cb) > 8;
+    const m = layer === 1001 ? 1 : Math.max(ta, tl);
+    const rot = (f[o + 3] >>> 16) / 65536 * 2 * Math.PI;
+    if (colored) emit(cx, cy, w, h, rot, 1, 1, ...src, cr / 255, cg / 255, cb / 255, 1, 1);
+    else emit(cx, cy, w, h, rot, 1, 1, ...src, m, m, m, m, 1);
   }
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.globalAlpha = 1;
-  // Вне вида камеры — только снимки карты (без анимаций): затемняем и обводим границу.
+
+  // Видеокарта: мип-уровни для новых кусков (при отдалении без них рябит), экземпляры кадра — одним буфером.
+  for (const a of arrs) if (a.mip) { gl.bindTexture(gl.TEXTURE_2D_ARRAY, a.tex); gl.generateMipmap(gl.TEXTURE_2D_ARRAY); a.mip = false; }
+  gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+  gl.bufferData(gl.ARRAY_BUFFER, inst.subarray(0, ni * IF), gl.STREAM_DRAW);
+  if (night) { sizeTarget(sceneT, Wd, Hd); sizeTarget(lightT, Wd, Hd); }
+  if (sh0 >= 0) sizeTarget(shadowT, Wd, Hd);
+  const main = night ? sceneT.fb : null;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, main);
+  gl.viewport(0, 0, Wd, Hd);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  if (showBg) background(W, H, toClip);
+  if (sh0 < 0) drawRange(0, sc1, scale);
+  else {
+    drawRange(0, sh0, scale);
+    // Тени игра собирает в отдельный буфер (перекрытия не темнеют сильнее) и накладывает его между слоями 119 и 120 с силой 0,5.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowT.fb);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    drawRange(sh0, sh1 - sh0, scale);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, main);
+    gl.useProgram(quad.p); gl.uniform1f(quad.u.u_k, 0.5); gl.uniform1i(quad.u.u_tex, 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, shadowT.tex);
+    drawQuad(quad, [-1, -1, 1, 1], [0, 0, 1, 1]);
+    drawRange(sh1, sc1 - sh1, scale);
+  }
+  // Ночь, как в игре: цвета сцены — через таблицу цветов ночи; где светят фонари и окна, остаётся дневной цвет.
+  if (night) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lightT.fb);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    drawRange(sc1, ni - sc1, scale);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.disable(gl.BLEND);
+    gl.useProgram(nightP.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneT.tex); gl.uniform1i(nightP.u.u_scene, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lightT.tex); gl.uniform1i(nightP.u.u_light, 1);
+    gl.uniformMatrix3fv(nightP.u.u_m, false, nightMatrix(Math.min(1, dark / 0.85)));
+    drawQuad(nightP, [-1, -1, 1, 1], [0, 0, 1, 1]);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+  // Поверх — 2D: граница вида камеры (вне её — только снимки карты, без анимаций).
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0); octx.clearRect(0, 0, W, H);
   if (cam && gameOn) {
-    const x1 = (cam.x - cam.w / 2 - view.x) * view.k + W / 2, y1 = (cam.y - cam.h / 2 - view.y) * view.k + H / 2, w = cam.w * view.k, h = cam.h * view.k;
-    ctx.fillStyle = 'rgba(0, 0, 0, .45)';
-    ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(x1, y1, w, h); ctx.fill('evenodd');
-    ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 6]); ctx.strokeRect(x1, y1, w, h); ctx.setLineDash([]);
+    const x1 = (cam.x - cam.w / 2 - view.x) * k + W / 2, y1 = (cam.y - cam.h / 2 - view.y) * k + H / 2, w = cam.w * k, h = cam.h * k;
+    octx.fillStyle = 'rgba(0, 0, 0, .45)';
+    octx.beginPath(); octx.rect(0, 0, W, H); octx.rect(x1, y1, w, h); octx.fill('evenodd');
+    octx.strokeStyle = '#ffcc33'; octx.lineWidth = 1.5; octx.setLineDash([8, 6]); octx.strokeRect(x1, y1, w, h); octx.setLineDash([]);
   }
   document.getElementById('st').textContent = !gameOn ? 'клиент игры с перехватом сейчас не запущен — видна только подложка со снимков карты' : `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length} · ${netStat()}, отрисовка ${drawMs.toFixed(0)} мс`;
 }
