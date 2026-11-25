@@ -33,6 +33,7 @@ const tilePngs = new Map();    // "номер/x-y" -> PNG куска 1024×1024
 let game = null, frame = null, frameAt = 0, frames = 0;
 let gen = Date.now().toString(36); // поколение номеров спрайтов: меняется при переподключении игры (в адресе картинок)
 const viewers = new Set();
+export const renderViewers = () => viewers.size;
 
 // ---------- PNG ----------
 const CRC = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });

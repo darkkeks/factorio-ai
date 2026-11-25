@@ -118,7 +118,7 @@ function connect() {
   const ws = new WebSocket(new URL('ws?d=1', location.href).href.replace(/^http/, 'ws'));
   ws.binaryType = 'arraybuffer';
   ws.onmessage = (e) => {
-    if (typeof e.data !== 'string') { frame = decodeFrame(new Int32Array(e.data), frame); frameN++; dirty = true; return; }
+    if (typeof e.data !== 'string') { frame = decodeFrame(new Int32Array(e.data), frame); frameN++; arrivals.push(performance.now()); dirty = true; return; }
     const m = JSON.parse(e.data);
     if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; tiles.clear(); lastImg.clear(); tintCache.clear(); }
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
@@ -236,8 +236,22 @@ function applyNight(w) {
   ctx.putImageData(sc, 0, 0);
 }
 
+// Для строки состояния: когда приходили кадры (за 3 с) и сколько занимает отрисовка — чтобы видеть, рвёт ли сеть/камера или браузер.
+const arrivals = [];
+function netStat() {
+  const now = performance.now();
+  while (arrivals.length && now - arrivals[0] > 3000) arrivals.shift();
+  let gap = arrivals.length ? now - arrivals[arrivals.length - 1] : 0;
+  for (let i = 1; i < arrivals.length; i++) gap = Math.max(gap, arrivals[i] - arrivals[i - 1]);
+  return `от камеры ${(arrivals.length / 3).toFixed(1)} кадр/с, самая длинная пауза ${gap.toFixed(0)} мс`;
+}
+let drawMs = 0;
 function draw() {
   requestAnimationFrame(draw);
+  const t0 = performance.now();
+  try { drawFrame(); } finally { if (performance.now() - t0 > 1) drawMs = drawMs * 0.8 + (performance.now() - t0) * 0.2; }
+}
+function drawFrame() {
   const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
   if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; dirty = true; }
   if (!dirty) return;
@@ -346,7 +360,7 @@ function draw() {
     ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(x1, y1, w, h); ctx.fill('evenodd');
     ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 6]); ctx.strokeRect(x1, y1, w, h); ctx.setLineDash([]);
   }
-  document.getElementById('st').textContent = !gameOn ? 'клиент игры с перехватом сейчас не запущен — видна только подложка со снимков карты' : `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length}`;
+  document.getElementById('st').textContent = !gameOn ? 'клиент игры с перехватом сейчас не запущен — видна только подложка со снимков карты' : `кадр ${frameN}: записей ${n}, нарисовано ${shown}, картинок ещё нет ${missing}, спрайтов известно ${spr.length} · ${netStat()}, отрисовка ${drawMs.toFixed(0)} мс`;
 }
 draw();
 

@@ -14,7 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
-import { handleRender, wssRender, setCamera, setDarkness, setZoom } from './map-render.mjs';
+import { handleRender, wssRender, setCamera, setDarkness, setZoom, renderViewers } from './map-render.mjs';
 import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
@@ -56,6 +56,7 @@ const VIEW_MS = Number(process.env.MAP_VIEW_MS || 500); // чаще этого �
 const SWEEP_MS = 600_000;      // цель полного фонового обхода
 const BATCH = Number(process.env.MAP_BATCH || 16);               // снимков в одной команде RCON
 const PAUSE_MS = 20;           // пауза между пачками
+const SMOOTH_PAUSE_MS = 250;   // пауза между снимками, пока смотрят /render/
 const SHOT_TIMEOUT_MS = 20_000;
 const VIEW_TILES = 80;         // сколько тайлов одного зрителя считать приоритетными
 const MAX_CLIENTS = 50;
@@ -638,7 +639,8 @@ async function fogLoop() {
 }
 
 // Приоритеты камеры: 0) тайл нужно пересобрать, 1) поле зрения зрителей, 2) окрестности ботов и игроков, 3) фоновый обход.
-function pick() {
+let pickN = 0;
+function pick(size = BATCH) {
   const hot = new Set();
   const s = span(ZREF);
   for (const a of [...live.bots, ...live.players]) {
@@ -661,8 +663,10 @@ function pick() {
   // Зрители могут занять камеру целиком, поэтому четверть каждой пачки оставлена остальному
   // (участки вокруг ботов и фоновый обход); незанятые места достаются тем, кому есть что снимать.
   const seen = due.filter((d) => d[2]), rest = due.filter((d) => !d[2]);
-  const keep = Math.min(rest.length, Math.max(BATCH / 4, BATCH - seen.length));
-  return [...rest.slice(0, keep), ...seen.slice(0, BATCH - keep)].map((d) => d[1]);
+  // В пачке меньше четырёх снимков — остальному достаётся каждая четвёртая пачка.
+  const quarter = size >= 4 ? Math.floor(size / 4) : ++pickN % 4 === 0 ? 1 : 0;
+  const keep = Math.min(rest.length, Math.max(quarter, size - seen.length));
+  return [...rest.slice(0, keep), ...seen.slice(0, size - keep)].map((d) => d[1]);
 }
 
 const jpegDone = (file) => {
@@ -744,11 +748,16 @@ async function renderBatch(batch) {
 
 async function renderLoop() {
   for (;;) {
-    const batch = live.ok && live.camera && chunksKnown && (!CAMERA_MANAGE || camera?.joined) ? pick() : [];
+    // Файл shots-off в папке камеры — снимки на паузе (отладка: снимки останавливают отрисовку клиента-камеры).
+    const off = fs.existsSync(path.join(CAMERA_DIR, 'shots-off'));
+    // Снимок останавливает отрисовку клиента-камеры (~60 мс на снимок; пачка из 16 — заминка на секунду). Пока кто-то
+    // смотрит прототип отрисовки (/render/ — анимация с той же камеры), снимаем по одному с паузой: заминки короткие.
+    const smooth = renderViewers() > 0;
+    const batch = !off && live.ok && live.camera && chunksKnown && (!CAMERA_MANAGE || camera?.joined) ? pick(smooth ? 1 : BATCH) : [];
     if (batch.length) {
       try { await renderBatch(batch); } catch (e) { log('перерисовка:', e.message); await sleep(2000); }
     }
-    await sleep(batch.length ? PAUSE_MS : 300);
+    await sleep(!batch.length ? 300 : smooth ? SMOOTH_PAUSE_MS : PAUSE_MS);
   }
 }
 
