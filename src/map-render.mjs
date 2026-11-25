@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
 const SOCK = process.env.V2_SOCK || path.join(os.homedir(), 'factorio-camera/hook/v2.sock');
 const PAGE = path.join(ROOT, 'src/map-web/render.html');
+const LUT_NIGHT = path.join(process.env.GAME_DATA || path.join(os.homedir(), 'factorio-camera/factorio/data'), 'core/graphics/color_luts/lut-night.png');
 const DUMP = path.join(os.homedir(), 'factorio-camera/hook/raw'); // есть папка — сжатые атласы пишутся туда (отладка)
 const SEND_MS = 100;           // кадров зрителям — не чаще 10 в секунду
 const log = (...a) => console.log(new Date().toISOString().slice(11, 23), '[render]', ...a);
@@ -258,6 +259,11 @@ wssRender.on('connection', (ws) => {
 
 /** HTTP для /render/…; true — запрос обработан. */
 export function handleRender(url, reply) {
+  // Таблица цветов ночи — из данных игры (клиент-камеры), как есть.
+  if (url.pathname === '/render/lut-night.png') {
+    try { reply(200, 'image/png', fs.readFileSync(LUT_NIGHT)); } catch { reply(404, 'text/plain', 'нет таблицы'); }
+    return true;
+  }
   if (url.pathname === '/render' || url.pathname === '/render/') { reply(200, 'text/html; charset=utf-8', fs.readFileSync(PAGE)); return true; }
   // Отладка: атлас целиком, уменьшенный (/render/debug/atlas/<номер>.png) и список спрайтов (/render/debug/sprites.json).
   const d = url.pathname.match(/^\/render\/debug\/atlas\/(\d{1,3})\.png$/);
