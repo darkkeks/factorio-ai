@@ -164,7 +164,7 @@ function convert(data) {
     recs.push(r);
   }
   // Масштаб — у самой камеры (ширина её вида известна сервису карты); медиана по записям врёт: у значков свой масштаб.
-  const zoom = cam?.w ? 1280 / 32 / cam.w : 0.75, Z = 32 * zoom;
+  const zoom = camZoom, Z = 32 * zoom;
   const cxs = [], cys = [];
   // Калибруем по спрайтам без сдвига (предметы, значки): у них точка на экране — ровно позиция из ключа.
   for (const r of recs) if (Math.abs(r.kx) < 1e6 && Math.abs(r.ky) < 1e6 && !r.rot && Math.abs(r.s.shiftX) < 0.01 && Math.abs(r.s.shiftY) < 0.01) { cxs.push(r.px - Z * r.kx); cys.push(r.py - Z * r.ky); }
@@ -228,6 +228,9 @@ export function setDarkness(d) {
   const s = JSON.stringify({ t: 'dark', dark });
   if (s !== darkSent) { darkSent = s; broadcast(s); }
 }
+// Масштаб клиента-камеры (из игры): по нему экранные точки записей переводятся в клетки.
+let camZoom = 0.75;
+export function setZoom(z) { if (z > 0) camZoom = z; }
 export function setCamera(c) {
   cam = c;
   const s = c ? JSON.stringify({ t: 'cam', ...c }) : '{"t":"cam"}';

@@ -45,6 +45,23 @@ function tile(a, tx, ty) {
   }
   return t.ok ? t.img : null;
 }
+// Картинка, умноженная на цвет записи (для цветного оттенка: призраки, раскраска): холст с кешем.
+const tintCache = new Map();
+function tinted(src, tint) {
+  const k = src.join(',') + ':' + tint;
+  let c = tintCache.get(k);
+  if (c) return c;
+  c = document.createElement('canvas'); c.width = src[3]; c.height = src[4];
+  const t = c.getContext('2d');
+  if (!drawAtlas(t, ...src, 0, 0, src[3], src[4])) return null;
+  // Попиксельно: цвет картинки × цвет записи, прозрачность картинки не трогаем.
+  const d = t.getImageData(0, 0, c.width, c.height), px = d.data, r = (tint & 255) / 255, gg = ((tint >>> 8) & 255) / 255, b = ((tint >>> 16) & 255) / 255;
+  for (let i = 0; i < px.length; i += 4) { px[i] *= r; px[i + 1] *= gg; px[i + 2] *= b; }
+  t.putImageData(d, 0, 0);
+  if (tintCache.size > 3000) tintCache.clear();
+  tintCache.set(k, c);
+  return c;
+}
 // Нарисовать прямоугольник атласа (sx, sy, sw, sh) в (dx, dy, dw, dh); false — если какой-то кусок ещё не загружен.
 function drawAtlas(g2, a, sx, sy, sw, sh, dx, dy, dw, dh) {
   if (a === undefined || !sw || !sh) return false;
@@ -80,7 +97,7 @@ function connect() {
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') { frame = new Int32Array(e.data); frameN++; dirty = true; return; }
     const m = JSON.parse(e.data);
-    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; tiles.clear(); lastImg.clear(); }
+    if (m.t === 'reset') { gen = m.gen; spr.length = 0; frame = null; tiles.clear(); lastImg.clear(); tintCache.clear(); }
     // Картинки спрайтов грузим сразу, а не при первом появлении в кадре.
     else if (m.t === 'sprites') { for (const s of m.list) spr[s.n] = s; if ('game' in m) { gameOn = m.game; dirty = true; } }
     else if (m.t === 'game') { gameOn = m.on; dirty = true; }
@@ -149,7 +166,7 @@ function draw() {
     if (layer === 255 || layer === 1001) { if (dark > 0.02) lights.push(o); continue; }
     const cxr = f[o + 7] & 0xffff, cyr = f[o + 7] >>> 16, cw = f[o + 8] & 0xffff, ch = f[o + 8] >>> 16;
     // Прямоугольник в атласе; кадр анимации, кусок атласа для которого ещё грузится, — рисуем прошлый с этого места.
-    const src = [s.a, s.ax + cxr, s.ay + cyr, cw, ch];
+    let src = [s.a, s.ax + cxr, s.ay + cyr, cw, ch];
     const slot = `${layer}:${f[o + 1]}:${f[o + 2]}`;
     const w = cw * f[o + 4] / 1000 / 32, h = ch * f[o + 5] / 1000 / 32;      // размер в клетках
     const cx = (f[o + 1] / 256 - view.x) * view.k + W / 2, cy = (f[o + 2] / 256 - view.y) * view.k + H / 2;
@@ -161,16 +178,27 @@ function draw() {
     const tint = f[o + 6] >>> 0, ta = (tint >>> 24) / 255, tl = ((tint & 255) + ((tint >>> 8) & 255) + ((tint >>> 16) & 255)) / 765;
     const put = (alpha, op) => {
       g.globalAlpha = alpha; g.globalCompositeOperation = op;
-      const draw = (r, x, y) => drawAtlas(g, r[0], r[1], r[2], r[3], r[4], x, y, w * view.k, h * view.k);
+      const draw = (r, x, y) => (r instanceof HTMLCanvasElement ? (g.drawImage(r, x, y, w * view.k, h * view.k), true) : drawAtlas(g, r[0], r[1], r[2], r[3], r[4], x, y, w * view.k, h * view.k));
       let ok;
       if (rot) { g.save(); g.translate(cx, cy); g.rotate(rot); ok = draw(src, -w / 2 * view.k, -h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), -w / 2 * view.k, -h / 2 * view.k); g.restore(); }
       else { ok = draw(src, cx - w / 2 * view.k, cy - h / 2 * view.k); if (!ok && lastImg.get(slot)) draw(lastImg.get(slot), cx - w / 2 * view.k, cy - h / 2 * view.k); }
-      if (ok) lastImg.set(slot, src); else missing++;
+      if (ok) { if (!(src instanceof HTMLCanvasElement)) lastImg.set(slot, src); } else missing++;
     };
     if (layer === 1000) put(1, 'source-over');                                   // тень — в буфер теней
     else if (s.fl & 4) put(Math.max(tl, ta), 'lighter');                        // свечение — сложением
-    else if (Math.abs(tl - ta) < 0.02) put(ta, 'source-over');
-    else { if (ta > 0) put(ta, 'destination-out'); if (tl > 0) put(tl, 'lighter'); }
+    else {
+      const r = (tint & 255) / 255, gg = ((tint >>> 8) & 255) / 255, b = ((tint >>> 16) & 255) / 255;
+      const gray = Math.max(r, gg, b) - Math.min(r, gg, b) < 0.03;
+      if (gray && Math.abs(tl - ta) < 0.02) put(ta, 'source-over');                 // обычное наложение
+      else {
+        const t = gray ? null : tinted(src, tint);
+        if (t || gray) {                                                           // картинка с цветом ещё не готова — пропускаем целиком
+          if (ta > 0) put(ta, 'destination-out');                                  // приглушить фон на α·α_записи
+          if (!t) { if (tl > 0) put(tl, 'lighter'); }                              // добавить картинку·цвет
+          else { const keep = src; src = t; put(1, 'lighter'); src = keep; }
+        } else missing++;
+      }
+    }
     shown++;
   }
   flushShadows();

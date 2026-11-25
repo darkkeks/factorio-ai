@@ -14,7 +14,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { ROOT } from './config.mjs';
 import { makeLua } from './map-rcon.mjs';
-import { handleRender, wssRender, setCamera, setDarkness } from './map-render.mjs';
+import { handleRender, wssRender, setCamera, setDarkness, setZoom } from './map-render.mjs';
 import { layer, entityAt, boxes, loadLocale, LAYERS } from './map-inspect.mjs';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
@@ -113,7 +113,7 @@ const LUA = {
       if p.name ~= A.camera then out.players[#out.players+1] = {name=p.name, x=p.position.x, y=p.position.y, surface=p.surface.name} end
     end
     local cam = game.get_player(A.camera)
-    if cam then out.camera = {connected=cam.connected, spectator=cam.controller_type == defines.controllers.spectator} end
+    if cam then out.camera = {connected=cam.connected, spectator=cam.controller_type == defines.controllers.spectator, zoom=cam.zoom} end
     local c = storage.vb_chat
     out.seq = c and c.seq or 0
     if c then for _, m in pairs(c.items) do if m.seq > A.since then out.chat[#out.chat+1] = {seq=m.seq, from=m.from, text=m.text} end end end
@@ -314,6 +314,7 @@ async function liveLoop() {
       // Вид клиента-камеры для страницы /render/: центр — тот, за кем она следит.
       const ta = live.target && (live.target.kind === 'bot' ? live.bots : live.players).find((a) => a.name === live.target.name);
       setDarkness(r.dark ?? 0);
+      setZoom(r.camera?.zoom);
       setCamera(live.camera && ta ? { x: Math.round(ta.x * 4) / 4, y: Math.round(ta.y * 4) / 4, w: 1280 / 32 / CAMERA_ZOOM, h: 720 / 32 / CAMERA_ZOOM } : null);
       if (live.camera && viewers.size && !encoder) startVideo();
       const fresh = list(r.chat).map((m) => ({ seq: m.seq, from: m.from, text: String(m.text).slice(0, 600), at: Date.now() }));
