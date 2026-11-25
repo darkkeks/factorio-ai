@@ -48,29 +48,40 @@ function program(vs, fs) {
   return { p, u };
 }
 
-// Куски атласов 256×256 — слои текстурных массивов (до 4 массивов по 256 слоёв); спрайт на стыке кусков — несколько четырёхугольников.
-const TILE = 256, ARR_LAYERS = 256, MAX_ARRS = 4;
-const arrs = [];           // { tex, used, mip }
+// Куски атласов 256×256 — слои текстурных массивов (до MAX_ARRS массивов по 256 слоёв); спрайт на стыке кусков — несколько
+// четырёхугольников. Места нет — вытесняются куски, которые дольше всех не рисовались (сбрасывать всё нельзя: на большой
+// карте виду нужно больше тысячи кусков, и сброс шёл по кругу — постройки то пропадали, то появлялись).
+const TILE = 256, ARR_LAYERS = 256, MAX_ARRS = 6;
+const arrs = [];           // { tex, mip }
 const tiles = new Map();   // "a/x-y" -> { img, slot: массив·256 + слой, −1 — ещё нет }
 const lastSrc = new Map(); // место (слой, x, y) -> последний целиком загруженный прямоугольник атласа [a, x, y, w, h]
+const slotKey = [], slotUse = [], freeSlots = [];
+let useStamp = 0;          // номер отрисовки: у каждого слоя — когда его последний раз брали
+function newArray() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 9, gl.RGBA8, TILE, TILE, ARR_LAYERS);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const i = arrs.push({ tex, mip: false }) - 1;
+  for (let l = ARR_LAYERS - 1; l >= 0; l--) freeSlots.push(i * ARR_LAYERS + l);
+}
 function allocLayer() {
-  let a = arrs.find((x) => x.used < ARR_LAYERS);
-  if (!a) {
-    if (arrs.length >= MAX_ARRS) { resetAtlas(); return -1; } // места нет — начинаем заново (куски перегрузятся)
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
-    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 9, gl.RGBA8, TILE, TILE, ARR_LAYERS);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    arrs.push(a = { tex, used: 0, mip: false });
+  if (!freeSlots.length && arrs.length < MAX_ARRS) newArray();
+  if (!freeSlots.length) {
+    // Вытесняем до 64 самых давних, не нужных в последних двух отрисовках.
+    const old = [];
+    for (let s = 0; s < arrs.length * ARR_LAYERS; s++) if (slotKey[s] && slotUse[s] < useStamp - 1) old.push(s);
+    old.sort((a, b) => slotUse[a] - slotUse[b]);
+    for (const s of old.slice(0, 64)) { tiles.delete(slotKey[s]); slotKey[s] = null; freeSlots.push(s); }
   }
-  return arrs.indexOf(a) * ARR_LAYERS + a.used++;
+  return freeSlots.length ? freeSlots.pop() : -1;
 }
 function resetAtlas() {
   for (const a of arrs) gl.deleteTexture(a.tex);
-  arrs.length = 0; tiles.clear(); lastSrc.clear();
+  arrs.length = 0; tiles.clear(); lastSrc.clear(); slotKey.length = 0; slotUse.length = 0; freeSlots.length = 0;
 }
 function tile(a, tx, ty) {
   const k = `${a}/${tx}-${ty}`;
@@ -81,19 +92,21 @@ function tile(a, tx, ty) {
     t.img.onload = () => {
       if (g0 !== gen || tiles.get(k) !== t) return;
       const slot = allocLayer();
-      if (slot < 0) return;
+      // Всё место занято тем, что на экране прямо сейчас, — попросим этот кусок позже.
+      if (slot < 0) { setTimeout(() => { if (tiles.get(k) === t) tiles.delete(k); }, 1000); return; }
       const ar = arrs[slot >> 8];
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, ar.tex);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       // Кусок у края атласа может быть меньше 256 — кладём как есть, остальное в слое не используется.
       gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, slot & 255, t.img.width, t.img.height, 1, gl.RGBA, gl.UNSIGNED_BYTE, t.img);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-      ar.mip = true; t.slot = slot; t.img = null; dirty = true;
+      ar.mip = true; t.slot = slot; t.img = null; slotKey[slot] = k; slotUse[slot] = useStamp; dirty = true;
     };
     t.img.onerror = () => { setTimeout(() => { if (tiles.get(k) === t) tiles.delete(k); }, 2000); }; // атлас ещё распаковывается — попросим снова
     t.img.src = `atlas/${gen}/${a}/${tx}-${ty}.png`;
     tiles.set(k, t);
   }
+  if (t.slot >= 0) slotUse[t.slot] = useStamp;
   return t.slot;
 }
 function ready(a, sx, sy, sw, sh) {
@@ -144,11 +157,12 @@ void main() {
 }`;
 const SPRITE_FS = `#version 300 es
 precision highp float; precision highp sampler2DArray;
-uniform sampler2DArray u_t0, u_t1, u_t2, u_t3;
+uniform sampler2DArray u_t0, u_t1, u_t2, u_t3, u_t4, u_t5;
 in vec3 v_uv; in vec4 v_tint; flat in int v_arr; flat in float v_mode;
 out vec4 o;
 void main() {
-  vec4 t = v_arr == 0 ? texture(u_t0, v_uv) : v_arr == 1 ? texture(u_t1, v_uv) : v_arr == 2 ? texture(u_t2, v_uv) : texture(u_t3, v_uv);
+  vec4 t = v_arr == 0 ? texture(u_t0, v_uv) : v_arr == 1 ? texture(u_t1, v_uv) : v_arr == 2 ? texture(u_t2, v_uv) :
+    v_arr == 3 ? texture(u_t3, v_uv) : v_arr == 4 ? texture(u_t4, v_uv) : texture(u_t5, v_uv);
   o = t * v_tint;                         // предумноженная картинка × цвет записи
   if (v_mode > 0.5) o.a = 0.0;            // 1 — свечение и свет: сложением
 }`;
@@ -417,6 +431,7 @@ function drawFrame() {
   const k = view.k, night = dark > 0.02 && nightLut;
   const scale = [2 * k / W, -2 * k / H];
   const toClip = (x0, y0, x1, y1) => [(x0 - view.x) * scale[0], (y0 - view.y) * scale[1], (x1 - view.x) * scale[0], (y1 - view.y) * scale[1]];
+  useStamp++;
   // Записи -> экземпляры: сцена до теней [0, sh0), тени [sh0, sh1), сцена после [sh1, sc1), свет [sc1, ni).
   ni = 0;
   let sh0 = -1, sh1 = -1, shown = 0, missing = 0;
