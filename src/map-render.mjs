@@ -12,6 +12,7 @@ import os from 'node:os';
 import zlib from 'node:zlib';
 import { ROOT } from './config.mjs';
 import { Worker } from 'node:worker_threads';
+import { encodeFrame } from './render-delta.mjs';
 import { createRequire } from 'node:module';
 
 const { WebSocketServer } = createRequire(import.meta.url)('ws');
@@ -202,6 +203,7 @@ net.createServer((c) => {
   // Атласы, полученные раньше, могли устареть (другой запуск игры) — начинаем с чистого листа.
   sprites.clear(); byN.length = 0; atlases.clear(); pngs.clear(); atlasIdx.clear(); atlasByIdx.length = 0; tilePngs.clear();
   gen = Date.now().toString(36);
+  for (const ws of viewers) ws.prevFrame = null;
   broadcast(JSON.stringify({ t: 'reset', gen }));
   // Атлас — десятки мегабайт: куски копим списком и склеиваем один раз, когда сообщение пришло целиком.
   let parts = [], have = 0, need = 4;
@@ -238,21 +240,35 @@ export function setCamera(c) {
   if (s !== camSent) { camSent = s; broadcast(s); }
 }
 function broadcast(s) { for (const ws of viewers) if (ws.readyState === 1) ws.send(s); }
+// Кадр зрителю — разностью с тем кадром, что ушёл ему в прошлый раз (render-delta.mjs); новому зрителю и после
+// сброса — целиком (разность с пустым). Обычно у всех зрителей прошлый кадр один, кодируем один раз.
+const asInts = (b) => new Int32Array(b.buffer, b.byteOffset, b.length >> 2);
+function sendFrame(ws, cache) {
+  if (ws.readyState !== 1 || ws.bufferedAmount > 2_000_000) return;
+  if (!ws.delta) { ws.send(frame); return; }
+  const cur = asInts(frame), key = ws.prevFrame || null;
+  let enc = cache.get(key);
+  if (!enc) { enc = encodeFrame(cur, key && key.length ? key : null); cache.set(key, enc); }
+  ws.send(enc);
+  ws.prevFrame = cur;
+}
 setInterval(() => {
   if (!frame || frame === frameAt) return;
   frameAt = frame;
-  for (const ws of viewers) if (ws.readyState === 1 && ws.bufferedAmount < 2_000_000) ws.send(frame);
+  const cache = new Map();
+  for (const ws of viewers) sendFrame(ws, cache);
 }, SEND_MS);
 setInterval(() => { if (frames) log(`кадров от игры за минуту ${frames}, спрайтов ${byN.length}, атласов ${atlases.size}, зрителей ${viewers.size}`); frames = 0; }, 60_000);
 
 export const wssRender = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: { threshold: 1024 } });
-wssRender.on('connection', (ws) => {
+wssRender.on('connection', (ws, req) => {
+  ws.delta = /[?&]d=1/.test(req?.url || ''); // страница умеет разность (старые открытые вкладки получают кадры целиком)
   viewers.add(ws);
   ws.send(JSON.stringify({ t: 'reset', gen }));
   ws.send(JSON.stringify({ t: 'sprites', list: byN.map(pub), game: !!game }));
   if (camSent) ws.send(camSent);
   if (darkSent) ws.send(darkSent);
-  if (frame) ws.send(frame);
+  if (frame) sendFrame(ws, new Map());
   ws.on('close', () => viewers.delete(ws));
   ws.on('error', () => viewers.delete(ws));
 });
