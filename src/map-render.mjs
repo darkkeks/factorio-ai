@@ -25,6 +25,9 @@ const sprites = new Map();     // адрес спрайта в игре -> { n, 
 const byN = [];                // номер -> описание
 const atlases = new Map();     // адрес атласа -> { w, h, rgba } | 'wait'
 const pngs = new Map();        // номер спрайта -> PNG
+const atlasIdx = new Map();    // адрес атласа -> номер (для адресов кусков атласа)
+const atlasByIdx = [];         // номер -> адрес
+const tilePngs = new Map();    // "номер/x-y" -> PNG куска 1024×1024
 let game = null, frame = null, frameAt = 0, frames = 0;
 let gen = Date.now().toString(36); // поколение номеров спрайтов: меняется при переподключении игры (в адресе картинок)
 const viewers = new Set();
@@ -39,13 +42,34 @@ function chunk(type, data) {
   out.writeUInt32BE((c ^ -1) >>> 0, 8 + data.length);
   return out;
 }
-function png(rgba, w, h) {
+function png(rgba, w, h, level = 6) {
   const raw = Buffer.alloc((w * 4 + 1) * h);
   for (let y = 0; y < h; y++) rgba.copy(raw, y * (w * 4 + 1) + 1, y * w * 4, (y + 1) * w * 4);
   const head = Buffer.alloc(13);
   head.writeUInt32BE(w, 0); head.writeUInt32BE(h, 4); head[8] = 8; head[9] = 6;
-  return Buffer.concat([Buffer.from('\x89PNG\r\n\x1a\n', 'latin1'), chunk('IHDR', head), chunk('IDAT', zlib.deflateSync(raw, { level: 6 })), chunk('IEND', Buffer.alloc(0))]);
+  return Buffer.concat([Buffer.from('\x89PNG\r\n\x1a\n', 'latin1'), chunk('IHDR', head), chunk('IDAT', zlib.deflateSync(raw, { level })), chunk('IEND', Buffer.alloc(0))]);
 }
+// Кусок атласа 256×256 (по краям меньше): браузер грузит сотни небольших кусков вместо тысяч отдельных картинок
+// и не тянет лишнего (кусок 1024 — ~1 МБ, а нужна в нём обычно малая часть).
+const TILE = 256;
+function atlasTilePng(ai, tx, ty) {
+  const k = `${ai}/${tx}-${ty}`;
+  let p = tilePngs.get(k);
+  if (p) return p;
+  const a = atlases.get(atlasByIdx[ai]);
+  if (!a || a === 'wait') return null;
+  const x0 = tx * TILE, y0 = ty * TILE, w = Math.min(TILE, a.w - x0), h = Math.min(TILE, a.h - y0);
+  if (w <= 0 || h <= 0) return null;
+  const out = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) a.rgba.copy(out, y * w * 4, ((y0 + y) * a.w + x0) * 4, ((y0 + y) * a.w + x0 + w) * 4);
+  for (let i = 0; i < out.length; i += 4) {
+    const al = out[i + 3];
+    if (al && al < 255) { out[i] = Math.min(255, out[i] * 255 / al); out[i + 1] = Math.min(255, out[i + 1] * 255 / al); out[i + 2] = Math.min(255, out[i + 2] * 255 / al); }
+  }
+  tilePngs.set(k, p = png(out, w, h, 3));
+  return p;
+}
+
 function spritePng(n, cx = 0, cy = 0, cw = 0, ch = 0) {
   const k = `${n}:${cx}:${cy}:${cw}:${ch}`;
   let p = pngs.get(k);
@@ -86,6 +110,7 @@ function onMessage(type, data) {
       const s = { ...d, n: byN.length };
       sprites.set(d.id, s); byN.push(s); fresh.push(s);
       if (!atlases.has(d.atlas)) { atlases.set(d.atlas, 'wait'); game?.write(`atlas ${d.atlas}\n`); }
+      if (!atlasIdx.has(d.atlas)) { atlasIdx.set(d.atlas, atlasByIdx.length); atlasByIdx.push(d.atlas); }
     }
     if (fresh.length) broadcast(JSON.stringify({ t: 'sprites', list: fresh.map(pub) }));
   } else if (type === 3) {
@@ -165,7 +190,7 @@ function convert(data) {
   }
   return Buffer.from(out.buffer, 0, k * 4);
 }
-const pub = (s) => ({ n: s.n, w: s.w, h: s.h, sx: s.shiftX, sy: s.shiftY, sc: s.scale, fl: s.fl, next: s.next ? sprites.get(s.next)?.n ?? -1 : -1 });
+const pub = (s) => ({ n: s.n, w: s.w, h: s.h, sx: s.shiftX, sy: s.shiftY, sc: s.scale, fl: s.fl, a: atlasIdx.get(s.atlas), ax: s.x, ay: s.y, next: s.next ? sprites.get(s.next)?.n ?? -1 : -1 });
 
 fs.rmSync(SOCK, { force: true });
 net.createServer((c) => {
@@ -174,7 +199,7 @@ net.createServer((c) => {
   log('игра подключилась');
   setTimeout(() => broadcast(JSON.stringify({ t: 'game', on: true })), 0);
   // Атласы, полученные раньше, могли устареть (другой запуск игры) — начинаем с чистого листа.
-  sprites.clear(); byN.length = 0; atlases.clear(); pngs.clear();
+  sprites.clear(); byN.length = 0; atlases.clear(); pngs.clear(); atlasIdx.clear(); atlasByIdx.length = 0; tilePngs.clear();
   gen = Date.now().toString(36);
   broadcast(JSON.stringify({ t: 'reset', gen }));
   // Атлас — десятки мегабайт: куски копим списком и склеиваем один раз, когда сообщение пришло целиком.
@@ -233,6 +258,12 @@ export function handleRender(url, reply) {
     reply(200, 'image/png', png(out, w, h)); return true;
   }
   if (url.pathname === '/render/debug/sprites.json') { reply(200, 'application/json', JSON.stringify({ atlases: [...atlases].map(([k, v]) => [k, v === 'wait' ? 'wait' : [v.w, v.h]]), sprites: byN })); return true; }
+  const t = url.pathname.match(/^\/render\/atlas\/([a-z0-9]{1,12})\/(\d{1,3})\/(\d{1,3})-(\d{1,3})\.png$/);
+  if (t) {
+    const p = t[1] === gen ? atlasTilePng(Number(t[2]), Number(t[3]), Number(t[4])) : null;
+    if (p) reply(200, 'image/png', p, 'public, max-age=3600'); else reply(404, 'text/plain', '', 'no-store');
+    return true;
+  }
   const m = url.pathname.match(/^\/render\/sprite\/([a-z0-9]{1,12})\/(\d{1,7})(?:-(\d{1,5})-(\d{1,5})-(\d{1,5})-(\d{1,5}))?\.png$/);
   if (m) {
     const p = m[1] === gen ? spritePng(Number(m[2]), Number(m[3] ?? 0), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)) : null;
